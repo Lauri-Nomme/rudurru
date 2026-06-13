@@ -1,0 +1,20 @@
+[package]
+name = "rudurru"
+version = "0.1.0"
+edition = "2021"
+description = "A purpose-built etcd-compatible KV store for k3s, written in Rust"
+
+[dependencies]
+etcd-client = { version = "0.18", default-features = false }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+rand = "0.8"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
