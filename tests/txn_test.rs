@@ -123,3 +123,82 @@ async fn test_transaction_multi_cond() {
     let r = client.get(k1.as_str(), None).await.unwrap();
     assert_eq!(r.kvs()[0].value(), b"updated_x");
 }
+
+// ── Regression tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_txn_compare_value_equal() {
+    let mut client = common::connect().await;
+    let key = key!("txn/val_eq");
+    client.put(key.as_str(), "match_me", None).await.unwrap();
+
+    // Compare::value(..., Equal, "match_me") should succeed
+    let txn = Txn::new()
+        .when(vec![Compare::value(key.as_str(), CompareOp::Equal, "match_me")])
+        .and_then(vec![TxnOp::put(key.as_str(), "matched", None)]);
+    let resp = client.txn(txn).await.unwrap();
+    assert!(resp.succeeded(), "value equal should succeed");
+
+    let get = client.get(key.as_str(), None).await.unwrap();
+    assert_eq!(get.kvs()[0].value(), b"matched");
+}
+
+#[tokio::test]
+async fn test_txn_compare_value_not_equal() {
+    let mut client = common::connect().await;
+    let key = key!("txn/val_neq");
+    client.put(key.as_str(), "original", None).await.unwrap();
+
+    // Compare::value(..., NotEqual, "wrong") should succeed
+    let txn = Txn::new()
+        .when(vec![Compare::value(key.as_str(), CompareOp::NotEqual, "wrong")])
+        .and_then(vec![TxnOp::put(key.as_str(), "diff", None)]);
+    let resp = client.txn(txn).await.unwrap();
+    assert!(resp.succeeded(), "value not-equal should succeed");
+
+    let get = client.get(key.as_str(), None).await.unwrap();
+    assert_eq!(get.kvs()[0].value(), b"diff");
+}
+
+#[tokio::test]
+async fn test_txn_compare_version() {
+    let mut client = common::connect().await;
+    let key = key!("txn/ver");
+
+    // Key doesn't exist yet — version should be 0
+    let txn = Txn::new()
+        .when(vec![Compare::version(key.as_str(), CompareOp::Equal, 0)])
+        .and_then(vec![TxnOp::put(key.as_str(), "v1", None)]);
+    let resp = client.txn(txn).await.unwrap();
+    assert!(resp.succeeded(), "version==0 should succeed for new key");
+
+    // Now version should be 1
+    let txn2 = Txn::new()
+        .when(vec![Compare::version(key.as_str(), CompareOp::Equal, 1)])
+        .and_then(vec![TxnOp::put(key.as_str(), "v2", None)]);
+    let resp2 = client.txn(txn2).await.unwrap();
+    assert!(resp2.succeeded(), "version==1 should succeed after first put");
+}
+
+#[tokio::test]
+async fn test_txn_compare_create_revision() {
+    let mut client = common::connect().await;
+    let key = key!("txn/cr");
+
+    client.put(key.as_str(), "first", None).await.unwrap();
+    let get = client.get(key.as_str(), None).await.unwrap();
+    let create_rev = get.kvs()[0].create_revision();
+
+    let txn = Txn::new()
+        .when(vec![Compare::create_revision(key.as_str(), CompareOp::Equal, create_rev)])
+        .and_then(vec![TxnOp::put(key.as_str(), "checked", None)]);
+    let resp = client.txn(txn).await.unwrap();
+    assert!(resp.succeeded(), "create_revision match should succeed");
+
+    // Now try with wrong create_revision
+    let txn2 = Txn::new()
+        .when(vec![Compare::create_revision(key.as_str(), CompareOp::Equal, create_rev + 999)])
+        .and_then(vec![TxnOp::put(key.as_str(), "wrong", None)]);
+    let resp2 = client.txn(txn2).await.unwrap();
+    assert!(!resp2.succeeded(), "wrong create_revision should fail");
+}

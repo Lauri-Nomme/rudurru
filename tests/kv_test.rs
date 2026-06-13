@@ -144,3 +144,103 @@ async fn test_mod_revision_increments() {
     let get = client.get(key.as_str(), None).await.unwrap();
     assert_eq!(get.kvs()[0].version(), 2);
 }
+
+// ── Regression tests for bugs found during Phase 2 ────────────────────
+
+#[tokio::test]
+async fn test_point_vs_from_key_range() {
+    let mut client = common::connect().await;
+    let prefix = format!("aaa_pfk/{}", rand::random::<u16>());
+
+    // Put keys at different levels
+    client.put(format!("{prefix}/a"), "1", None).await.unwrap();
+    client.put(format!("{prefix}/b"), "2", None).await.unwrap();
+    client.put(format!("{prefix}/c"), "3", None).await.unwrap();
+
+    // Point lookup for one key returns exactly 1
+    let point = client.get(format!("{prefix}/b"), None).await.unwrap();
+    assert_eq!(point.count(), 1, "point lookup should return exactly 1 key");
+
+    // From-key (\0 range_end) returns all keys >= key
+    let from = client.get(
+        format!("{prefix}/b"),
+        Some(GetOptions::new().with_from_key()),
+    ).await.unwrap();
+    assert!(from.count() >= 2, "from-key should return at least 2 keys (b, c), got {}", from.count());
+    assert_eq!(from.kvs()[0].key(), format!("{prefix}/b").as_bytes());
+    assert_eq!(from.kvs()[1].key(), format!("{prefix}/c").as_bytes());
+}
+
+#[tokio::test]
+async fn test_all_keys_range() {
+    let mut client = common::connect().await;
+    let prefix = format!("bbb_allk/{}", rand::random::<u16>());
+
+    client.put(format!("{prefix}/x"), "1", None).await.unwrap();
+    client.put(format!("{prefix}/y"), "2", None).await.unwrap();
+
+    // Get all keys (key="", range_end="\0")
+    let all = client.get("", Some(GetOptions::new().with_all_keys())).await.unwrap();
+    assert!(all.count() >= 2, "all-keys should return at least our 2 keys, got {}", all.count());
+}
+
+#[tokio::test]
+async fn test_prefix_with_ff_boundary() {
+    let mut client = common::connect().await;
+    let prefix = format!("ccc_ffb/{}", rand::random::<u16>());
+
+    let mut key_a = format!("{prefix}/").into_bytes();
+    key_a.push(0xFF);
+    let mut key_b = format!("{prefix}/").into_bytes();
+    key_b.extend_from_slice(&[0xFF, 0xFF]);
+
+    client.put(key_a.clone(), "1", None).await.unwrap();
+    client.put(key_b.clone(), "2", None).await.unwrap();
+
+    let mut prefix_key = format!("{prefix}/").into_bytes();
+    prefix_key.push(0xFF);
+    let opts = Some(GetOptions::new().with_prefix());
+    let resp = client.get(prefix_key, opts).await.unwrap();
+    assert_eq!(resp.count(), 2, "should match keys with 0xFF prefix");
+}
+
+#[tokio::test]
+async fn test_delete_from_key() {
+    let mut client = common::connect().await;
+    // Use ~~~ prefix (0x7E) so from-key delete only affects our keys (sorts after all alphanumeric)
+    let prefix = format!("~~~_del/{}", rand::random::<u16>());
+
+    client.put(format!("{prefix}/a"), "1", None).await.unwrap();
+    client.put(format!("{prefix}/b"), "2", None).await.unwrap();
+    client.put(format!("{prefix}/c"), "3", None).await.unwrap();
+
+    // Delete all keys >= {prefix}/b using from-key
+    let del = client.delete(
+        format!("{prefix}/b"),
+        Some(DeleteOptions::new().with_from_key()),
+    ).await.unwrap();
+    assert_eq!(del.deleted(), 2, "should delete b and c");
+
+    let remaining = client.get(
+        format!("{prefix}/"),
+        Some(GetOptions::new().with_prefix()),
+    ).await.unwrap();
+    assert_eq!(remaining.count(), 1, "only a should remain");
+    assert_eq!(remaining.kvs()[0].key(), format!("{prefix}/a").as_bytes());
+}
+
+#[tokio::test]
+async fn test_range_with_start_equals_end() {
+    let mut client = common::connect().await;
+    let prefix = format!("ddd_seq/{}", rand::random::<u16>());
+
+    client.put(format!("{prefix}/m"), "1", None).await.unwrap();
+    client.put(format!("{prefix}/n"), "2", None).await.unwrap();
+
+    // Range [m, m) — should return nothing since start == end
+    let resp = client.get(
+        format!("{prefix}/m"),
+        Some(GetOptions::new().with_range(format!("{prefix}/m"))),
+    ).await.unwrap();
+    assert_eq!(resp.count(), 0, "empty range should return 0 keys");
+}
