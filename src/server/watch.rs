@@ -31,6 +31,24 @@ fn event_to_proto(event: &WatchEvent) -> mvccpb::Event {
     }
 }
 
+fn rec_to_event(rec: &wal::WalRecord) -> WatchEvent {
+    let deleted = (rec.flags & wal::DELETED) != 0;
+    let has_lease = (rec.flags & wal::HAS_LEASE) != 0;
+    WatchEvent {
+        revision: rec.revision,
+        event_type: if deleted { mvccpb::event::EventType::Delete } else { mvccpb::event::EventType::Put },
+        kv: mvccpb::KeyValue {
+            key: rec.key.clone(),
+            create_revision: rec.revision as i64,
+            mod_revision: rec.revision as i64,
+            version: 1,
+            value: rec.value.clone(),
+            lease: if has_lease { rec.lease_id.unwrap_or(0) } else { 0 },
+        },
+        prev_kv: None,
+    }
+}
+
 #[derive(Debug)]
 pub struct Watch {
     store: Arc<Store>,
@@ -74,6 +92,27 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 let start_revision = create.start_revision as u64;
                                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
+                                let current_rev = if start_revision > 0 { current_revision() } else { 0 };
+
+                                // Phase 1: replay events [start_revision, current_rev] without lock
+                                if start_revision > 0 && start_revision <= current_rev {
+                                    if let Ok(mut reader) = wal::WalFile::open(&store.wal_path().await) {
+                                        if let Ok(ref records) = reader.scan() {
+                                            let bound = storage::resolve_range(&key, &range_end);
+                                            for rec in records.iter() {
+                                                if rec.revision < start_revision || rec.revision > current_rev {
+                                                    continue;
+                                                }
+                                                if !storage::matches_range(bound.to_ref(), &rec.key) {
+                                                    continue;
+                                                }
+                                                let _ = event_tx.send(rec_to_event(rec));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Phase 2: under lock, catch up events > current_rev, then register
                                 {
                                     let mut state = store.state.write().await;
 
@@ -81,37 +120,13 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                         if let Ok(ref records) = state.wal.scan() {
                                             let bound = storage::resolve_range(&key, &range_end);
                                             for rec in records.iter() {
-                                                if rec.revision < start_revision {
+                                                if rec.revision <= current_rev {
                                                     continue;
                                                 }
                                                 if !storage::matches_range(bound.to_ref(), &rec.key) {
                                                     continue;
                                                 }
-
-                                                let deleted = (rec.flags & wal::DELETED) != 0;
-                                                let event_type = if deleted {
-                                                    mvccpb::event::EventType::Delete
-                                                } else {
-                                                    mvccpb::event::EventType::Put
-                                                };
-                                                let has_lease = (rec.flags & wal::HAS_LEASE) != 0;
-                                                let lease = if has_lease { rec.lease_id.unwrap_or(0) } else { 0 };
-
-                                                let event = WatchEvent {
-                                                    revision: rec.revision,
-                                                    event_type,
-                                                    kv: mvccpb::KeyValue {
-                                                        key: rec.key.clone(),
-                                                        create_revision: rec.revision as i64,
-                                                        mod_revision: rec.revision as i64,
-                                                        version: 1,
-                                                        value: rec.value.clone(),
-                                                        lease,
-                                                    },
-                                                    prev_kv: None,
-                                                };
-
-                                                let _ = event_tx.send(event);
+                                                let _ = event_tx.send(rec_to_event(rec));
                                             }
                                         }
                                     }
