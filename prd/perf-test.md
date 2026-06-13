@@ -219,32 +219,46 @@ PMU counters (`cpu_core/cycles/`) are not available on this VM. The `cpu-clock` 
 
 Attempts with `-F 99` (99Hz sampling) produce zero samples — the kernel rejects the frequency and silently captures nothing. The Debian 7.0.9+ kernel in this VM has aggressive rate limiting.
 
-### Call-chain Data (4 samples from cpu-clock)
+### Symbol-level Profile (145 samples, cycles:u, precision i9-11950H)
 
-Despite the sparse samples, the call chains are consistent:
+Server ran on precision (11th Gen i9, non-VM. 145 samples with `-e cycles:u -c 10000`). Binary built with `debug=2` for symbol resolution.
+
+**Top hotspots (>1% of samples):**
+
+| Share | Function | Category |
+|-------|----------|----------|
+| 11.7% | `tokio::runtime::task::raw::poll` | Tokio task polling |
+| 8.3% | `clock_gettime` (libc) | Time syscall |
+| 8.3% | `tokio::runtime::time::Handle::process_at_time` | Tokio timer processing |
+| 6.2% | `tokio::runtime::worker::Context::park_internal` | Worker park (sleep) |
+| 5.5% | `tokio::runtime::io::driver::Driver::turn` | IO event loop |
+| 4.8% | `tokio::runtime::task::raw::schedule` | Task scheduling |
+| 4.1% | `__vdso_clock_gettime` | Fast userspace time |
+| 2.8% | `tokio::runtime::time::Driver::park_internal` | Timer park |
+| 2.1% | `epoll_wait` (libc) | IO wait syscall |
+| 2.1% | **`rudurru::storage::Store::start_expiry_task`** | **Lease expiry** |
+| 2.1% | `<Sleep as Future>::poll` | Timer sleep |
+| 1.4% | `write` (libc) | **WAL append (fsync)** |
+| 1.4% | `tokio::runtime::task::waker::wake_by_val` | Task wake |
+| 0.7% | **`tokio::sync::rwlock::RwLock::write`** | **Write lock acquisition** |
+
+**Rudurru application code** (`start_expiry_task` + `RwLock::write`) accounts for **<3%** of CPU samples.
+
+**Breakdown by category:**
 
 ```
-  __syscall_cancel_arch
-    ├── entry_SYSCALL_64 → do_syscall_64
-    │     ├── __x64_sys_epoll_wait → do_epoll_wait
-    │     │     └── schedule_hrtimeout_range_clock → hrtimer_cancel
-    │     │                                      (25% — idle/Tokio wait)
-    │     └── ksys_write → fdget_pos
-    │                                    (25% — WAL append/fsync)
-    └── (Rust userspace: __clock_gettime)
-                                          (25% — tokio timekeeping)
+Category           Share
+──────────────────────────
+Tokio runtime       ~50%  (poll, schedule, park, IO driver, timers)
+clock_gettime       ~12%  (libc + vdso, used by tokio)
+Kernel syscalls      ~4%  (epoll_wait 2%, write 1.4%)
+Rudurru app          ~3%  (expiry task, RwLock)
+Other                ~31% (dispersed, unknown)
 ```
 
-Rough profile of a saturated Rudurru instance:
+**Conclusion:** The server is **Tokio-runtime-bound**, not CPU-bound or I/O-bound. ~50% of CPU cycles go to the async runtime infrastructure (polling futures, scheduling tasks, parking workers, processing timers). Rudurru's own code accounts for <3%. WAL `write` is 1.38%. The RwLock is 0.7%.
 
-| Activity | Share | What |
-|----------|-------|------|
-| `write()` syscall (WAL fsync) | 25% | Kernel I/O — writing + syncing WAL records |
-| `epoll_wait()` idle | 25% | Tokio waiting for the next gRPC event |
-| `clock_gettime()` | 25% | Tokio timer management |
-| Unknown/other | 25% | Rust application code (grpc handler, BTreeMap) |
-
-**Conclusion:** The server is **I/O-bound on WAL fsync** and **Tokio event loop overhead**. CPU-bound compute (serialization, BTreeMap, RwLock) accounts for <25% of samples. This is exactly the expected profile for an append-only log with `sync_all`.
+This profile is typical for a low-latency async gRPC server under moderate load. The tokio multi-thread runtime's work-stealing scheduler dominates when most tasks are short-lived (microsecond-scale gRPC handlers).
 
 ### perf stat aggregate (8s window during bench load)
 
@@ -254,7 +268,7 @@ Rough profile of a saturated Rudurru instance:
     0.0017  task-clock (seconds)
 ```
 
-Extremely low context-switch rate — the process stays on CPU continuously during load. The 0 seconds task-clock is a VM measurement artifact.
+Extremely low context-switch rate — the process stays on CPU continuously during load.
 
 ## Production Build
 
