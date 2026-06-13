@@ -92,15 +92,16 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 let start_revision = create.start_revision as u64;
                                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-                                let current_rev = if start_revision > 0 { current_revision() } else { 0 };
+                                let checkpoint_rev = if start_revision > 0 { current_revision() } else { 0 };
 
-                                // Phase 1: replay events [start_revision, current_rev] without lock
-                                if start_revision > 0 && start_revision <= current_rev {
+                                // Phase 1: replay events [start_revision, checkpoint_rev] without lock
+                                let wal_len = if start_revision > 0 && start_revision <= checkpoint_rev {
                                     if let Ok(mut reader) = wal::WalFile::open(&store.wal_path().await) {
+                                        let len = reader.file_len().unwrap_or(0);
                                         if let Ok(ref records) = reader.scan() {
                                             let bound = storage::resolve_range(&key, &range_end);
                                             for rec in records.iter() {
-                                                if rec.revision < start_revision || rec.revision > current_rev {
+                                                if rec.revision < start_revision || rec.revision > checkpoint_rev {
                                                     continue;
                                                 }
                                                 if !storage::matches_range(bound.to_ref(), &rec.key) {
@@ -109,18 +110,23 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                                 let _ = event_tx.send(rec_to_event(rec));
                                             }
                                         }
+                                        len
+                                    } else {
+                                        0
                                     }
-                                }
+                                } else {
+                                    0
+                                };
 
-                                // Phase 2: under lock, catch up events > current_rev, then register
+                                // Phase 2: under lock, catch up events after checkpoint_rev, then register
                                 {
                                     let mut state = store.state.write().await;
 
                                     if start_revision > 0 {
-                                        if let Ok(ref records) = state.wal.scan() {
+                                        if let Ok(ref records) = state.wal.scan_from(wal_len) {
                                             let bound = storage::resolve_range(&key, &range_end);
                                             for rec in records.iter() {
-                                                if rec.revision <= current_rev {
+                                                if rec.revision <= checkpoint_rev {
                                                     continue;
                                                 }
                                                 if !storage::matches_range(bound.to_ref(), &rec.key) {

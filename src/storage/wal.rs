@@ -146,7 +146,22 @@ impl WalFile {
     /// Scan all records from the WAL file.
     pub fn scan(&mut self) -> io::Result<Vec<WalRecord>> {
         self.file.seek(SeekFrom::Start(0))?;
+        self.scan_remaining()
+    }
 
+    /// Scan records starting from a given byte offset.
+    /// Useful for incremental scanning without re-reading the entire file.
+    pub fn scan_from(&mut self, offset: u64) -> io::Result<Vec<WalRecord>> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.scan_remaining()
+    }
+
+    /// Current file length in bytes.
+    pub fn file_len(&self) -> io::Result<u64> {
+        self.file.metadata().map(|m| m.len())
+    }
+
+    fn scan_remaining(&mut self) -> io::Result<Vec<WalRecord>> {
         let mut records = Vec::new();
         let mut buf = Vec::new();
         self.file.read_to_end(&mut buf)?;
@@ -158,10 +173,7 @@ impl WalFile {
                     records.push(rec);
                     ofs += consumed;
                 }
-                Err(_) => {
-                    // Corrupted or truncated record — stop scanning
-                    break;
-                }
+                Err(_) => break,
             }
         }
 
