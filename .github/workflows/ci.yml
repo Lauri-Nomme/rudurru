@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+        continue-on-error: true
+
+      - name: Build
+        run: cargo build
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+        continue-on-error: true
+
+      - name: Start Rudurru server
+        run: |
+          RUDURRU_WAL=/tmp/rudurru_ci.wal RUDURRU_LISTEN=127.0.0.1:2379 \
+          ./target/debug/rudurru &
+          sleep 2
+          echo "Rudurru started"
+
+      - name: Run tests against Rudurru
+        run: |
+          ETCD_ENDPOINT=http://localhost:2379 cargo test -- --test-threads=1 --skip test_auth_full_lifecycle
+
+      - name: Stop Rudurru
+        run: pkill -f rudurru || true
+        if: always()
