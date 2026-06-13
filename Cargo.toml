@@ -5,7 +5,9 @@ edition = "2021"
 description = "A purpose-built etcd-compatible KV store for k3s, written in Rust"
 
 [dependencies]
-etcd-client = { version = "0.18", default-features = false }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tracing = "0.1"
@@ -17,4 +19,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+etcd-client = { version = "0.18", default-features = false }
 tempfile = "3"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
