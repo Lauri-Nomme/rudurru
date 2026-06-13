@@ -5,7 +5,7 @@ use crate::proto::mvccpb;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 /// Global revision counter. Monotonically increasing, starts at 1.
 static NEXT_REV: AtomicU64 = AtomicU64::new(1);
@@ -50,9 +50,10 @@ pub struct LeaseState {
     pub key_count: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WatchRegistration {
-    pub prefix: Vec<u8>,
+    pub key: Vec<u8>,
+    pub range_end: Vec<u8>,
     pub start_revision: u64,
     pub sender: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
     pub watch_id: i64,
@@ -111,16 +112,112 @@ impl StoreState {
             lease,
             deleted: false,
         };
-        self.keys.insert(key, entry);
+        self.keys.insert(key.clone(), entry.clone());
+        
+        let event = WatchEvent {
+            revision: rev,
+            event_type: mvccpb::event::EventType::Put,
+            kv: mvccpb::KeyValue {
+                key: key.clone(),
+                create_revision: entry.create_revision as i64,
+                mod_revision: entry.mod_revision as i64,
+                version: entry.version,
+                value: entry.value.to_vec(),
+                lease: entry.lease,
+            },
+            prev_kv: prev.as_ref().map(|p| p.to_key_value(&key)),
+        };
+        self.notify_watchers(event);
+        
         prev
     }
 
-    fn apply_delete(&mut self, key: Vec<u8>, _rev: u64) -> Option<KeyState> {
+    fn apply_delete(&mut self, key: Vec<u8>, rev: u64) -> Option<KeyState> {
         let prev = self.keys.remove(&key)?;
         if prev.deleted {
             return None;
         }
+        
+        // Create watch event for DELETE
+        let event = WatchEvent {
+            revision: rev,
+            event_type: mvccpb::event::EventType::Delete,
+            kv: mvccpb::KeyValue {
+                key: key.clone(),
+                create_revision: prev.create_revision as i64,
+                mod_revision: prev.mod_revision as i64,
+                version: prev.version,
+                value: prev.value.to_vec(),
+                lease: prev.lease,
+            },
+            prev_kv: Some(prev.to_key_value(&key)),
+        };
+        self.notify_watchers(event);
+        
         Some(prev)
+    }
+
+    // Watcher management
+    pub(crate) fn register_watcher(&mut self, key: Vec<u8>, range_end: Vec<u8>, start_revision: u64,
+                       sender: mpsc::UnboundedSender<WatchEvent>, watch_id: i64,
+                       progress_notify: bool, filters: Vec<i32>, prev_kv: bool) -> i64 {
+        let registration = WatchRegistration {
+            key,
+            range_end,
+            start_revision,
+            sender,
+            watch_id,
+            progress_notify,
+            filters,
+            prev_kv,
+        };
+        self.watchers.push(registration);
+        watch_id
+    }
+
+    pub(crate) fn cancel_watcher(&mut self, watch_id: i64) -> bool {
+        let len_before = self.watchers.len();
+        self.watchers.retain(|w| w.watch_id != watch_id);
+        len_before != self.watchers.len()
+    }
+
+    fn notify_watchers(&mut self, event: WatchEvent) {
+        let watchers: Vec<WatchRegistration> = self.watchers.clone();
+        for watcher in watchers {
+            let bound = resolve_range(&watcher.key, &watcher.range_end);
+            if !matches_range(bound.to_ref(), &event.kv.key) {
+                continue;
+            }
+            
+            if event.revision < watcher.start_revision {
+                continue;
+            }
+            
+            let mut should_send = true;
+            for &filter in &watcher.filters {
+                match filter {
+                    0 => {
+                        if event.event_type == mvccpb::event::EventType::Put {
+                            should_send = false;
+                            break;
+                        }
+                    }
+                    1 => {
+                        if event.event_type == mvccpb::event::EventType::Delete {
+                            should_send = false;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            if !should_send {
+                continue;
+            }
+            
+            let _ = watcher.sender.send(event.clone());
+        }
     }
 }
 
@@ -153,7 +250,7 @@ impl Store {
         state.next_rev = max_rev + 1;
         NEXT_REV.store(state.next_rev, Ordering::SeqCst);
 
-        tracing::info!(
+            tracing::info!(
             "rudurru ready: revision={}, keys={}, compact_rev={}",
             max_rev,
             state.keys.len(),
@@ -163,6 +260,11 @@ impl Store {
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
         })
+    }
+
+    pub async fn wal_path(&self) -> String {
+        let state = self.state.read().await;
+        state.wal.path.clone()
     }
 
     // ── KV operations ──────────────────────────────────────────────────
@@ -185,7 +287,7 @@ impl Store {
             if ks.deleted {
                 continue;
             }
-            if !matches_range(bound.as_ref(), k) {
+            if !matches_range(bound.to_ref(), k) {
                 continue;
             }
             if req.min_mod_revision > 0 && (ks.mod_revision as i64) < req.min_mod_revision {
@@ -292,7 +394,7 @@ impl Store {
                 if ks.deleted {
                     return false;
                 }
-                matches_range(bound.as_ref(), k)
+                matches_range(bound.to_ref(), k)
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -415,8 +517,36 @@ fn apply_record(state: &mut StoreState, rec: &wal::WalRecord) {
     let lease = if has_lease { rec.lease_id.unwrap_or(0) } else { 0 };
 
     if deleted {
+        // Create watch event for DELETE during replay
+        let event = WatchEvent {
+            revision: rec.revision,
+            event_type: mvccpb::event::EventType::Delete,
+            kv: mvccpb::KeyValue {
+                key: rec.key.clone(),
+                create_revision: rec.revision as i64,
+                mod_revision: rec.revision as i64,
+                version: 1,
+                value: vec![],
+                lease: 0,
+            },
+            prev_kv: None,
+        };
         state.keys.remove(&rec.key);
+        state.notify_watchers(event);
     } else {
+        let event = WatchEvent {
+            revision: rec.revision,
+            event_type: mvccpb::event::EventType::Put,
+            kv: mvccpb::KeyValue {
+                key: rec.key.clone(),
+                create_revision: rec.revision as i64,
+                mod_revision: rec.revision as i64,
+                version: 1, // During replay, we don't have original version
+                value: rec.value.clone(),
+                lease,
+            },
+            prev_kv: None, // During replay, we don't have previous KV
+        };
         let entry = KeyState {
             value: Arc::from(rec.value.clone().into_boxed_slice()),
             mod_revision: rec.revision,
@@ -426,11 +556,12 @@ fn apply_record(state: &mut StoreState, rec: &wal::WalRecord) {
             deleted: false,
         };
         state.keys.insert(rec.key.clone(), entry);
+        state.notify_watchers(event);
     }
 }
 
 /// Translate key + range_end from proto into a range bound for BTreeMap.
-fn resolve_range(key: &[u8], range_end: &[u8]) -> RangeBound {
+pub(crate) fn resolve_range(key: &[u8], range_end: &[u8]) -> RangeBound {
     if range_end.is_empty() {
         return RangeBound::Point(key.to_vec());
     }
@@ -467,7 +598,7 @@ fn resolve_range(key: &[u8], range_end: &[u8]) -> RangeBound {
     RangeBound::Range(key.to_vec(), range_end.to_vec())
 }
 
-enum RangeBound {
+pub(crate) enum RangeBound {
     All,
     Point(Vec<u8>),
     From(Vec<u8>),
@@ -476,7 +607,7 @@ enum RangeBound {
 }
 
 impl RangeBound {
-    fn as_ref(&self) -> RangeBoundRef<'_> {
+    pub(crate) fn to_ref(&self) -> RangeBoundRef<'_> {
         match self {
             RangeBound::All => RangeBoundRef::All,
             RangeBound::Point(k) => RangeBoundRef::Point(k),
@@ -487,7 +618,7 @@ impl RangeBound {
     }
 }
 
-enum RangeBoundRef<'a> {
+pub(crate) enum RangeBoundRef<'a> {
     All,
     Point(&'a [u8]),
     From(&'a [u8]),
@@ -495,7 +626,7 @@ enum RangeBoundRef<'a> {
     Range(&'a [u8], &'a [u8]),
 }
 
-fn matches_range(bound: RangeBoundRef<'_>, key: &[u8]) -> bool {
+pub(crate) fn matches_range(bound: RangeBoundRef<'_>, key: &[u8]) -> bool {
     match bound {
         RangeBoundRef::All => true,
         RangeBoundRef::Point(k) => key == k,

@@ -38,8 +38,9 @@ impl WalRecord {
             buf.extend_from_slice(&lid.to_le_bytes());       // 8
         }
 
-        // Compute CRC32C of flags + key + value
-        let crc = crc32c(&buf[17..]); // from flags byte onward
+        // Compute CRC32C of flags(1) + key(N) + value(M) + lease_id(8)
+        // buf[22] is the flags byte
+        let crc = crc32c(&buf[22..]);
         buf[crc_ofs..crc_ofs + 4].copy_from_slice(&crc.to_le_bytes());
 
         buf
@@ -80,7 +81,7 @@ impl WalRecord {
         let flags = data[ofs];
         ofs += 1;
 
-        let payload_start = ofs;
+        let flags_ofs = ofs - 1; // flags byte is right before current position
         let payload_end = ofs + key_len + val_len;
         if data.len() < payload_end {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated payload"));
@@ -102,8 +103,8 @@ impl WalRecord {
             None
         };
 
-        // Verify CRC32C
-        let computed = crc32c(&data[payload_start..ofs]);
+        // Verify CRC32C: covers flags(1) + key(N) + value(M) + lease_id(8)
+        let computed = crc32c(&data[flags_ofs..ofs]);
         if computed != _stored_crc {
             // Log and skip corrupted record
             return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch"));
@@ -126,7 +127,7 @@ impl WalRecord {
 #[derive(Debug)]
 pub struct WalFile {
     file: std::fs::File,
-    path: String,
+    pub path: String,
 }
 
 impl WalFile {
