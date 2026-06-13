@@ -33,7 +33,10 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
         &self,
         _req: Request<etcdserverpb::AlarmRequest>,
     ) -> Result<Response<etcdserverpb::AlarmResponse>, Status> {
-        Err(Status::unimplemented("no alarms in single-node store"))
+        Ok(Response::new(etcdserverpb::AlarmResponse {
+            header: Some(header()),
+            alarms: vec![],
+        }))
     }
 
     async fn status(

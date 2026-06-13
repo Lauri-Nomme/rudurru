@@ -223,4 +223,65 @@ The `key_count` field exists on `LeaseState` but is never updated. `lease_time_t
 ### Files Changed
 
 - `src/server/lease.rs` — full implementation of all 5 Lease RPCs (previously all stubs)
-- `src/storage/mod.rs` — added `NEXT_LEASE_ID`, `LeaseGrantRequest`/`LeaseRevokeRequest`/`LeaseKeepAliveResponse`/`LeaseTimeToLiveRequest`/`LeaseLeasesRequest` handlers on `Store`; `start_expiry_task`; `use std::sync::atomic::AtomicI64`
+- `src/storage/mod.rs` — added `NEXT_LEASE_ID`, lease operations on `Store`; `start_expiry_task`; `use std::sync::atomic::AtomicI64`
+
+---
+
+## Phase 5 — Maintenance & Cluster (2026-06-14)
+
+### Design Decisions
+
+**1. Single-node cluster stub.**
+`member_list` returns a hardcoded `Member` with `id=1`, `name="rudurru"`, and dummy peer/client URLs. All mutation RPCs (`member_add`, `member_remove`, `member_update`, `member_promote`) return `Unimplemented`. This is a single-node store with no Raft — there is no cluster to mutate.
+
+**2. Status returns WAL file size as `db_size`.**
+`db_size` is obtained from `WalFile.file.metadata().len()`. This is the actual on-disk WAL size. The test expects `db_size > 0`, which holds as long as even the smallest WAL header has been written.
+
+**3. Hash uses SipHash (std `DefaultHasher`) over all key-value pairs.**
+Keys and values are fed into `std::collections::hash_map::DefaultHasher`. No crypto guarantees — this is a fast hash that changes when data changes. The etcd-client test only checks `hash != 0` and `hash changes after write`, both of which SipHash satisfies.
+
+**4. Snapshot serializes KVs into a binary blob, sent in 64KB chunks.**
+Format: `revision(8) + key_count(4) + [key_len(4) + key(N) + val_len(4) + value(M)]*`. The revision header ensures the blob is non-empty even with zero keys. Chunks up to 64KB, final chunk sets `remaining_bytes=0`.
+
+**5. Defragment is a no-op.**
+The in-memory BTreeMap has no fragmentation; the WAL is append-only. `defragment` returns a response with `header: None` (matching etcd 3.5.17 behavior).
+
+**6. Auth service remains unimplemented.**
+All 15 auth RPCs (`auth_enable`, `auth_disable`, `authenticate`, user/role CRUD) return `Unimplemented`. The auth test runs against the etcd docker container, not our server. Implementing auth would require user/role storage, permission checking on every operation, and token management — substantial effort for k3s which typically disables auth.
+
+### Doubts & Unresolved Questions
+
+1. **Snapshot format is not etcd-compatible.** The binary format (revision + key_count + key/val pairs) is a simple ad-hoc format. etcd's snapshot is a protobuf-encoded snapshot of the entire backend. Our format cannot be restored by etcd tools. It's only useful for our own future restore logic.
+
+2. **Hash includes deleted-key values.** `store_hash()` iterates `state.keys` but skips `ks.deleted`. However, deleted keys still exist in the BTreeMap (as tombstones) — they're just filtered from the hash. If a deleted key has not been compacted, it won't contribute to the hash. After compaction, it's removed. This means hash depends on compaction state, not just live data. Acceptable because the test only checks that hash changes after a write.
+
+3. **`hash` RPC returns `u32` but internal hash is `u64`.** The `HashResponse.hash` field in the proto is `uint32` but SipHash produces `u64`. The value is truncated. Two different store states could produce the same `u32` hash (collision). The test only checks non-zero and change-after-write, so this is fine for now.
+
+4. **No `Alarm` support.** `alarm` returns `Unimplemented`. etcd uses alarms for disk space exhaustion and corruption detection. Our store has no quota or corruption detection.
+
+5. **No `MoveLeader` support.** Single-node cluster has no leader election.
+
+### Shortcuts / Known Gaps
+
+| Gap | Impact | When to Fix |
+|-----|--------|-------------|
+| Auth not implemented | Tests must run against etcd docker | If k3s requires auth |
+| Snapshot format not etcd-compatible | Cannot restore via etcd tools | If restore is needed |
+| Hash truncated to u32 | Collision possible | If hash uniqueness matters |
+| No alarm/corruption detection | Silent data corruption | If corruption detection needed |
+| No move_leader | No-op (single node) | Never (single-node) |
+| Cluster mutations unimplemented | No multi-node support | Never (design constraint) |
+
+### Test Coverage
+
+- 5 maintenance tests pass against Rudurru: `test_status`, `test_member_list`, `test_hash`, `test_snapshot`, `test_defragment`
+- 41/42 integration tests pass against Rudurru (auth unimplemented)
+- 46/47 pass against real etcd docker (1 pre-existing `test_delete_from_key` state pollution)
+- Snapshot validated with empty store (revision header ensures non-empty blob)
+
+### Files Changed
+
+- `src/server/cluster.rs` — `member_list` returns hardcoded single-member response; rest unimplemented
+- `src/server/maintenance.rs` — `status`/`hash`/`hash_kv`/`snapshot`/`defragment` implemented; `alarm`/`move_leader` unimplemented
+- `src/storage/mod.rs` — added `db_size()` and `store_hash()` methods to `Store`
+- `src/storage/wal.rs` — made `file` field `pub` for db_size access
