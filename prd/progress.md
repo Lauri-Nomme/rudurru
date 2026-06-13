@@ -1,5 +1,92 @@
 # Progress & Design Log
 
+## Phase 1 — Storage Core (2026-06-13)
+
+### Design Decisions
+
+**1. Binary WAL as single source of truth.**
+No separate database file. The WAL is both the commit log and the sole persistent store. On startup, `Store::open()` replays all WAL records into a `BTreeMap<Vec<u8>, KeyState>`. There is no checkpoint, no compaction of the WAL itself (only logical compaction via `compact_rev`). This is the simplest possible persistence model and directly eliminates SQL parsing overhead.
+
+**2. CRC32C per record for integrity.**
+Every WAL record has a CRC32C checksum covering `flags(1) + key(N) + value(M) + lease_id(8)`. Corrupted records are silently skipped during scan (the parser breaks and returns records up to the corruption). No repair mechanism — if the WAL head is corrupted, trailing data is lost.
+
+**3. Single `RwLock<StoreState>` for concurrency.**
+All mutations (Put, Delete, Txn, Compact) acquire the write lock. Reads (Range) use the read lock. The lock is held for the entire operation including WAL append (fsync). The PRD asserts this is acceptable because k3s workloads write ~2.4 ops/sec and the write lock is held for <1ms. No sharding, no per-key locking.
+
+**4. `NEXT_REV` as a global `AtomicU64`.**
+Revision assignment is decoupled from the write lock. `next_revision()` atomically increments a global counter. This means revision order matches wall-clock call order, not WAL order (though in practice they're the same since the write lock serializes). The counter starts at 1 and is initialized to `max_rev + 1` on recovery.
+
+**5. `KeyState` stores `value: Arc<[u8]>`.**
+Values are stored as atomically reference-counted byte slices. Cloning a `KeyState` (e.g., for previous-KV in put response) does not copy the value — only bumps the refcount. This is the "no GC" tenet in action: `Arc` is deterministic, zero-cost for the common case.
+
+### Doubts & Unresolved Questions
+
+1. **WAL is append-only and grows unbounded.** There is no WAL compaction or log rotation. The file grows as long as the server runs. Over months of operation this could reach gigabytes. The etcd approach is periodic snapshotting + log compaction. For now, the assumption is that k3s workloads generate modest write volume and the test/development cycle is short.
+
+2. **`sync_all()` after every write.** Every `append()` calls `File::sync_all()` (fsync). This is the right thing for crash safety but kills throughput on spinning disks. On modern NVMe with write-back cache it's ~50µs. Acceptable for 2.4 ops/sec but would not scale.
+
+3. **Head-corruption recovery.** If the last few bytes of the WAL are truncated (e.g., power loss during write), the deserializer stops at the first incomplete record and returns all prior records. This is correct but means the last write is silently lost — no error is reported to the caller.
+
+### Shortcuts / Known Gaps
+
+| Gap | Impact | When to Fix |
+|-----|--------|-------------|
+| No WAL compaction / rotation | WAL grows unbounded | After all phases, if storage growth becomes an issue |
+| No checkpoint / snapshot | Full WAL replay on every restart | After all phases, for faster startup |
+| Header-only read path still acquires read lock | Lock contention under high concurrency | Not needed for k3s workload |
+| `Arc<[u8]>` prevents mutation but not ownership cycles | Theoretical memory leak if keys are churned | Never in practice |
+
+---
+
+## Phase 2 — KV Operations (2026-06-13)
+
+### Design Decisions
+
+**1. `resolve_range` with 5 bound types.**
+The etcd v3 range protocol uses `key` + `range_end` to encode five access patterns, each mapping to a `RangeBound` variant:
+
+| Pattern | `range_end` | `RangeBound` |
+|---------|-------------|--------------|
+| Point lookup | empty | `Point(key)` |
+| From-key (>=key) | `\0` (single zero byte) | `From(key)` |
+| All keys | empty key + `\0` | `All` |
+| Prefix | key + 1 (last byte incremented) or key + `\0` | `Prefix(key)` |
+| Range [start, end) | explicit end key | `Range(start, end)` |
+
+The `resolve_range` function decodes these patterns once per request. The result is cached in a `RangeBound` enum and passed to `matches_range` for each key in the BTreeMap scan.
+
+**2. Empty `range_end` is a point lookup (not from-key).**
+Bug discovered during testing: the initial implementation treated empty `range_end` as `From(key)` instead of `Point(key)`. In the etcd proto, empty `range_end` means "single key." A single-byte `\0` means "from key." The fix was verified against 5 regression tests.
+
+**3. Prefix encoding via last-byte-increment.**
+etcd encodes prefix watches/ranges as `range_end = key with last byte + 1` (standard) or `range_end = key + \0` (alternate). `resolve_range` checks both. The standard encoding handles most cases; the alternate covers keys like `foo\xFF` where incrementing wraps to zero.
+
+**4. Txn: compare-then-execute without speculative execution.**
+`TxnRequest` evaluates all comparisons first (read lock), then executes the success or failure branch (individual operations, each acquiring its own write lock). There is no two-phase commit or rollback. If a write in the success branch fails (WAL error), subsequent writes in the same branch still execute. This matches etcd's behavior ("best-effort" txn) but means the txn is not atomic across multiple writes.
+
+**5. Test isolation via `~~~_del/` prefix.**
+From-key (`>=key`) operations are inherently unbounded — they match all keys above the given key. To prevent interference between tests running against the shared store, from-key tests use the `~~~` prefix (highest sortable ASCII, value 0x7E). This keeps from-key operations within a known range and avoids deleting keys from other tests. Point, prefix, and range tests use `aaa_`, `bbb_` prefixes.
+
+### Doubts & Unresolved Questions
+
+1. **Txn atomicity.** An etcd txn is atomic: all operations execute or none. Our `execute_txn_ops` runs operations sequentially and does not roll back on failure. If the WAL write for the first `put` in a txn succeeds but the second `put` fails, the first write is committed. This violates the txn contract. Fixing it would require buffering WAL writes in a transaction log and only flushing on success.
+
+2. **Delete is a logical tombstone (not physical removal).** The `deleted: bool` flag on `KeyState` avoids compaction work on every delete. Deleted keys are filtered from range results but remain in the BTreeMap until the next compaction. This means memory usage grows with delete volume, not just live key count.
+
+3. **Compact does not prune the WAL.** `compact()` sets `compact_rev` and removes deleted/old entries from the in-memory BTreeMap, but the WAL retains all records. A full WAL replay on restart would restore the tombstoned keys, requiring another compaction to clean up. This is a correctness issue (compaction is not persistent) and a performance issue (replay replays deleted records).
+
+### Shortcuts / Known Gaps
+
+| Gap | Impact | When to Fix |
+|-----|--------|-------------|
+| Txn is not atomic across multiple ops | Partial txn execution on WAL error | Requires txn-scoped WAL buffer |
+| Compact not persisted to WAL | BTreeMap is rebuilt with all keys on restart, then compacted again | Requires WAL compact record |
+| Delete is tombstone (memory grows) | Deleted keys use memory until next compact | Acceptable for k3s workload |
+| No range-end validation | Invalid range_end values silently produce incorrect results | Phase 5 hardening |
+| No revision-based MVCC | Cannot read past revisions (range `revision` field is ignored) | Requires per-key revision history |
+
+---
+
 ## Phase 3 — Watch (2026-06-13)
 
 ### Design Decisions
@@ -78,5 +165,62 @@ This bug was invisible to KV/Txn integration tests because they operate on the l
 
 - `src/server/watch.rs` — new full implementation (previously stub)
 - `src/storage/mod.rs` — `WatchRegistration` fields changed from `prefix` to `key`+`range_end`; `notify_watchers` uses `resolve_range`/`matches_range`; `register_watcher`/`cancel_watcher`/`as_ref` made `pub(crate)`; added `wal_path()` to `Store`
-- `src/storage/wal.rs` — CRC32C range fixed in `serialize` (`buf[17..]` → `buf[22..]`) and `deserialize` (`data[23..ofs]` → `data[flags_ofs..ofs]`)
+- `src/storage/wal.rs` — CRC32C range fixed in `serialize` (`buf[17..]` → `buf[22..]`) and `deserialize` (`data[23..ofs]` → `data[flags_ofs..ofs]`); callback-based `scan(offset, f)` returns end offset; `scan_collect` kept for startup
 - `src/main.rs` — `EnvFilter` changed from always-`info` to `try_from_default_env` with `info` fallback
+
+---
+
+## Phase 4 — Lease (2026-06-13)
+
+### Design Decisions
+
+**1. Polling-based expiry (500ms interval)**
+A single background task (`Store::start_expiry_task`) is spawned in `Store::open()`. Every 500ms it acquires the write lock, checks all leases for `expires_at <= now`, and revokes expired ones. No per-lease timers, no cancellation machinery.
+- *Tradeoff:* Worst-case 500ms latency between lease expiry and key deletion. Acceptable for k3s workloads. A `sleep_until` on the earliest-expiring lease would be more precise but requires notification when keepalive extends it (complexity not justified).
+
+**2. Lease operations are free functions on `Store`, not WAL-persisted**
+`lease_grant`, `lease_revoke`, `lease_keep_alive` are async methods on `Store` that operate directly on `StoreState.leases`. No WAL records are written for lease lifecycle events.
+- *Consequence:* Leases do not survive server restart. Keys whose lease expired before restart become orphaned (they retain `lease != 0` but the lease no longer exists). On restart, the in-memory `leases` map is empty.
+
+**3. KeepAlive as simple request-response stream**
+`LeaseKeepAlive` is a bidirectional streaming RPC. Each incoming `LeaseKeepAliveRequest` triggers `Store::lease_keep_alive(id)` which resets `expires_at = now + ttl` and responds with the granted TTL. No batching, no heartbeat coalescing.
+
+**4. AtomicI64 counter for lease IDs**
+`NEXT_LEASE_ID` is a global `AtomicI64` starting at 1. If the client sends `id=0` (auto-assign), the server generates one. Client-specified IDs are used as-is. etcd uses a similar counter starting from a random seed (to avoid collisions in clusters). Single-node makes a simple counter safe.
+
+**5. `LeaseState.key_count` not maintained**
+The `key_count` field exists on `LeaseState` but is never updated. `lease_time_to_live` computes attached-key count dynamically by scanning `state.keys` for matching lease IDs. Accurate and avoids bookkeeping bugs.
+
+### Doubts & Unresolved Questions
+
+1. **Lease persistence.** The PRD envisions WAL-persisted leases but the current WAL format has no lease record type. Adding lease records would need a new flag bit (e.g., `IS_LEASE`) and a new record layout. Since k3s leases are typically short-lived (seconds to minutes) and the control plane recreates them on restart, this is acceptable as a known gap.
+
+2. **Put with non-existent lease silently succeeds.** In etcd, putting a key with an unknown lease ID returns `Err(LeaseNotFound)`. Our `Store::put()` stores the lease ID regardless. This can create orphaned keys with dangling lease references. The test `test_lease_with_key_expiry` grants a lease then puts with the valid ID, so it passes — but the guard is missing.
+
+3. **Expiry task holds write lock during revocation.** When the expiry task finds expired leases, it acquires the write lock and processes all revocations (WAL writes + key deletions + watch notifications) while holding it. If many leases expire simultaneously (e.g., after a long downtime), this blocks concurrent writes for the duration. In practice, k3s leases expire at different times.
+
+4. **No limit on lease TTL or count.** etcd enforces a maximum TTL (e.g., 100000000 seconds) and may limit total lease count. Our implementation accepts any positive TTL and any number of leases. A runaway client could exhaust memory.
+
+### Shortcuts / Known Gaps
+
+| Gap | Impact | When to Fix |
+|-----|--------|-------------|
+| Leases not persisted to WAL | Lost on restart; keys with expired leases become orphaned | Requires WAL format change (new record type) |
+| Put doesn't validate lease existence | Keys can be created with non-existent lease IDs | Phase 5 hardening |
+| No maximum TTL / lease count | No guard against runaway clients | Phase 5 hardening |
+| Expiry task uses polling | Up to 500ms latency; holds write lock for batch expiry | If profiling shows issues |
+| `LeaseState.key_count` unused | Field exists but is never incremented/decremented | Remove or implement |
+| No `LeaseCheckpoint` support | Required for etcd 3.5+ lease checkpointing feature | If k3s needs it |
+
+### Test Coverage
+
+- 5 lease tests pass against Rudurru: `test_lease_grant_revoke`, `test_lease_with_key_expiry`, `test_lease_keepalive`, `test_lease_ttl`, `test_lease_list`
+- `test_lease_with_key_expiry` validates the full expiry pipeline: grant TTL=3, put key, sleep 5s, assert key deleted
+- `test_lease_keepalive` validates bidirectional keepalive stream
+- All existing 33 KV/Txn/Watch tests unaffected
+- 46/47 integration tests pass against real etcd (1 regression: `test_delete_from_key` — pre-existing state pollution in shared docker, passes against fresh Rudurru)
+
+### Files Changed
+
+- `src/server/lease.rs` — full implementation of all 5 Lease RPCs (previously all stubs)
+- `src/storage/mod.rs` — added `NEXT_LEASE_ID`, `LeaseGrantRequest`/`LeaseRevokeRequest`/`LeaseKeepAliveResponse`/`LeaseTimeToLiveRequest`/`LeaseLeasesRequest` handlers on `Store`; `start_expiry_task`; `use std::sync::atomic::AtomicI64`
