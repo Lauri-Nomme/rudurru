@@ -2,7 +2,9 @@ use etcd_client::*;
 use std::time::Duration;
 use tokio::time::Instant;
 
-const ENDPOINT: &str = "http://127.0.0.1:2379";
+fn endpoint() -> String {
+    std::env::var("ETCD_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:2379".into())
+}
 const KEY_PREFIX: &str = "rudurru_bench/";
 
 fn make_key(i: u64) -> String {
@@ -14,7 +16,7 @@ fn make_value(n: usize) -> Vec<u8> {
 }
 
 async fn connect() -> Client {
-    Client::connect([ENDPOINT], None)
+    Client::connect([endpoint()], None)
         .await
         .expect("connect to Rudurru")
 }
@@ -34,7 +36,7 @@ fn compute_stats(latencies: &[Duration]) -> (f64, f64, f64) {
 #[tokio::main]
 async fn main() {
     println!("=== Rudurru Performance Benchmark ===\n");
-    println!("Endpoint: {ENDPOINT}\n");
+    println!("Endpoint: {}\n", endpoint());
 
     // ── Warmup ─────────────────────────────────────────────────────
     let mut client = connect().await;
