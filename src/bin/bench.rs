@@ -125,7 +125,7 @@ async fn main() {
 
     // ── Concurrent throughput ───────────────────────────────────────
     println!("\n── Concurrent put throughput (2000 total ops) ──");
-    for &workers in &[1, 4, 8, 16, 32] {
+    for &workers in &[1, 4, 8, 16, 32, 64, 128] {
         let val = make_value(128);
         let start = Instant::now();
         let mut handles = Vec::new();

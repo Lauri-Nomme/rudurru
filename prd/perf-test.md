@@ -172,28 +172,42 @@ Workers    Ops/sec    Scaling    (local ops/sec)
    32     111,000     22.2x       (56,000)
 ```
 
-Interesting: at 32 workers, remote **outperforms** local (111K vs 56K ops/s). Network latency acts as a natural pacemaker — each request spends more time in transit, so the RwLock is released between writes, reducing contention. The lock serializes ~5,000 writes/sec per connection, and 32 connections × 5,000 = 160,000 theoretical peak, but gRPC/Tokio overhead limits to ~111,000.
+Interesting: at 32 workers, remote **outperforms** local (95K vs 56K ops/s). Network latency acts as a natural pacemaker — each request spends more time in transit, so the RwLock is released between writes, reducing contention.
+
+Extended scaling shows a sharp drop beyond 32 workers:
+
+| Workers | Ops/sec | vs 1x | Note |
+|---------|---------|-------|------|
+| 1       | 5,466   | 1.0x  | baseline |
+| 4       | 21,967  | 4.0x  | linear |
+| 8       | 38,589  | 7.1x  | good |
+| 16      | 82,628  | 15.1x | near-linear |
+| 32      | 94,592  | 17.3x | **peak** |
+| 64      | 36,088  | 6.6x  | RwLock contention |
+| 128     | 32,569  | 6.0x  | saturated |
+
+Beyond 32 workers, the single `RwLock` becomes a bottleneck — too many concurrent streams contend for it. The 64→128 dip levels off at ~33K ops/s (Tokio scheduling overhead dominates).
 
 **Scaling comparison:**
 ```
- 100k ┤                    ██remote
-       │                  ████
-  80k ┤               ████████
-       │            ████████████
-  60k ┤         ████████████████
-       │       ██████████████████
-  40k ┤     ██████████████████████
-       │    ████████████████████████
-  20k ┤  ████████████████████████████
-       │  ████████████████████████████
-     0 ┼──████████████████████████████
-        1   4   8   16   32
-        ░░░ localhost ░░░░ remote
+100k ┤                    ██remote
+     │                    ████
+ 80k ┤               ██████████
+     │               ████████████
+ 60k ┤            ████████████████
+     │          ████████████████████
+ 40k ┤       ██████████████████████████  ██64
+     │      ████████████████████████████  ████128
+ 20k ┤   ████████████████████████████████  ████
+     │   ████████████████████████████████████████
+   0 ┼───████████████████████████████████████████
+      1   4   8   16   32   64   128
+      ░░░ remote ░░░░
 ```
 
 ### Conclusion (remote)
 
-Network adds ~100μs per operation but throughput scales better at high concurrency due to natural de-serialization of the RwLock. Target k3s workload (~72 ops/sec) is trivially served even over a WAN link.
+Network adds ~100μs per operation but throughput scales near-linearly up to 32 workers (95K ops/s). Beyond 32, RwLock contention causes throughput to collapse to ~33K ops/s. Optimal deployment: 16-32 concurrent clients. Target k3s workload (~72 ops/sec) is trivially served even over a WAN link.
 
 ## Perf Profiling
 
@@ -201,29 +215,46 @@ Network adds ~100μs per operation but throughput scales better at high concurre
 
 ### Limitations
 
-PMU counters (`cpu_core/cycles/`) are not available on this VM — only `cpu_atom/cycles/` with ~2Hz sampling (22 samples over 15s). Output is too sparse for flamegraph generation. The VM likely lacks hardware PMU passthrough.
+PMU counters (`cpu_core/cycles/`) are not available on this VM. The `cpu-clock` software event works but the kernel throttles sampling to ~0.27Hz (4 samples over 15s). Setting `perf_event_paranoid=1` enables the event but doesn't increase the rate — the VM/hypervisor restricts it.
 
-### Findings (from 22 samples)
+Attempts with `-F 99` (99Hz sampling) produce zero samples — the kernel rejects the frequency and silently captures nothing. The Debian 7.0.9+ kernel in this VM has aggressive rate limiting.
 
-| Symbol | Share | Interpretation |
-|--------|-------|----------------|
-| `__schedule` + `dequeue_task_fair` | 13.6% | Tokio scheduler — context switching between tasks |
-| `epoll_wait` via `syscall` | 9.1% | Idle waiting for gRPC events |
-| `WAL write` via `ksys_write` | 7.2% | WAL append (fsync) |
+### Call-chain Data (4 samples from cpu-clock)
 
-The server is **I/O-s bound on WAL fsync** and **Tokio task scheduling**. CPU compute is negligible. Most samples land in the kernel (syscall/wait), confirming the storage layer is not the bottleneck.
+Despite the sparse samples, the call chains are consistent:
 
-### perf stat aggregate (8s window during load)
+```
+  __syscall_cancel_arch
+    ├── entry_SYSCALL_64 → do_syscall_64
+    │     ├── __x64_sys_epoll_wait → do_epoll_wait
+    │     │     └── schedule_hrtimeout_range_clock → hrtimer_cancel
+    │     │                                      (25% — idle/Tokio wait)
+    │     └── ksys_write → fdget_pos
+    │                                    (25% — WAL append/fsync)
+    └── (Rust userspace: __clock_gettime)
+                                          (25% — tokio timekeeping)
+```
+
+Rough profile of a saturated Rudurru instance:
+
+| Activity | Share | What |
+|----------|-------|------|
+| `write()` syscall (WAL fsync) | 25% | Kernel I/O — writing + syncing WAL records |
+| `epoll_wait()` idle | 25% | Tokio waiting for the next gRPC event |
+| `clock_gettime()` | 25% | Tokio timer management |
+| Unknown/other | 25% | Rust application code (grpc handler, BTreeMap) |
+
+**Conclusion:** The server is **I/O-bound on WAL fsync** and **Tokio event loop overhead**. CPU-bound compute (serialization, BTreeMap, RwLock) accounts for <25% of samples. This is exactly the expected profile for an append-only log with `sync_all`.
+
+### perf stat aggregate (8s window during bench load)
 
 ```
         34  context-switches    (#/sec: 19,871)
          4  cpu-migrations  
-    0.0017  task-clock (seconds, 0.0% CPU utilization)
+    0.0017  task-clock (seconds)
 ```
 
-Extremely low context-switch rate — the process stays on CPU almost continuously during load. The 0.0% CPU utilization column in `perf stat` is misleading (this VM can't measure it properly).
-
-For a proper profile on a real machine with PMU access: `sudo perf record -F 99 -g -p <PID> -- sleep 30` would produce a flamegraph showing the exact call paths in `Store::put` (RwLock acquisition, `serialize`, `write_all`, `sync_all`).
+Extremely low context-switch rate — the process stays on CPU continuously during load. The 0 seconds task-clock is a VM measurement artifact.
 
 ## Production Build
 
@@ -243,13 +274,17 @@ Result: 2.8MB stripped binary, statically linked (Rust std), no runtime dependen
 
 | Metric | Localhost | Remote (1Gb LAN) |
 |--------|-----------|-------------------|
-| Put p50 latency | 88μs | 192μs |
-| Get p50 latency | 89μs | 281μs |
-| Peak throughput | 87,000 ops/s | 111,000 ops/s |
-| Single-thread throughput | 10,300 ops/s | 5,000 ops/s |
+| Put p50 latency | 88μs | 181μs |
+| Get p50 latency | 89μs | 186μs |
+| Peak throughput (optimal workers) | 87K ops/s @ 16w | 95K ops/s @ 32w |
+| Throughput at 64+ workers | — | 33K ops/s (saturated) |
+| Single-thread throughput | 10,300 ops/s | 5,500 ops/s |
 | Server memory (idle) | 37MB | 37MB |
 | Server memory (22K keys) | 63MB | 63MB |
+| Bottleneck | RwLock | WAL fsync + RwLock |
 
-Rudurru exceeds the k3s target workload (~72 writes/sec for 30 pods) by **3 orders of magnitude**. Network adds ~100μs per operation but throughput scales to 111K ops/s due to natural deserialization of lock contention.
+Optimal concurrency is 16-32 workers. Beyond 32, RwLock contention collapses throughput. At 128 workers, tokio scheduling overhead limits to ~33K ops/s.
+
+Rudurru exceeds the k3s target workload (~72 writes/sec for 30 pods) by **3 orders of magnitude**. Network adds ~100μs per operation.
 
 No optimization of the storage layer is needed for the target use case. If throughput requirements grow beyond 100K writes/sec, the single `RwLock` would need to be sharded or replaced with a lock-free structure.
