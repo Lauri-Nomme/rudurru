@@ -1,10 +1,20 @@
 use crate::proto::etcdserverpb;
+use crate::storage::Store;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-#[derive(Debug, Default)]
-pub struct Watch;
+#[derive(Debug)]
+pub struct Watch {
+    store: Arc<Store>,
+}
+
+impl Watch {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+}
 
 #[tonic::async_trait]
 impl etcdserverpb::watch_server::Watch for Watch {

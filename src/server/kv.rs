@@ -1,43 +1,58 @@
 use crate::proto::etcdserverpb;
+use crate::storage::Store;
+use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-#[derive(Debug, Default)]
-pub struct Kv;
+#[derive(Debug)]
+pub struct Kv {
+    store: Arc<Store>,
+}
+
+impl Kv {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+}
 
 #[tonic::async_trait]
 impl etcdserverpb::kv_server::Kv for Kv {
     async fn range(
         &self,
-        _req: Request<etcdserverpb::RangeRequest>,
+        req: Request<etcdserverpb::RangeRequest>,
     ) -> Result<Response<etcdserverpb::RangeResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.range(req.into_inner()).await;
+        Ok(Response::new(resp))
     }
 
     async fn put(
         &self,
-        _req: Request<etcdserverpb::PutRequest>,
+        req: Request<etcdserverpb::PutRequest>,
     ) -> Result<Response<etcdserverpb::PutResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.put(req.into_inner()).await;
+        Ok(Response::new(resp))
     }
 
     async fn delete_range(
         &self,
-        _req: Request<etcdserverpb::DeleteRangeRequest>,
+        req: Request<etcdserverpb::DeleteRangeRequest>,
     ) -> Result<Response<etcdserverpb::DeleteRangeResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.delete_range(req.into_inner()).await;
+        Ok(Response::new(resp))
     }
 
     async fn txn(
         &self,
-        _req: Request<etcdserverpb::TxnRequest>,
+        req: Request<etcdserverpb::TxnRequest>,
     ) -> Result<Response<etcdserverpb::TxnResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.txn(req.into_inner()).await;
+        Ok(Response::new(resp))
     }
 
     async fn compact(
         &self,
-        _req: Request<etcdserverpb::CompactionRequest>,
+        req: Request<etcdserverpb::CompactionRequest>,
     ) -> Result<Response<etcdserverpb::CompactionResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.compact(req.into_inner()).await;
+        Ok(Response::new(resp))
     }
 }

@@ -1,8 +1,18 @@
 use crate::proto::etcdserverpb;
+use crate::storage::Store;
+use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-#[derive(Debug, Default)]
-pub struct Auth;
+#[derive(Debug)]
+pub struct Auth {
+    store: Arc<Store>,
+}
+
+impl Auth {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+}
 
 #[tonic::async_trait]
 impl etcdserverpb::auth_server::Auth for Auth {

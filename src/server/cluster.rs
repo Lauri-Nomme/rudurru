@@ -1,8 +1,18 @@
 use crate::proto::etcdserverpb;
+use crate::storage::Store;
+use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-#[derive(Debug, Default)]
-pub struct Cluster;
+#[derive(Debug)]
+pub struct Cluster {
+    store: Arc<Store>,
+}
+
+impl Cluster {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+}
 
 #[tonic::async_trait]
 impl etcdserverpb::cluster_server::Cluster for Cluster {
