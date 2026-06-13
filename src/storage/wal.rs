@@ -143,40 +143,33 @@ impl WalFile {
         })
     }
 
-    /// Scan all records from the WAL file.
-    pub fn scan(&mut self) -> io::Result<Vec<WalRecord>> {
-        self.file.seek(SeekFrom::Start(0))?;
-        self.scan_remaining()
-    }
-
-    /// Scan records starting from a given byte offset.
-    /// Useful for incremental scanning without re-reading the entire file.
-    pub fn scan_from(&mut self, offset: u64) -> io::Result<Vec<WalRecord>> {
+    /// Scan WAL records from `offset`, calling `f` for each.
+    /// Returns the byte offset after the last byte consumed.
+    pub fn scan<F>(&mut self, offset: u64, f: F) -> io::Result<u64>
+    where F: FnMut(&WalRecord),
+    {
         self.file.seek(SeekFrom::Start(offset))?;
-        self.scan_remaining()
-    }
-
-    /// Current file length in bytes.
-    pub fn file_len(&self) -> io::Result<u64> {
-        self.file.metadata().map(|m| m.len())
-    }
-
-    fn scan_remaining(&mut self) -> io::Result<Vec<WalRecord>> {
-        let mut records = Vec::new();
         let mut buf = Vec::new();
         self.file.read_to_end(&mut buf)?;
-
+        let mut f = f;
         let mut ofs = 0;
         while ofs < buf.len() {
             match WalRecord::deserialize(&buf[ofs..]) {
                 Ok((rec, consumed)) => {
-                    records.push(rec);
+                    f(&rec);
                     ofs += consumed;
                 }
                 Err(_) => break,
             }
         }
+        Ok(offset + buf.len() as u64)
+    }
 
+    /// Convenience: scan all records into a Vec. Allocates.
+    /// Prefer `scan(offset, f)` when a callback is natural.
+    pub fn scan_collect(&mut self) -> io::Result<Vec<WalRecord>> {
+        let mut records = Vec::new();
+        self.scan(0, |rec| records.push(rec.clone()))?;
         Ok(records)
     }
 

@@ -94,23 +94,17 @@ impl etcdserverpb::watch_server::Watch for Watch {
 
                                 let checkpoint_rev = if start_revision > 0 { current_revision() } else { 0 };
 
-                                // Phase 1: replay events [start_revision, checkpoint_rev] without lock
-                                let wal_len = if start_revision > 0 && start_revision <= checkpoint_rev {
+                                let phase1_end = if start_revision > 0 && start_revision <= checkpoint_rev {
                                     if let Ok(mut reader) = wal::WalFile::open(&store.wal_path().await) {
-                                        let len = reader.file_len().unwrap_or(0);
-                                        if let Ok(ref records) = reader.scan() {
-                                            let bound = storage::resolve_range(&key, &range_end);
-                                            for rec in records.iter() {
-                                                if rec.revision < start_revision || rec.revision > checkpoint_rev {
-                                                    continue;
-                                                }
-                                                if !storage::matches_range(bound.to_ref(), &rec.key) {
-                                                    continue;
-                                                }
+                                        let bound = storage::resolve_range(&key, &range_end);
+                                        reader.scan(0, |rec| {
+                                            if rec.revision >= start_revision
+                                                && rec.revision <= checkpoint_rev
+                                                && storage::matches_range(bound.to_ref(), &rec.key)
+                                            {
                                                 let _ = event_tx.send(rec_to_event(rec));
                                             }
-                                        }
-                                        len
+                                        }).unwrap_or(0)
                                     } else {
                                         0
                                     }
@@ -123,18 +117,14 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     let mut state = store.state.write().await;
 
                                     if start_revision > 0 {
-                                        if let Ok(ref records) = state.wal.scan_from(wal_len) {
-                                            let bound = storage::resolve_range(&key, &range_end);
-                                            for rec in records.iter() {
-                                                if rec.revision <= checkpoint_rev {
-                                                    continue;
-                                                }
-                                                if !storage::matches_range(bound.to_ref(), &rec.key) {
-                                                    continue;
-                                                }
+                                        let bound = storage::resolve_range(&key, &range_end);
+                                        let _ = state.wal.scan(phase1_end, |rec| {
+                                            if rec.revision > checkpoint_rev
+                                                && storage::matches_range(bound.to_ref(), &rec.key)
+                                            {
                                                 let _ = event_tx.send(rec_to_event(rec));
                                             }
-                                        }
+                                        });
                                     }
 
                                     state.register_watcher(

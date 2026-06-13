@@ -7,9 +7,14 @@
 **1. Push-based notification via `mpsc::UnboundedSender`**
 Each watcher gets its own `UnboundedSender<WatchEvent>` stored in `WatchRegistration`. `notify_watchers` iterates all registrations and pushes matching events. No polling loop, no timer. Matches the PRD tenet "no polling."
 
-**2. WAL replay inside the write lock**
-When a watcher specifies `start_revision > 0`, the handler acquires the store's write lock, scans the WAL, sends matching historical events to the watcher's channel, and registers the watcher — all atomically. This prevents the race where a concurrent write between replay and registration would be missed.
-- *Tradeoff:* The write lock is held during WAL scan. WAL scan reads the entire file and deserializes every record. For a large WAL this could block writes for milliseconds. Acceptable because k3s workloads write ~2.4 ops/sec.
+**2. Two-phase WAL replay (minimizes lock time)**
+Refactored to minimize write-lock hold time:
+- **Phase 1 (no lock):** Note `checkpoint_rev = current_revision()` and `wal_len = file_len()`. Open a separate WalFile handle, scan from byte 0, send events for records with `revision in [start_revision, checkpoint_rev]`. Write lock is never acquired.
+- **Phase 2 (under lock):** `wal.scan_from(wal_len)` reads only bytes appended after the checkpoint. Send events for records with `revision > checkpoint_rev`. Register watcher.
+
+Lock time is now `O(writes_between_phase1_and_phase2)` — typically 0-1 records — instead of `O(total_WAL_size)`. The `file_len()` call must happen before `scan()` in Phase 1: any write between `file_len` and `scan` is read by the scan but filtered (revision > checkpoint_rev), then caught by Phase 2's `scan_from`.
+
+`checkpoint_rev` name chosen over `current_rev` to emphasize it's a point-in-time snapshot, not the live head revision.
 
 **3. Watcher matching via `resolve_range` + `matches_range`**
 `WatchRegistration` stores the raw `key` + `range_end` from the proto, not a precomputed prefix. `notify_watchers` calls `resolve_range` + `matches_range` on every event to check match. This supports all range types (point, prefix, from-key, range) without maintaining separate match logic.

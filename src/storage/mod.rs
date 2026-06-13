@@ -232,7 +232,7 @@ impl Store {
     /// Rebuilds in-memory state from the WAL on startup.
     pub async fn open(wal_path: &str) -> anyhow::Result<Self> {
         let mut wal = wal::WalFile::open(wal_path)?;
-        let records = wal.scan()?;
+        let records = wal.scan_collect()?;
 
         let mut state = StoreState::new(wal);
         let mut max_rev = 0u64;
