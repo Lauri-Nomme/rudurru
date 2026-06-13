@@ -20,42 +20,62 @@ impl Lease {
 impl etcdserverpb::lease_server::Lease for Lease {
     async fn lease_grant(
         &self,
-        _req: Request<etcdserverpb::LeaseGrantRequest>,
+        req: Request<etcdserverpb::LeaseGrantRequest>,
     ) -> Result<Response<etcdserverpb::LeaseGrantResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.lease_grant(req.into_inner()).await;
+        Ok(Response::new(resp))
     }
 
     async fn lease_revoke(
         &self,
-        _req: Request<etcdserverpb::LeaseRevokeRequest>,
+        req: Request<etcdserverpb::LeaseRevokeRequest>,
     ) -> Result<Response<etcdserverpb::LeaseRevokeResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.lease_revoke(req.into_inner()).await;
+        Ok(Response::new(resp))
     }
 
     type LeaseKeepAliveStream = ReceiverStream<Result<etcdserverpb::LeaseKeepAliveResponse, Status>>;
 
     async fn lease_keep_alive(
         &self,
-        _req: Request<tonic::Streaming<etcdserverpb::LeaseKeepAliveRequest>>,
+        req: Request<tonic::Streaming<etcdserverpb::LeaseKeepAliveRequest>>,
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
-        let (tx, rx) = mpsc::channel(1);
+        let mut in_stream = req.into_inner();
+        let store = self.store.clone();
+
+        let (tx, rx) = mpsc::channel(64);
+
         tokio::spawn(async move {
-            let _ = tx.send(Err(Status::unimplemented("not implemented")));
+            loop {
+                match in_stream.message().await {
+                    Ok(Some(msg)) => {
+                        let resp = store.lease_keep_alive(msg.id).await;
+                        if tx.send(Ok(resp)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
         });
+
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn lease_time_to_live(
         &self,
-        _req: Request<etcdserverpb::LeaseTimeToLiveRequest>,
+        req: Request<etcdserverpb::LeaseTimeToLiveRequest>,
     ) -> Result<Response<etcdserverpb::LeaseTimeToLiveResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.lease_time_to_live(req.into_inner()).await;
+        Ok(Response::new(resp))
     }
 
     async fn lease_leases(
         &self,
         _req: Request<etcdserverpb::LeaseLeasesRequest>,
     ) -> Result<Response<etcdserverpb::LeaseLeasesResponse>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        let resp = self.store.lease_leases().await;
+        Ok(Response::new(resp))
     }
 }

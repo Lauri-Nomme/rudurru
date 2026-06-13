@@ -4,7 +4,8 @@ use crate::proto::etcdserverpb;
 use crate::proto::mvccpb;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
 /// Global revision counter. Monotonically increasing, starts at 1.
@@ -16,6 +17,12 @@ pub fn next_revision() -> u64 {
 
 pub fn current_revision() -> u64 {
     NEXT_REV.load(Ordering::SeqCst).saturating_sub(1)
+}
+
+static NEXT_LEASE_ID: AtomicI64 = AtomicI64::new(1);
+
+fn next_lease_id() -> i64 {
+    NEXT_LEASE_ID.fetch_add(1, Ordering::SeqCst)
 }
 
 /// In-memory representation of a key's current state.
@@ -257,9 +264,10 @@ impl Store {
             state.compact_rev,
         );
 
-        Ok(Self {
-            state: Arc::new(RwLock::new(state)),
-        })
+        let state = Arc::new(RwLock::new(state));
+        Self::start_expiry_task(state.clone());
+
+        Ok(Self { state })
     }
 
     pub async fn wal_path(&self) -> String {
@@ -508,6 +516,142 @@ impl Store {
         etcdserverpb::CompactionResponse {
             header: Some(state.header()),
         }
+    }
+
+    // ── Lease operations ────────────────────────────────────────────────
+
+    pub async fn lease_grant(&self, req: etcdserverpb::LeaseGrantRequest) -> etcdserverpb::LeaseGrantResponse {
+        let mut state = self.state.write().await;
+        let id = if req.id != 0 { req.id } else { next_lease_id() };
+        let ttl = req.ttl;
+        let expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
+        state.leases.insert(id, LeaseState { id, ttl, expires_at, key_count: 0 });
+        etcdserverpb::LeaseGrantResponse {
+            header: Some(state.header()),
+            id,
+            ttl,
+            error: String::new(),
+        }
+    }
+
+    pub async fn lease_revoke(&self, req: etcdserverpb::LeaseRevokeRequest) -> etcdserverpb::LeaseRevokeResponse {
+        let mut state = self.state.write().await;
+        let id = req.id;
+        state.leases.remove(&id);
+        let keys_to_delete: Vec<Vec<u8>> = state.keys.iter()
+            .filter(|(_, ks)| ks.lease == id && !ks.deleted)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &keys_to_delete {
+            let rev = next_revision();
+            state.apply_delete(key.clone(), rev);
+            let record = wal::WalRecord {
+                revision: rev,
+                key: key.clone(),
+                value: vec![],
+                flags: wal::DELETED,
+                lease_id: None,
+            };
+            if let Err(e) = state.wal.append(&record) {
+                tracing::error!("WAL append failed on lease revoke: {e}");
+            }
+        }
+        etcdserverpb::LeaseRevokeResponse {
+            header: Some(state.header()),
+        }
+    }
+
+    pub async fn lease_keep_alive(&self, id: i64) -> etcdserverpb::LeaseKeepAliveResponse {
+        let mut state = self.state.write().await;
+        if let Some(ls) = state.leases.get_mut(&id) {
+            let ttl = ls.ttl;
+            ls.expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
+            etcdserverpb::LeaseKeepAliveResponse {
+                header: Some(state.header()),
+                id,
+                ttl,
+            }
+        } else {
+            etcdserverpb::LeaseKeepAliveResponse {
+                header: Some(state.header()),
+                id,
+                ttl: -1,
+            }
+        }
+    }
+
+    pub async fn lease_time_to_live(&self, req: etcdserverpb::LeaseTimeToLiveRequest) -> etcdserverpb::LeaseTimeToLiveResponse {
+        let state = self.state.read().await;
+        if let Some(ls) = state.leases.get(&req.id) {
+            let remaining = (ls.expires_at.saturating_duration_since(tokio::time::Instant::now())).as_secs() as i64;
+            let keys = if req.keys {
+                state.keys.iter()
+                    .filter(|(_, ks)| ks.lease == req.id && !ks.deleted)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            } else {
+                vec![]
+            };
+            etcdserverpb::LeaseTimeToLiveResponse {
+                header: Some(state.header()),
+                id: req.id,
+                ttl: remaining.max(0),
+                granted_ttl: ls.ttl,
+                keys,
+            }
+        } else {
+            etcdserverpb::LeaseTimeToLiveResponse {
+                header: Some(state.header()),
+                id: req.id,
+                ttl: -1,
+                granted_ttl: -1,
+                keys: vec![],
+            }
+        }
+    }
+
+    pub async fn lease_leases(&self) -> etcdserverpb::LeaseLeasesResponse {
+        let state = self.state.read().await;
+        let leases = state.leases.iter().map(|(id, _)| etcdserverpb::LeaseStatus { id: *id }).collect();
+        etcdserverpb::LeaseLeasesResponse {
+            header: Some(state.header()),
+            leases,
+        }
+    }
+
+    fn start_expiry_task(state: Arc<RwLock<StoreState>>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let mut s = state.write().await;
+                let now = tokio::time::Instant::now();
+                let expired: Vec<i64> = s.leases.iter()
+                    .filter(|(_, ls)| ls.expires_at <= now)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in expired {
+                    s.leases.remove(&id);
+                    let keys_to_delete: Vec<Vec<u8>> = s.keys.iter()
+                        .filter(|(_, ks)| ks.lease == id && !ks.deleted)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for key in &keys_to_delete {
+                        let rev = next_revision();
+                        s.apply_delete(key.clone(), rev);
+                        let record = wal::WalRecord {
+                            revision: rev,
+                            key: key.clone(),
+                            value: vec![],
+                            flags: wal::DELETED,
+                            lease_id: None,
+                        };
+                        if let Err(e) = s.wal.append(&record) {
+                            tracing::error!("WAL append failed on lease expiry: {e}");
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 
