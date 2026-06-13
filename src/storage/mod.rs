@@ -619,6 +619,25 @@ impl Store {
         }
     }
 
+    // ── Maintenance operations ──────────────────────────────────────────
+
+    pub async fn db_size(&self) -> i64 {
+        let state = self.state.read().await;
+        state.wal.file.metadata().map(|m| m.len() as i64).unwrap_or(0)
+    }
+
+    pub async fn store_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let state = self.state.read().await;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (k, ks) in state.keys.iter() {
+            if ks.deleted { continue; }
+            k.hash(&mut hasher);
+            ks.value.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     fn start_expiry_task(state: Arc<RwLock<StoreState>>) {
         tokio::spawn(async move {
             loop {

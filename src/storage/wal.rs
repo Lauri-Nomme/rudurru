@@ -126,7 +126,7 @@ impl WalRecord {
 /// Append-only WAL file.
 #[derive(Debug)]
 pub struct WalFile {
-    file: std::fs::File,
+    pub file: std::fs::File,
     pub path: String,
 }
 
