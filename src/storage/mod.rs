@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 /// Global revision counter. Monotonically increasing, starts at 1.
 static NEXT_REV: AtomicU64 = AtomicU64::new(1);
@@ -165,20 +165,9 @@ impl StoreState {
     }
 
     // Watcher management
-    pub(crate) fn register_watcher(&mut self, key: Vec<u8>, range_end: Vec<u8>, start_revision: u64,
-                       sender: mpsc::UnboundedSender<WatchEvent>, watch_id: i64,
-                       progress_notify: bool, filters: Vec<i32>, prev_kv: bool) -> i64 {
-        let registration = WatchRegistration {
-            key,
-            range_end,
-            start_revision,
-            sender,
-            watch_id,
-            progress_notify,
-            filters,
-            prev_kv,
-        };
-        self.watchers.push(registration);
+    pub(crate) fn register_watcher(&mut self, reg: WatchRegistration) -> i64 {
+        let watch_id = reg.watch_id;
+        self.watchers.push(reg);
         watch_id
     }
 
@@ -203,17 +192,13 @@ impl StoreState {
             let mut should_send = true;
             for &filter in &watcher.filters {
                 match filter {
-                    0 => {
-                        if event.event_type == mvccpb::event::EventType::Put {
-                            should_send = false;
-                            break;
-                        }
+                    0 if event.event_type == mvccpb::event::EventType::Put => {
+                        should_send = false;
+                        break;
                     }
-                    1 => {
-                        if event.event_type == mvccpb::event::EventType::Delete {
-                            should_send = false;
-                            break;
-                        }
+                    1 if event.event_type == mvccpb::event::EventType::Delete => {
+                        should_send = false;
+                        break;
                     }
                     _ => {}
                 }
@@ -612,7 +597,7 @@ impl Store {
 
     pub async fn lease_leases(&self) -> etcdserverpb::LeaseLeasesResponse {
         let state = self.state.read().await;
-        let leases = state.leases.iter().map(|(id, _)| etcdserverpb::LeaseStatus { id: *id }).collect();
+        let leases = state.leases.keys().map(|id| etcdserverpb::LeaseStatus { id: *id }).collect();
         etcdserverpb::LeaseLeasesResponse {
             header: Some(state.header()),
             leases,

@@ -134,9 +134,9 @@ async fn main() {
             let val = val.clone();
             handles.push(tokio::spawn(async move {
                 let mut c = connect().await;
-                let base = w as u64 * per_task + 30_000_000;
+                let base = w * per_task + 30_000_000;
                 for i in 0..per_task {
-                    let key = make_key(base + i as u64);
+                    let key = make_key(base + i);
                     c.put(key.as_str(), val.as_slice(), None).await.unwrap();
                 }
             }));

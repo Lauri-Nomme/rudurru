@@ -23,6 +23,7 @@ fn self_member() -> etcdserverpb::Member {
 }
 
 #[derive(Debug)]
+#[expect(dead_code)]
 pub struct Cluster {
     store: Arc<Store>,
 }

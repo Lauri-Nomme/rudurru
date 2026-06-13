@@ -1,7 +1,7 @@
 use crate::proto::etcdserverpb;
 use crate::proto::etcdserverpb::watch_request;
 use crate::proto::mvccpb;
-use crate::storage::{self, Store, WatchEvent, current_revision, wal};
+use crate::storage::{self, Store, WatchEvent, WatchRegistration, current_revision, wal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::mpsc;
@@ -127,16 +127,16 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                         });
                                     }
 
-                                    state.register_watcher(
-                                        key.clone(),
+                                    state.register_watcher(WatchRegistration {
+                                        key: key.clone(),
                                         range_end,
                                         start_revision,
-                                        event_tx,
+                                        sender: event_tx,
                                         watch_id,
-                                        create.progress_notify,
-                                        create.filters.iter().map(|f| *f as i32).collect(),
-                                        create.prev_kv,
-                                    );
+                                        progress_notify: create.progress_notify,
+                                        filters: create.filters.to_vec(),
+                                        prev_kv: create.prev_kv,
+                                    });
                                 }
 
                                 let resp = etcdserverpb::WatchResponse {

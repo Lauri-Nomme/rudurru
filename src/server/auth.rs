@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 #[derive(Debug)]
+#[expect(dead_code)]
 pub struct Auth {
     store: Arc<Store>,
 }

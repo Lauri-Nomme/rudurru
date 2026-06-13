@@ -49,11 +49,11 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
             version: "rudurru-0.1.0".into(),
             db_size,
             leader: 1,
-            raft_index: storage::current_revision() as u64,
+            raft_index: storage::current_revision(),
             raft_term: 1,
             db_size_in_use: db_size,
             is_learner: false,
-            raft_applied_index: storage::current_revision() as u64,
+            raft_applied_index: storage::current_revision(),
             errors: vec![],
         }))
     }
