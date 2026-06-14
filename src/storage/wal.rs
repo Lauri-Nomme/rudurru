@@ -7,6 +7,9 @@ pub const HAS_LEASE: u8 = 0x04;
 
 // ── Overlong varint helpers ───────────────────────────────────────
 
+/// Encode a u32 as a 5-byte overlong protobuf varint.
+/// 5 bytes × 7 bits = 35 bits, enough for any u32 (max 32 bits).
+/// The last byte only contributes 4 bits (bits 28-31).
 pub fn encode_overlong_u32(v: u32) -> [u8; 5] {
     let mut buf = [0u8; 5];
     for i in 0..4 {
@@ -16,6 +19,7 @@ pub fn encode_overlong_u32(v: u32) -> [u8; 5] {
     buf
 }
 
+/// Decode a fixed 5-byte overlong protobuf varint.
 pub fn decode_overlong_u32(buf: &[u8]) -> Option<u32> {
     if buf.len() < 5 {
         return None;
@@ -27,6 +31,9 @@ pub fn decode_overlong_u32(buf: &[u8]) -> Option<u32> {
     Some(v as u32)
 }
 
+/// Encode a u64 as a 10-byte overlong protobuf varint.
+/// 10 bytes × 7 bits = 70 bits, enough for any u64 (max 64 bits).
+/// The last byte only contributes 1 bit (bit 63).
 pub fn encode_overlong_u64(v: u64) -> [u8; 10] {
     let mut buf = [0u8; 10];
     for i in 0..9 {
@@ -36,6 +43,7 @@ pub fn encode_overlong_u64(v: u64) -> [u8; 10] {
     buf
 }
 
+/// Decode a fixed 10-byte overlong protobuf varint.
 pub fn decode_overlong_u64(buf: &[u8]) -> Option<u64> {
     if buf.len() < 10 {
         return None;
@@ -80,6 +88,10 @@ pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
 
 // ── Protobuf kv_bytes encoder ─────────────────────────────────────
 
+/// Encodes a `mvccpb.KeyValue` protobuf message with overlong varints
+/// for key_length (4B) and mod_revision (8B). Returns (kv_bytes,
+/// key_offset, mod_rev_offset) where offsets point to the varint data
+/// within kv_bytes (past the field tag).
 pub fn encode_kv(
     key: &[u8],
     value: &[u8],
@@ -92,26 +104,32 @@ pub fn encode_kv(
     let key_offset;
     let mod_rev_offset;
 
-    buf.push(0x0a);
+    // Field 1: key (bytes, wire type 2, field number 1)
+    buf.push(0x0a); // tag = (1 << 3) | 2
     key_offset = buf.len() as u16;
     buf.extend_from_slice(&encode_overlong_u32(key.len() as u32));
     buf.extend_from_slice(key);
 
-    buf.push(0x10);
+    // Field 2: create_revision (int64, wire type 0, field number 2)
+    buf.push(0x10); // tag = (2 << 3) | 0
     buf.extend_from_slice(&encode_varint(create_revision as u64));
 
-    buf.push(0x18);
+    // Field 3: mod_revision (int64, wire type 0, field number 3)
+    buf.push(0x18); // tag = (3 << 3) | 0
     mod_rev_offset = buf.len() as u16;
     buf.extend_from_slice(&encode_overlong_u64(mod_revision as u64));
 
-    buf.push(0x20);
+    // Field 4: version (int64, wire type 0, field number 4)
+    buf.push(0x20); // tag = (4 << 3) | 0
     buf.extend_from_slice(&encode_varint(version as u64));
 
-    buf.push(0x2a);
+    // Field 5: value (bytes, wire type 2, field number 5)
+    buf.push(0x2a); // tag = (5 << 3) | 2
     buf.extend_from_slice(&encode_varint(value.len() as u64));
     buf.extend_from_slice(value);
 
-    buf.push(0x30);
+    // Field 6: lease (int64, wire type 0, field number 6)
+    buf.push(0x30); // tag = (6 << 3) | 0
     buf.extend_from_slice(&encode_varint(lease as u64));
 
     (buf, key_offset, mod_rev_offset)
@@ -141,9 +159,17 @@ pub fn read_mod_revision_from_kv(kv_bytes: &[u8], mod_rev_offset: u16) -> Option
 
 // ── KvWalRecord (protobuf-native WAL format) ──────────────────────
 
-pub const KV_HEADER_SIZE: usize = 9;
+pub const KV_HEADER_SIZE: usize = 9; // flags(1) + key_offset(2) + mod_rev_offset(2) + rec_len(4)
 pub const KV_CRC_SIZE: usize = 4;
 
+/// A WAL record in the protobuf-native format.
+///
+/// Layout on disk:
+///   [flags(1) | key_offset(2) | mod_rev_offset(2) | rec_len(4) | kv_bytes(N) | crc32(4)]
+///
+/// `kv_bytes` is a valid `mvccpb.KeyValue` protobuf message with
+/// overlong varints for key_length and mod_revision (allowing O(1)
+/// field access during scan via the header offsets).
 #[derive(Debug, Clone)]
 pub struct KvWalRecord {
     pub flags: u8,
@@ -155,6 +181,8 @@ pub struct KvWalRecord {
 }
 
 impl KvWalRecord {
+    /// Create a new record from its components. Computes kv_bytes,
+    /// offsets, rec_len, and CRC.
     pub fn new(
         flags: u8,
         key: &[u8],
@@ -186,6 +214,7 @@ impl KvWalRecord {
         }
     }
 
+    /// Serialize the record to bytes for writing to the WAL.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.rec_len as usize);
         buf.push(self.flags);
@@ -197,6 +226,7 @@ impl KvWalRecord {
         buf
     }
 
+    /// Deserialize a record from raw bytes. Returns (record, bytes_consumed).
     pub fn deserialize(data: &[u8]) -> io::Result<(Self, usize)> {
         if data.len() < KV_HEADER_SIZE + KV_CRC_SIZE {
             return Err(io::Error::new(
@@ -259,10 +289,12 @@ impl KvWalRecord {
         ))
     }
 
+    /// Extract the key from kv_bytes using the stored offset (O(1), no protobuf decode).
     pub fn key(&self) -> Option<&[u8]> {
         read_key_from_kv(&self.kv_bytes, self.key_offset)
     }
 
+    /// Extract the mod_revision from kv_bytes using the stored offset (O(1)).
     pub fn mod_revision(&self) -> Option<i64> {
         read_mod_revision_from_kv(&self.kv_bytes, self.mod_rev_offset)
     }
