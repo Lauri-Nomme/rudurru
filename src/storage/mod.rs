@@ -255,9 +255,12 @@ impl Store {
         Ok(Self { state })
     }
 
+    pub async fn compact_rev(&self) -> u64 {
+        self.state.read().await.compact_rev
+    }
+
     pub async fn wal_path(&self) -> String {
-        let state = self.state.read().await;
-        state.wal.path.clone()
+        self.state.read().await.wal.path.clone()
     }
 
     // ── KV operations ──────────────────────────────────────────────────

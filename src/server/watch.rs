@@ -94,6 +94,21 @@ impl etcdserverpb::watch_server::Watch for Watch {
 
                                 let checkpoint_rev = if start_revision > 0 { current_revision() } else { 0 };
 
+                                if start_revision > 0 && start_revision < store.compact_rev().await {
+                                    let resp = etcdserverpb::WatchResponse {
+                                        header: Some(make_header(current_revision() as i64)),
+                                        watch_id: -1,
+                                        created: false,
+                                        canceled: true,
+                                        compact_revision: store.compact_rev().await as i64,
+                                        cancel_reason: "compacted".into(),
+                                        events: vec![],
+                                        fragment: false,
+                                    };
+                                    if tx.send(Ok(resp)).await.is_err() { return; }
+                                    continue;
+                                }
+
                                 let phase1_end = if start_revision > 0 && start_revision <= checkpoint_rev {
                                     if let Ok(mut reader) = wal::WalFile::open(&store.wal_path().await) {
                                         let bound = storage::resolve_range(&key, &range_end);

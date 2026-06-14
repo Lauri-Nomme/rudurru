@@ -147,3 +147,34 @@ The CAS transaction ensures idempotency: if a key already exists (e.g. from a pa
 | Nodes | changwang (control-plane), precision (worker) — both Ready |
 | Workloads | All 30+ deployments running normally |
 | Rancher | Accessible, managing cluster |
+
+## Post-Migration Observations
+
+### k3s Log Noise
+
+After migration, k3s logs contain Info-level messages:
+```
+"Error getting keys" err="Timeout: Too large resource version: 8332, current: 1688"
+```
+
+This is harmless. It occurs because the migration tool wrote keys with fresh revision numbers (1, 2, 3...), but the kube-controller-manager's stats collector goroutines cached the old resource versions from before the migration. Each goroutine independently retries from its cached revision, times out on WAL replay, and retries. The errors are Info-level, not errors.
+
+The noise persists because multiple stats-collector goroutines each hold a stale cache. It does not affect cluster operations.
+
+### Compaction Check Added
+
+The watch handler now checks if `start_revision < compact_rev` and returns a `WatchResponse` with `compact_revision` set and `canceled: true`. This is semantically correct — etcd returns `compact_revision` when a watcher requests a compacted revision. k3s will issue a compact every 4 hours (`--etcd-compaction-interval=4h0m0s`), after which future watchers with stale revisions will immediately get a compact response instead of timing out.
+
+### CPU Savings
+
+| Stack | CPU | Improvement |
+|-------|-----|-------------|
+| Before (kine + SQLite) | ~61% of core | — |
+| After (Rudurru) | 0.10% (k3s) + 0.00% (Rudurru) | ~610x |
+
+### Resource Usage
+
+| Process | RSS | Threads | Connections to Rudurru |
+|---------|-----|---------|----------------------|
+| Rudurru | 160MB | 29 | — |
+| k3s | 947MB | 35 | 291 |
