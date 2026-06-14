@@ -159,7 +159,10 @@ impl WalFile {
                     f(&rec);
                     ofs += consumed;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(wal_offset = offset + ofs as u64, error = %e, "wal_record_error");
+                    break;
+                }
             }
         }
         Ok(offset + buf.len() as u64)

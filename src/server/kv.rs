@@ -1,5 +1,5 @@
 use crate::proto::etcdserverpb;
-use crate::storage::Store;
+use crate::storage::{self, Store};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -52,7 +52,10 @@ impl etcdserverpb::kv_server::Kv for Kv {
         &self,
         req: Request<etcdserverpb::CompactionRequest>,
     ) -> Result<Response<etcdserverpb::CompactionResponse>, Status> {
+        let revision = req.get_ref().revision;
+        let keys_before = self.store.state.read().await.keys.len();
         let resp = self.store.compact(req.into_inner()).await;
+        tracing::info!(revision, keys_before, "compact");
         Ok(Response::new(resp))
     }
 }

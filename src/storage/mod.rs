@@ -511,6 +511,7 @@ impl Store {
         let ttl = req.ttl;
         let expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
         state.leases.insert(id, LeaseState { id, ttl, expires_at, key_count: 0 });
+        tracing::info!(id, ttl, "lease_granted");
         etcdserverpb::LeaseGrantResponse {
             header: Some(state.header()),
             id,
@@ -523,6 +524,7 @@ impl Store {
         let mut state = self.state.write().await;
         let id = req.id;
         state.leases.remove(&id);
+        tracing::info!(id, "lease_revoked");
         let keys_to_delete: Vec<Vec<u8>> = state.keys.iter()
             .filter(|(_, ks)| ks.lease == id && !ks.deleted)
             .map(|(k, _)| k.clone())

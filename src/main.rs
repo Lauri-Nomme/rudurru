@@ -26,6 +26,25 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Rudurru listening on {addr}, WAL: {wal_path}");
 
+    // Periodic status logging (every 60s)
+    let status_store = store.clone();
+    let status_wal = wal_path.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let (keys, watchers, leases) = {
+                let s = status_store.state.read().await;
+                (s.keys.len(), s.watchers.len(), s.leases.len())
+            };
+            let wal_size = std::fs::metadata(&status_wal)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let rev = rudurru::storage::current_revision();
+            tracing::info!(rev, keys, watchers, leases, wal_size, "rudurru status");
+        }
+    });
+
     Server::builder()
         .add_service(server::new_kv(store.clone()))
         .add_service(server::new_watch(store.clone()))

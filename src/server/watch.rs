@@ -95,12 +95,19 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 let checkpoint_rev = if start_revision > 0 { current_revision() } else { 0 };
 
                                 if start_revision > 0 && start_revision < store.compact_rev().await {
+                                    let compact_rev = store.compact_rev().await;
+                                    tracing::info!(
+                                        start_revision,
+                                        compact_rev,
+                                        key = %String::from_utf8_lossy(&key),
+                                        "watch_compacted"
+                                    );
                                     let resp = etcdserverpb::WatchResponse {
                                         header: Some(make_header(current_revision() as i64)),
                                         watch_id: -1,
                                         created: false,
                                         canceled: true,
-                                        compact_revision: store.compact_rev().await as i64,
+                                        compact_revision: compact_rev as i64,
                                         cancel_reason: "compacted".into(),
                                         events: vec![],
                                         fragment: false,
@@ -171,6 +178,13 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     return;
                                 }
 
+                                tracing::info!(
+                                    watch_id,
+                                    start_revision,
+                                    key = %String::from_utf8_lossy(&key),
+                                    "watch_created"
+                                );
+
                                 let tx_clone = tx.clone();
                                 let store_clone = store.clone();
                                 tokio::spawn(async move {
@@ -186,6 +200,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                             fragment: false,
                                         };
                                         if tx_clone.send(Ok(resp)).await.is_err() {
+                                            tracing::warn!(watch_id, "watch_dropped");
                                             let mut state = store_clone.state.write().await;
                                             state.cancel_watcher(watch_id);
                                             break;
@@ -199,6 +214,8 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     let mut state = store.state.write().await;
                                     state.cancel_watcher(watch_id);
                                 }
+
+                                tracing::info!(watch_id, "watch_canceled");
 
                                 let resp = etcdserverpb::WatchResponse {
                                     header: Some(make_header(current_revision() as i64)),
