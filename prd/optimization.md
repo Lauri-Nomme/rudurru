@@ -377,13 +377,21 @@ For a Range response returning 5000 keys: 5000× struct construction +
 #### New WAL record layout
 
 ```
-┌──────────┬─────────────────────────────────────┬──────────┐
-│ flags(1) │  mvccpb.KeyValue protobuf message   │ crc32(4) │
-│          │  (self-describing wire format)       │          │
-└──────────┴─────────────────────────────────────┴──────────┘
+┌──────┬───────────┬────────────────┬────────────┬──────────────────────┬──────────┐
+│ flags│ key_offset│ mod_rev_offset │ rec_len(4) │ kv_bytes (protobuf  │ crc32(4) │
+│  (1) │    (2)    │     (2)        │            │ KeyValue message)    │          │
+└──────┴───────────┴────────────────┴────────────┴──────────────────────┴──────────┘
+          └────────── 9-byte header ──────────┘
 
 flags: bit 0 = IS_CREATE (vs DELETE)
        bit 1 = HAS_LEASE
+
+key_offset:     byte offset within kv_bytes where key's length varint starts
+                (field 1 = tag(0x0a) + varint(len) + key_bytes)
+mod_rev_offset: byte offset within kv_bytes where mod_revision varint starts
+                (field 3 = tag(0x18) + varint(value))
+rec_len:        total record size in bytes (header + kv_bytes + crc32)
+                enables O(1) skip to next record during scan
 
 KeyValue protobuf (per rpc.proto):
   field 1: key             → tag(0x0a) + len + bytes
@@ -393,23 +401,35 @@ KeyValue protobuf (per rpc.proto):
   field 5: value           → tag(0x2a) + len + bytes
   field 6: lease           → tag(0x30) + varint
 
-CRC32C covers: flags(1) + kv_protobuf(N)
+CRC32C covers: header(9) + kv_protobuf(N)
 ```
+
+**Header gives O(1) field access without protobuf parsing.**
+At write time (prost::encode known), we compute the offsets once.
+At scan time, we jump directly:
+- Key: `kv_bytes + key_offset` → read varint len → read key bytes
+- Revision: `kv_bytes + mod_rev_offset` → read varint value
+- Next record: `offset += rec_len`
 
 #### What changes
 
 **WAL write** (`src/storage/wal.rs`, `src/storage/mod.rs`):
 - Build `mvccpb::KeyValue` from the in-memory `KeyState` at write time
-- Encode with `prost::Message::encode_to_vec()`
-- Append: `flags(1) + kv_bytes(N) + crc32(4)`
-- `WalRecord` struct becomes: `{ flags: u8, kv_bytes: Vec<u8>, crc: u32 }`
-- The revision is embedded in `kv_bytes` (in `mod_revision` field)
+- Encode with `prost::Message::encode_to_vec()` → `kv_bytes`
+- Compute header offsets during encoding by tracking field positions,
+  or from post-encode analysis (prost encoding is deterministic)
+- Append: `header(9) + kv_bytes(N) + crc32(4)`
+- `WalRecord` struct: `{ flags: u8, kv_bytes: Vec<u8>, key_offset: u16,
+  mod_rev_offset: u16, rec_len: u32, crc: u32 }`
 
 **WAL scan** (wal.rs):
-- Parse: read flags, read kv_bytes (rest of data minus CRC), verify CRC
-- For watch filtering: decode `kv_bytes` to extract `key` and `mod_revision`
-  (prost partial decode is fast — just walk fields)
-- `rec_to_event()` returns `kv_bytes` directly; no struct construction
+- Read 9-byte header at current offset
+- Read kv_bytes = `rec_len - header_size - crc_size` bytes
+- Verify CRC over header + kv_bytes
+- Access flags, key, revision via header fields (no protobuf parse)
+- For watch filtering: compare key and revision from header offsets
+- `rec_to_event()` short-circuits: returns kv_bytes directly as event payload
+- Skip to next record: `offset += rec_len`
 
 **Range/Put responses** (`src/server/kv.rs`):
 - `StoreState.keys` stores `kv_bytes: Vec<u8>` per key (from the latest WAL
@@ -435,8 +455,8 @@ responses that hit 1000+ keys benefit most.
 | `create_revision` correctness | rec_to_event() uses `rec.revision` (BUG: always current rev, not original) | Embedded in kv_bytes at write time from `KeyState.create_revision` — always correct |
 | `version` correctness | rec_to_event() uses `version: 1` (BUG: always 1) | Embedded in kv_bytes at write time from `KeyState.version` — always correct |
 | WAL integrity | CRC32C over all fields | Same, just different field boundaries |
-| Random access (read key from record) | Fixed offset | Must parse varint tags |
-| Record length | Deterministic from format | Must parse protobuf or use known length from read |
+| Random access (read key from record) | Fixed offset | O(1) via header key_offset — jump directly to key data |
+| Record length | Deterministic from format | O(1) via header rec_len — no protobuf parsing |
 
 Note: The `create_revision` and `version` bugs in `rec_to_event()` are
 pre-existing and would be automatically fixed by this change (since
@@ -484,11 +504,11 @@ the record type.
 3. **CRC cost**: CRC32C over the full protobuf is slightly more
    expensive (covers more bytes) but negligibly so.
 
-4. **Partial protobuf decoding for scan**: During WAL re-scan, we
-   need `key` and `mod_revision` to match watchers. With protobuf
-   we must walk the varint-tagged fields to find them. This is
-   slightly slower than fixed-offset access but still fast
-   (~50ns per field walk vs ~5ns for fixed offset).
+4. ~~Partial protobuf decoding for scan~~ — **Eliminated by header**.
+   The 9-byte header (flags, key_offset, mod_rev_offset, rec_len) gives
+   O(1) access to key and revision without any protobuf field walking.
+   At write time we know the offsets; at scan time we jump directly.
+   This is as fast as the current fixed-offset format.
 
 ### Potential savings estimate
 
