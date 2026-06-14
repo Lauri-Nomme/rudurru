@@ -407,9 +407,55 @@ CRC32C covers: header(9) + kv_protobuf(N)
 **Header gives O(1) field access without protobuf parsing.**
 At write time (prost::encode known), we compute the offsets once.
 At scan time, we jump directly:
-- Key: `kv_bytes + key_offset` → read varint len → read key bytes
-- Revision: `kv_bytes + mod_rev_offset` → read varint value
+- Key: `kv_bytes + key_offset` → read overlong varint → read key bytes
+- Revision: `kv_bytes + mod_rev_offset` → read overlong varint → value
 - Next record: `offset += rec_len`
+
+### Megahack #2: overlong varints for zero-loop decode
+
+Protobuf decoders MUST accept overlong varints (spec: "a varint is not
+required to be a minimum number of bytes"). We exploit this: always
+encode `key_length` as a **4-byte** overlong varint and `mod_revision`
+as an **8-byte** overlong varint.
+
+At scan time, instead of a byte-by-byte varint loop (branch per byte,
+5-10ns), we read a `u32`/`u64` directly and extract the 7-bit groups
+with bit manipulation:
+
+```rust
+// Read 4-byte overlong varint — no loop, no branch
+fn read_overlong_u32(buf: &[u8]) -> u32 {
+    let raw = u32::from_le_bytes(buf[..4].try_into().unwrap());
+    let m = raw & 0x7f7f7f7f;
+    (m & 0x7f)
+        | ((m >> 1) & 0x3f80)
+        | ((m >> 2) & 0x1fc000)
+        | ((m >> 3) & 0xfe00000)
+}
+
+// Read 8-byte overlong varint — same pattern, 8× 7-bit groups
+fn read_overlong_u64(buf: &[u8]) -> u64 {
+    let raw = u64::from_le_bytes(buf[..8].try_into().unwrap());
+    let m = raw & 0x7f7f7f7f7f7f7f7f;
+    (m & 0x7f)
+        | ((m >> 1) & 0x3f80)
+        | ((m >> 2) & 0x1fc000)
+        | ((m >> 3) & 0xfe00000)
+        | ((m >> 4) & 0x7f0000000)
+        | ((m >> 5) & 0x3f80000000)
+        | ((m >> 6) & 0x1fc000000000)
+        | ((m >> 7) & 0xfe0000000000)
+}
+```
+
+This eliminates varint decode from scan hot path entirely. The protobuf
+stays valid — any standard decoder (prost, protobuf-js) handles overlong
+varints transparently.
+
+**Trade-off**: We cannot use `prost::Message::encode()` for kv_bytes
+since prost always emits minimal varints. We write a custom encoder
+that produces valid protobuf with overlong fields. The encoder is
+straightforward (tag + fixed-size varint + data for each field).
 
 #### What changes
 
