@@ -5,23 +5,20 @@ use crate::storage::{self, Store, WatchEvent, WatchRegistration, current_revisio
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::mpsc;
-use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 static NEXT_WATCH_ID: AtomicI64 = AtomicI64::new(1);
 
-/// Limits concurrent Phase 1 WAL scans to prevent IO thrash and
-/// eliminate write lock contention. With many watchers created
-/// concurrently during k3s startup, each Phase 1 reads the full
-/// 77MB WAL from a separate file handle. Without throttling,
-/// 140 concurrent reads = 11GB total, thrashing the page cache
-/// AND all 140 pile up behind the write lock (500ms+ lock waits).
-///
-/// 4 permits: reads overlap without thrashing (308MB in flight).
-/// Total Phase 1 wall time ≈ (140/4) × 190ms = 6.7s at startup.
-/// Writes are NEVER blocked for more than ~50µs (the Phase 2 scan).
-static PHASE1_SEM: Semaphore = Semaphore::const_new(4);
+struct PendingCreate {
+    key: Vec<u8>,
+    range_end: Vec<u8>,
+    start_revision: u64,
+    watch_id: i64,
+    progress_notify: bool,
+    filters: Vec<i32>,
+    prev_kv: bool,
+}
 
 fn next_watch_id() -> i64 {
     NEXT_WATCH_ID.fetch_add(1, Ordering::SeqCst)
@@ -87,227 +84,313 @@ impl etcdserverpb::watch_server::Watch for Watch {
         let (tx, rx) = mpsc::channel(4096);
 
         tokio::spawn(async move {
+            use std::sync::Arc;
+            use std::time::Duration;
+            use tokio::sync::Notify;
+
+            let mut batch: Vec<PendingCreate> = Vec::new();
+            let flush_notify = Arc::new(Notify::new());
+
             loop {
-                let msg = in_stream.message().await;
-                match msg {
-                    Ok(Some(req)) => {
-                        let Some(union) = req.request_union else { continue };
-                        match union {
-                            watch_request::RequestUnion::CreateRequest(create) => {
-                                let watch_id = if create.watch_id != 0 {
-                                    create.watch_id
-                                } else {
-                                    next_watch_id()
-                                };
+                tokio::select! {
+                    biased;
 
-                                let key = create.key;
-                                let range_end = create.range_end;
-                                let start_revision = create.start_revision as u64;
-                                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                    msg = in_stream.message() => {
+                        match msg {
+                            Ok(Some(req)) => {
+                                let Some(union) = req.request_union else { continue };
+                                match union {
+                                    watch_request::RequestUnion::CreateRequest(create) => {
+                                        let watch_id = if create.watch_id != 0 {
+                                            create.watch_id
+                                        } else {
+                                            next_watch_id()
+                                        };
+                                        batch.push(PendingCreate {
+                                            key: create.key,
+                                            range_end: create.range_end,
+                                            start_revision: create.start_revision as u64,
+                                            watch_id,
+                                            progress_notify: create.progress_notify,
+                                            filters: create.filters.to_vec(),
+                                            prev_kv: create.prev_kv,
+                                        });
 
-                                // Checkpoint both revision and file offset before any WAL scans.
-                                // Phase 1 (no lock) replays revisions <= checkpoint_rev.
-                                // Phase 2 (under lock) scans from checkpoint_offset and replays
-                                // revisions > checkpoint_rev. This avoids scanning from byte 0
-                                // when Phase 1 is skipped (start_revision > checkpoint_rev),
-                                // and eliminates the race where new data appears between the
-                                // P5-style current_revision() check and the write lock acquisition.
-                                let (checkpoint_rev, checkpoint_offset) = if start_revision > 0 {
-                                    let state = store.state.read().await;
-                                    let rev = current_revision();
-                                    let off = std::fs::metadata(&state.wal.path)
-                                        .map(|m| m.len())
-                                        .unwrap_or(0);
-                                    (rev, off)
-                                } else {
-                                    (0, 0)
-                                };
-
-                                if start_revision > 0 && start_revision < store.compact_rev().await {
-                                    let compact_rev = store.compact_rev().await;
-                                    tracing::info!(
-                                        start_revision,
-                                        compact_rev,
-                                        key = %String::from_utf8_lossy(&key),
-                                        "watch_compacted"
-                                    );
-                                    let resp = etcdserverpb::WatchResponse {
-                                        header: Some(make_header(current_revision() as i64)),
-                                        watch_id: -1,
-                                        created: false,
-                                        canceled: true,
-                                        compact_revision: compact_rev as i64,
-                                        cancel_reason: "compacted".into(),
-                                        events: vec![],
-                                        fragment: false,
-                                    };
-                                    if tx.send(Ok(resp)).await.is_err() { return; }
-                                    continue;
-                                }
-
-                                // Phase 1: scan WAL without the write lock.
-                                // Semaphore limits concurrent readers to prevent IO thrash.
-                                let phase1_us = {
-                                    let _permit = PHASE1_SEM.acquire().await;
-                                    let t0 = std::time::Instant::now();
-                                    if start_revision > 0 && start_revision <= checkpoint_rev {
-                                        if let Ok(mut reader) = wal::WalFile::open(&store.wal_path().await) {
-                                            let bound = storage::resolve_range(&key, &range_end);
-                                            let _ = reader.scan(0, |rec| {
-                                                if rec.revision >= start_revision
-                                                    && rec.revision <= checkpoint_rev
-                                                    && storage::matches_range(bound.to_ref(), &rec.key)
-                                                {
-                                                    let _ = event_tx.send(rec_to_event(rec));
-                                                }
+                                        // Start flush timer on first create in a batch.
+                                        // During a burst, creates arrive faster than 50ms
+                                        // so the timer fires after the burst ends.
+                                        if batch.len() == 1 {
+                                            let n = flush_notify.clone();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                                n.notify_one();
                                             });
                                         }
                                     }
-                                    t0.elapsed().as_micros()
-                                };
-
-                                // Phase 2: under lock, catch up events after checkpoint_rev, then register
-                                let t_lock = std::time::Instant::now();
-                                let mut state = store.state.write().await;
-                                let lock_us = t_lock.elapsed().as_micros();
-
-                                let t_work = std::time::Instant::now();
-                                if start_revision > 0 {
-                                    // Scan from checkpoint_offset (not phase1_end) to avoid
-                                    // re-scanning the entire WAL when Phase 1 was skipped.
-                                    // Records with revision > checkpoint_rev are new since
-                                    // the checkpoint; records <= checkpoint_rev were already
-                                    // handled by Phase 1 (if it ran) or are below our
-                                    // start_revision (if Phase 1 was skipped).
-                                    let bound = storage::resolve_range(&key, &range_end);
-                                    let _ = state.wal.scan(checkpoint_offset, |rec| {
-                                        if rec.revision > checkpoint_rev
-                                            && storage::matches_range(bound.to_ref(), &rec.key)
-                                        {
-                                            let _ = event_tx.send(rec_to_event(rec));
+                                    other => {
+                                        if !batch.is_empty() {
+                                            flush_watch_batch(&mut batch, &store, &tx).await;
                                         }
-                                    });
-                                }
-
-                                state.register_watcher(WatchRegistration {
-                                    key: key.clone(),
-                                    range_end,
-                                    start_revision,
-                                    sender: event_tx,
-                                    watch_id,
-                                    progress_notify: create.progress_notify,
-                                    filters: create.filters.to_vec(),
-                                    prev_kv: create.prev_kv,
-                                });
-
-                                let scan_us = t_work.elapsed().as_micros();
-                                drop(state);
-
-                                tracing::info!(
-                                    watch_id,
-                                    start_revision,
-                                    phase1_us,
-                                    lock_us,
-                                    scan_us,
-                                    key = %String::from_utf8_lossy(&key),
-                                    "watch_replay"
-                                );
-
-                                let resp = etcdserverpb::WatchResponse {
-                                    header: Some(make_header(current_revision() as i64)),
-                                    watch_id,
-                                    created: true,
-                                    canceled: false,
-                                    compact_revision: 0,
-                                    cancel_reason: String::new(),
-                                    events: vec![],
-                                    fragment: false,
-                                };
-
-                                if tx.send(Ok(resp)).await.is_err() {
-                                    let mut state = store.state.write().await;
-                                    state.cancel_watcher(watch_id);
-                                    return;
-                                }
-
-                                tracing::info!(
-                                    watch_id,
-                                    start_revision,
-                                    key = %String::from_utf8_lossy(&key),
-                                    "watch_created"
-                                );
-
-                                let tx_clone = tx.clone();
-                                let store_clone = store.clone();
-                                tokio::spawn(async move {
-                                    while let Some(event) = event_rx.recv().await {
-                                        let resp = etcdserverpb::WatchResponse {
-                                            header: Some(make_header(event.revision as i64)),
-                                            watch_id,
-                                            created: false,
-                                            canceled: false,
-                                            compact_revision: 0,
-                                            cancel_reason: String::new(),
-                                            events: vec![event_to_proto(&event)],
-                                            fragment: false,
-                                        };
-                                        if tx_clone.send(Ok(resp)).await.is_err() {
-                                            tracing::warn!(watch_id, "watch_dropped");
-                                            let mut state = store_clone.state.write().await;
-                                            state.cancel_watcher(watch_id);
-                                            break;
+                                        match other {
+                                            watch_request::RequestUnion::CancelRequest(cancel) => {
+                                                let watch_id = cancel.watch_id;
+                                                {
+                                                    let mut state = store.state.write().await;
+                                                    state.cancel_watcher(watch_id);
+                                                }
+                                                tracing::info!(watch_id, "watch_canceled");
+                                                let resp = etcdserverpb::WatchResponse {
+                                                    header: Some(make_header(current_revision() as i64)),
+                                                    watch_id,
+                                                    created: false,
+                                                    canceled: true,
+                                                    compact_revision: 0,
+                                                    cancel_reason: String::new(),
+                                                    events: vec![],
+                                                    fragment: false,
+                                                };
+                                                if tx.send(Ok(resp)).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                            watch_request::RequestUnion::ProgressRequest(_) => {
+                                                let resp = etcdserverpb::WatchResponse {
+                                                    header: Some(make_header(current_revision() as i64)),
+                                                    watch_id: 0,
+                                                    created: false,
+                                                    canceled: false,
+                                                    compact_revision: 0,
+                                                    cancel_reason: String::new(),
+                                                    events: vec![],
+                                                    fragment: false,
+                                                };
+                                                if tx.send(Ok(resp)).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                });
-                            }
-                            watch_request::RequestUnion::CancelRequest(cancel) => {
-                                let watch_id = cancel.watch_id;
-                                {
-                                    let mut state = store.state.write().await;
-                                    state.cancel_watcher(watch_id);
-                                }
-
-                                tracing::info!(watch_id, "watch_canceled");
-
-                                let resp = etcdserverpb::WatchResponse {
-                                    header: Some(make_header(current_revision() as i64)),
-                                    watch_id,
-                                    created: false,
-                                    canceled: true,
-                                    compact_revision: 0,
-                                    cancel_reason: String::new(),
-                                    events: vec![],
-                                    fragment: false,
-                                };
-
-                                if tx.send(Ok(resp)).await.is_err() {
-                                    return;
                                 }
                             }
-                            watch_request::RequestUnion::ProgressRequest(_) => {
-                                let resp = etcdserverpb::WatchResponse {
-                                    header: Some(make_header(current_revision() as i64)),
-                                    watch_id: 0,
-                                    created: false,
-                                    canceled: false,
-                                    compact_revision: 0,
-                                    cancel_reason: String::new(),
-                                    events: vec![],
-                                    fragment: false,
-                                };
-
-                                if tx.send(Ok(resp)).await.is_err() {
-                                    return;
+                            Ok(None) => {
+                                if !batch.is_empty() {
+                                    flush_watch_batch(&mut batch, &store, &tx).await;
                                 }
+                                break;
                             }
+                            Err(_) => break,
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
+
+                    _ = flush_notify.notified() => {
+                        if !batch.is_empty() {
+                            flush_watch_batch(&mut batch, &store, &tx).await;
+                        }
+                    }
                 }
             }
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+async fn flush_watch_batch(
+    batch: &mut Vec<PendingCreate>,
+    store: &Arc<Store>,
+    tx: &mpsc::Sender<Result<etcdserverpb::WatchResponse, Status>>,
+) {
+    use std::time::Instant;
+    let creates: Vec<PendingCreate> = batch.drain(..).collect();
+    if creates.is_empty() {
+        return;
+    }
+
+    // ── compact check ──────────────────────────────────────────────
+    let compact_rev = store.compact_rev().await;
+    let mut active: Vec<WatchContext> = Vec::with_capacity(creates.len());
+
+    for c in creates {
+        if c.start_revision > 0 && c.start_revision < compact_rev {
+            tracing::info!(
+                start_revision = c.start_revision,
+                compact_rev,
+                key = %String::from_utf8_lossy(&c.key),
+                "watch_compacted"
+            );
+            let resp = etcdserverpb::WatchResponse {
+                header: Some(make_header(current_revision() as i64)),
+                watch_id: -1,
+                created: false,
+                canceled: true,
+                compact_revision: compact_rev as i64,
+                cancel_reason: "compacted".into(),
+                events: vec![],
+                fragment: false,
+            };
+            let _ = tx.send(Ok(resp)).await;
+            continue;
+        }
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let bound = storage::resolve_range(&c.key, &c.range_end);
+        active.push(WatchContext {
+            key: c.key,
+            range_end: c.range_end,
+            start_revision: c.start_revision,
+            watch_id: c.watch_id,
+            progress_notify: c.progress_notify,
+            filters: c.filters,
+            prev_kv: c.prev_kv,
+            bound,
+            event_tx,
+            event_rx: Some(event_rx),
+        });
+    }
+
+    if active.is_empty() {
+        return;
+    }
+
+    // ── checkpoint rev + offset ────────────────────────────────────
+    let (checkpoint_rev, checkpoint_offset) = {
+        let state = store.state.read().await;
+        let rev = current_revision();
+        let off = std::fs::metadata(&state.wal.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        (rev, off)
+    };
+
+    // ── Phase 1: scan without lock, shared across the batch ────────
+    let phase1_us = {
+        let t0 = Instant::now();
+        let wal_path = store.wal_path().await;
+        if let Ok(mut reader) = wal::WalFile::open(&wal_path) {
+            let _ = reader.scan(0, |rec| {
+                if rec.revision > checkpoint_rev {
+                    return;
+                }
+                for ctx in &active {
+                    if rec.revision >= ctx.start_revision
+                        && storage::matches_range(ctx.bound.to_ref(), &rec.key)
+                    {
+                        let _ = ctx.event_tx.send(rec_to_event(rec));
+                    }
+                }
+            });
+        }
+        t0.elapsed().as_micros()
+    };
+
+    // ── Phase 2: under lock, catch up then register all ────────────
+    let t_lock = Instant::now();
+    let mut state = store.state.write().await;
+    let lock_us = t_lock.elapsed().as_micros();
+
+    let t_work = Instant::now();
+
+    // Single scan from checkpoint_offset for all active watchers
+    let _ = state.wal.scan(checkpoint_offset, |rec| {
+        if rec.revision <= checkpoint_rev {
+            return;
+        }
+        for ctx in &active {
+            if storage::matches_range(ctx.bound.to_ref(), &rec.key) {
+                let _ = ctx.event_tx.send(rec_to_event(rec));
+            }
+        }
+    });
+
+    // Register all watchers under the same lock
+    for ctx in &active {
+        state.register_watcher(WatchRegistration {
+            key: ctx.key.clone(),
+            range_end: ctx.range_end.clone(),
+            start_revision: ctx.start_revision,
+            sender: ctx.event_tx.clone(),
+            watch_id: ctx.watch_id,
+            progress_notify: ctx.progress_notify,
+            filters: ctx.filters.clone(),
+            prev_kv: ctx.prev_kv,
+        });
+    }
+
+    let scan_us = t_work.elapsed().as_micros();
+    drop(state);
+
+    // ── send created responses and spawn event forwarding ──────────
+    for mut ctx in active {
+        tracing::info!(
+            watch_id = ctx.watch_id,
+            start_revision = ctx.start_revision,
+            phase1_us,
+            lock_us,
+            scan_us,
+            key = %String::from_utf8_lossy(&ctx.key),
+            "watch_replay"
+        );
+
+        let resp = etcdserverpb::WatchResponse {
+            header: Some(make_header(current_revision() as i64)),
+            watch_id: ctx.watch_id,
+            created: true,
+            canceled: false,
+            compact_revision: 0,
+            cancel_reason: String::new(),
+            events: vec![],
+            fragment: false,
+        };
+
+        if tx.send(Ok(resp)).await.is_err() {
+            let mut s = store.state.write().await;
+            s.cancel_watcher(ctx.watch_id);
+            return;
+        }
+
+        tracing::info!(
+            watch_id = ctx.watch_id,
+            start_revision = ctx.start_revision,
+            key = %String::from_utf8_lossy(&ctx.key),
+            "watch_created"
+        );
+
+        let tx_clone = tx.clone();
+        let store_clone = store.clone();
+        let mut rx = ctx.event_rx.take().unwrap();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let resp = etcdserverpb::WatchResponse {
+                    header: Some(make_header(event.revision as i64)),
+                    watch_id: ctx.watch_id,
+                    created: false,
+                    canceled: false,
+                    compact_revision: 0,
+                    cancel_reason: String::new(),
+                    events: vec![event_to_proto(&event)],
+                    fragment: false,
+                };
+                if tx_clone.send(Ok(resp)).await.is_err() {
+                    tracing::warn!(watch_id = ctx.watch_id, "watch_dropped");
+                    let mut s = store_clone.state.write().await;
+                    s.cancel_watcher(ctx.watch_id);
+                    break;
+                }
+            }
+        });
+    }
+}
+
+struct WatchContext {
+    key: Vec<u8>,
+    range_end: Vec<u8>,
+    start_revision: u64,
+    watch_id: i64,
+    progress_notify: bool,
+    filters: Vec<i32>,
+    prev_kv: bool,
+    bound: storage::RangeBound,
+    event_tx: mpsc::UnboundedSender<WatchEvent>,
+    event_rx: Option<mpsc::UnboundedReceiver<WatchEvent>>,
 }
