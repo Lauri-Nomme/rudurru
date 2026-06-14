@@ -3,3 +3,5 @@
 *.swo
 *~
 .DS_Store
+/debug-2026-06-14
+/src/bin/scan.rs
