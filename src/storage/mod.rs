@@ -493,13 +493,10 @@ impl Store {
         let mut state = self.state.write().await;
         state.compact_rev = req.revision as u64;
 
-        let compact_rev = state.compact_rev;
-        state.keys.retain(|_, ks| {
-            if ks.deleted {
-                return false;
-            }
-            ks.mod_revision >= compact_rev || ks.create_revision >= compact_rev
-        });
+        // NOTE: etcd's Compact does NOT delete current key-values from the store.
+        // It only sets compact_rev to allow garbage collection of old MVCC revisions.
+        // The current snapshot must be retained.
+        // The old code called state.keys.retain(...) which deleted current data — BUG.
 
         etcdserverpb::CompactionResponse {
             header: Some(state.header()),
