@@ -162,11 +162,18 @@ async fn test_point_vs_from_key_range() {
     assert_eq!(point.count(), 1, "point lookup should return exactly 1 key");
 
     // From-key (\0 range_end) returns all keys >= key
-    let from = client.get(
-        format!("{prefix}/b"),
-        Some(GetOptions::new().with_from_key()),
-    ).await.unwrap();
-    assert!(from.count() >= 2, "from-key should return at least 2 keys (b, c), got {}", from.count());
+    let from = client
+        .get(
+            format!("{prefix}/b"),
+            Some(GetOptions::new().with_from_key()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        from.count() >= 2,
+        "from-key should return at least 2 keys (b, c), got {}",
+        from.count()
+    );
     assert_eq!(from.kvs()[0].key(), format!("{prefix}/b").as_bytes());
     assert_eq!(from.kvs()[1].key(), format!("{prefix}/c").as_bytes());
 }
@@ -180,8 +187,15 @@ async fn test_all_keys_range() {
     client.put(format!("{prefix}/y"), "2", None).await.unwrap();
 
     // Get all keys (key="", range_end="\0")
-    let all = client.get("", Some(GetOptions::new().with_all_keys())).await.unwrap();
-    assert!(all.count() >= 2, "all-keys should return at least our 2 keys, got {}", all.count());
+    let all = client
+        .get("", Some(GetOptions::new().with_all_keys()))
+        .await
+        .unwrap();
+    assert!(
+        all.count() >= 2,
+        "all-keys should return at least our 2 keys, got {}",
+        all.count()
+    );
 }
 
 #[tokio::test]
@@ -215,16 +229,19 @@ async fn test_delete_from_key() {
     client.put(format!("{prefix}/c"), "3", None).await.unwrap();
 
     // Delete all keys >= {prefix}/b using from-key
-    let del = client.delete(
-        format!("{prefix}/b"),
-        Some(DeleteOptions::new().with_from_key()),
-    ).await.unwrap();
+    let del = client
+        .delete(
+            format!("{prefix}/b"),
+            Some(DeleteOptions::new().with_from_key()),
+        )
+        .await
+        .unwrap();
     assert_eq!(del.deleted(), 2, "should delete b and c");
 
-    let remaining = client.get(
-        format!("{prefix}/"),
-        Some(GetOptions::new().with_prefix()),
-    ).await.unwrap();
+    let remaining = client
+        .get(format!("{prefix}/"), Some(GetOptions::new().with_prefix()))
+        .await
+        .unwrap();
     assert_eq!(remaining.count(), 1, "only a should remain");
     assert_eq!(remaining.kvs()[0].key(), format!("{prefix}/a").as_bytes());
 }
@@ -238,9 +255,12 @@ async fn test_range_with_start_equals_end() {
     client.put(format!("{prefix}/n"), "2", None).await.unwrap();
 
     // Range [m, m) — should return nothing since start == end
-    let resp = client.get(
-        format!("{prefix}/m"),
-        Some(GetOptions::new().with_range(format!("{prefix}/m"))),
-    ).await.unwrap();
+    let resp = client
+        .get(
+            format!("{prefix}/m"),
+            Some(GetOptions::new().with_range(format!("{prefix}/m"))),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.count(), 0, "empty range should return 0 keys");
 }

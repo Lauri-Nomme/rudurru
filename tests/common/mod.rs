@@ -17,8 +17,7 @@ fn init() {
 }
 
 fn endpoint() -> String {
-    std::env::var("ETCD_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:2379".to_string())
+    std::env::var("ETCD_ENDPOINT").unwrap_or_else(|_| "http://localhost:2379".to_string())
 }
 
 pub async fn connect() -> etcd_client::Client {

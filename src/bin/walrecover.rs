@@ -8,10 +8,10 @@
 //!
 //! The output WAL can be loaded by Rudurru to restore the cluster state.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::collections::BTreeMap;
 use std::process;
 
 type Revision = u64;
@@ -43,10 +43,18 @@ fn crc32c(data: &[u8]) -> u32 {
     crc ^ 0xFFFFFFFF
 }
 
-fn scan_wal(path: &str) -> (Vec<(Revision, Vec<u8>, Vec<u8>, u8)>, u64) {
-    let mut f = File::open(path).unwrap_or_else(|e| { eprintln!("Error opening {path}: {e}"); process::exit(1); });
+type WalEntry = (Revision, Vec<u8>, Vec<u8>, u8);
+
+fn scan_wal(path: &str) -> (Vec<WalEntry>, u64) {
+    let mut f = File::open(path).unwrap_or_else(|e| {
+        eprintln!("Error opening {path}: {e}");
+        process::exit(1);
+    });
     let mut buf = Vec::new();
-    f.read_to_end(&mut buf).unwrap_or_else(|e| { eprintln!("Error reading {path}: {e}"); process::exit(1); });
+    f.read_to_end(&mut buf).unwrap_or_else(|e| {
+        eprintln!("Error reading {path}: {e}");
+        process::exit(1);
+    });
 
     let mut records = Vec::new();
     let mut pos = 0;
@@ -54,7 +62,10 @@ fn scan_wal(path: &str) -> (Vec<(Revision, Vec<u8>, Vec<u8>, u8)>, u64) {
 
     while pos + HEADER_SIZE <= buf.len() {
         let magic = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
-        if magic != MAGIC { pos += 1; continue; }
+        if magic != MAGIC {
+            pos += 1;
+            continue;
+        }
         pos += 2;
 
         let revision = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
@@ -69,33 +80,47 @@ fn scan_wal(path: &str) -> (Vec<(Revision, Vec<u8>, Vec<u8>, u8)>, u64) {
         let flags_ofs = pos;
         pos += 1;
 
-        if pos + key_len + val_len > buf.len() { break; }
+        if pos + key_len + val_len > buf.len() {
+            break;
+        }
         let key = buf[pos..pos + key_len].to_vec();
         pos += key_len;
         let value = buf[pos..pos + val_len].to_vec();
         pos += val_len;
 
         if flags & 0x04 != 0 {
-            if pos + 8 > buf.len() { break; }
+            if pos + 8 > buf.len() {
+                break;
+            }
             pos += 8;
         }
 
         let computed = crc32c(&buf[flags_ofs..pos]);
-        if computed != _stored_crc { continue; }
+        if computed != _stored_crc {
+            continue;
+        }
 
         total += 1;
         records.push((revision, key, value, flags));
     }
 
-    eprintln!("Scan: file={} records={} trailing={}", buf.len(), total, buf.len() - pos);
+    eprintln!(
+        "Scan: file={} records={} trailing={}",
+        buf.len(),
+        total,
+        buf.len() - pos
+    );
     (records, total)
 }
 
 fn write_wal(path: &str, entries: &[(Vec<u8>, KeyState)]) {
-    let mut f = File::create(path).unwrap_or_else(|e| { eprintln!("Error creating {path}: {e}"); process::exit(1); });
+    let mut f = File::create(path).unwrap_or_else(|e| {
+        eprintln!("Error creating {path}: {e}");
+        process::exit(1);
+    });
 
     for (key, ks) in entries {
-        let mut flags = IS_CREATE;
+        let flags = IS_CREATE;
         // flags: IS_CREATE (0x02) set for all entries
 
         let key_len = key.len() as u32;
@@ -103,22 +128,28 @@ fn write_wal(path: &str, entries: &[(Vec<u8>, KeyState)]) {
         let entry_size = 2 + 8 + 4 + 4 + 4 + 1 + key.len() + ks.value.len();
         let mut buf = Vec::with_capacity(entry_size);
 
-        buf.extend_from_slice(&MAGIC.to_le_bytes());   // 2
+        buf.extend_from_slice(&MAGIC.to_le_bytes()); // 2
         buf.extend_from_slice(&ks.mod_revision.to_le_bytes()); // 8
         let crc_ofs = buf.len();
-        buf.extend_from_slice(&[0u8; 4]);                // 4 (CRC placeholder)
-        buf.extend_from_slice(&key_len.to_le_bytes());   // 4
-        buf.extend_from_slice(&val_len.to_le_bytes());   // 4
-        buf.push(flags);                                  // 1
-        buf.extend_from_slice(key);                       // N
-        buf.extend_from_slice(&ks.value);                 // M
+        buf.extend_from_slice(&[0u8; 4]); // 4 (CRC placeholder)
+        buf.extend_from_slice(&key_len.to_le_bytes()); // 4
+        buf.extend_from_slice(&val_len.to_le_bytes()); // 4
+        buf.push(flags); // 1
+        buf.extend_from_slice(key); // N
+        buf.extend_from_slice(&ks.value); // M
 
-        let crc = crc32c(&buf[22..]);                     // CRC of flags+key+value
+        let crc = crc32c(&buf[22..]); // CRC of flags+key+value
         buf[crc_ofs..crc_ofs + 4].copy_from_slice(&crc.to_le_bytes());
 
-        f.write_all(&buf).unwrap_or_else(|e| { eprintln!("Error writing WAL: {e}"); process::exit(1); });
+        f.write_all(&buf).unwrap_or_else(|e| {
+            eprintln!("Error writing WAL: {e}");
+            process::exit(1);
+        });
     }
-    f.sync_all().unwrap_or_else(|e| { eprintln!("Error syncing WAL: {e}"); process::exit(1); });
+    f.sync_all().unwrap_or_else(|e| {
+        eprintln!("Error syncing WAL: {e}");
+        process::exit(1);
+    });
     eprintln!("Wrote {} records to {path}", entries.len());
 }
 
@@ -149,7 +180,8 @@ fn main() {
     for (rev, key, value, flags) in &records {
         max_rev = max_rev.max(*rev);
 
-        if flags & 0x01 != 0 { // DELETED
+        if flags & 0x01 != 0 {
+            // DELETED
             keys.remove(key);
             continue;
         }
@@ -168,17 +200,28 @@ fn main() {
         entry.version += 1;
     }
 
-    eprintln!("Reconstructed: keys={} max_revision={}", keys.len(), max_rev);
+    eprintln!(
+        "Reconstructed: keys={} max_revision={}",
+        keys.len(),
+        max_rev
+    );
 
     // Count compact damage
-    let lost: Vec<_> = keys.iter()
+    let lost: Vec<_> = keys
+        .iter()
         .filter(|(_, ks)| ks.mod_revision < 8000 && ks.create_revision < 8000)
         .collect();
     eprintln!("Compact(8000) damage: lost_keys={}", lost.len());
     if !lost.is_empty() {
         eprintln!("  First 5 lost:");
         for (k, ks) in lost.iter().take(5) {
-            eprintln!("    cr={:<6} mr={:<6} v={}  {}", ks.create_revision, ks.mod_revision, ks.version, String::from_utf8_lossy(k));
+            eprintln!(
+                "    cr={:<6} mr={:<6} v={}  {}",
+                ks.create_revision,
+                ks.mod_revision,
+                ks.version,
+                String::from_utf8_lossy(k)
+            );
         }
     }
 

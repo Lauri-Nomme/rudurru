@@ -1,9 +1,9 @@
 use crate::proto::etcdserverpb;
 use crate::proto::etcdserverpb::watch_request;
 use crate::proto::mvccpb;
-use crate::storage::{self, Store, WatchEvent, WatchRegistration, current_revision, wal};
-use std::sync::Arc;
+use crate::storage::{self, current_revision, wal, Store, WatchEvent, WatchRegistration};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_stream::wrappers::ReceiverStream;
@@ -43,7 +43,11 @@ fn kvrec_to_event(rec: &wal::KvWalRecord) -> Option<WatchEvent> {
     let key = rec.key()?.to_vec();
     Some(WatchEvent {
         revision: rev,
-        event_type: if deleted { mvccpb::event::EventType::Delete } else { mvccpb::event::EventType::Put },
+        event_type: if deleted {
+            mvccpb::event::EventType::Delete
+        } else {
+            mvccpb::event::EventType::Put
+        },
         key,
         kv_bytes: rec.kv_bytes.clone(),
         prev_kv_bytes: Vec::new(),
@@ -121,7 +125,9 @@ impl etcdserverpb::watch_server::Watch for Watch {
                 let msg = in_stream.message().await;
                 match msg {
                     Ok(Some(req)) => {
-                        let Some(union) = req.request_union else { continue };
+                        let Some(union) = req.request_union else {
+                            continue;
+                        };
                         match union {
                             watch_request::RequestUnion::CreateRequest(create) => {
                                 let watch_id = if create.watch_id != 0 {
@@ -191,47 +197,45 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     }
                                 });
                             }
-                            other => {
-                                match other {
-                                    watch_request::RequestUnion::CancelRequest(cancel) => {
-                                        let watch_id = cancel.watch_id;
-                                        {
-                                            let mut state = store.state.write().await;
-                                            state.cancel_watcher(watch_id);
-                                        }
-                                        tracing::info!(watch_id, "watch_canceled");
-                                        let resp = etcdserverpb::WatchResponse {
-                                            header: Some(make_header(current_revision() as i64)),
-                                            watch_id,
-                                            created: false,
-                                            canceled: true,
-                                            compact_revision: 0,
-                                            cancel_reason: String::new(),
-                                            events: vec![],
-                                            fragment: false,
-                                        };
-                                        if tx.send(Ok(resp)).await.is_err() {
-                                            return;
-                                        }
+                            other => match other {
+                                watch_request::RequestUnion::CancelRequest(cancel) => {
+                                    let watch_id = cancel.watch_id;
+                                    {
+                                        let mut state = store.state.write().await;
+                                        state.cancel_watcher(watch_id);
                                     }
-                                    watch_request::RequestUnion::ProgressRequest(_) => {
-                                        let resp = etcdserverpb::WatchResponse {
-                                            header: Some(make_header(current_revision() as i64)),
-                                            watch_id: 0,
-                                            created: false,
-                                            canceled: false,
-                                            compact_revision: 0,
-                                            cancel_reason: String::new(),
-                                            events: vec![],
-                                            fragment: false,
-                                        };
-                                        if tx.send(Ok(resp)).await.is_err() {
-                                            return;
-                                        }
+                                    tracing::info!(watch_id, "watch_canceled");
+                                    let resp = etcdserverpb::WatchResponse {
+                                        header: Some(make_header(current_revision() as i64)),
+                                        watch_id,
+                                        created: false,
+                                        canceled: true,
+                                        compact_revision: 0,
+                                        cancel_reason: String::new(),
+                                        events: vec![],
+                                        fragment: false,
+                                    };
+                                    if tx.send(Ok(resp)).await.is_err() {
+                                        return;
                                     }
-                                    _ => {}
                                 }
-                            }
+                                watch_request::RequestUnion::ProgressRequest(_) => {
+                                    let resp = etcdserverpb::WatchResponse {
+                                        header: Some(make_header(current_revision() as i64)),
+                                        watch_id: 0,
+                                        created: false,
+                                        canceled: false,
+                                        compact_revision: 0,
+                                        cancel_reason: String::new(),
+                                        events: vec![],
+                                        fragment: false,
+                                    };
+                                    if tx.send(Ok(resp)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ => {}
+                            },
                         }
                     }
                     Ok(None) => break,
@@ -244,10 +248,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
     }
 }
 
-async fn global_watch_loop(
-    store: Arc<Store>,
-    mut rx: mpsc::UnboundedReceiver<GlobalCreate>,
-) {
+async fn global_watch_loop(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<GlobalCreate>) {
     loop {
         let first = match rx.recv().await {
             Some(c) => c,
@@ -279,10 +280,7 @@ async fn global_watch_loop(
     }
 }
 
-async fn flush_global_batch(
-    batch: &mut Vec<GlobalCreate>,
-    store: &Arc<Store>,
-) {
+async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
     if batch.is_empty() {
         return;
     }
@@ -365,8 +363,7 @@ async fn flush_global_batch(
                     None => return,
                 };
                 for ctx in &active {
-                    if rev >= ctx.start_revision
-                        && storage::matches_range(ctx.bound.to_ref(), key)
+                    if rev >= ctx.start_revision && storage::matches_range(ctx.bound.to_ref(), key)
                     {
                         let _ = ctx.event_tx.send(event.clone());
                     }

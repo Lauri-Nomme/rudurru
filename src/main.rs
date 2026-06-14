@@ -14,17 +14,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let wal_path = std::env::var("RUDURRU_WAL")
-        .unwrap_or_else(|_| "/tmp/rudurru.wal".to_string());
+    let wal_path = std::env::var("RUDURRU_WAL").unwrap_or_else(|_| "/tmp/rudurru.wal".to_string());
 
-    let listen_addr = std::env::var("RUDURRU_LISTEN")
-        .unwrap_or_else(|_| "[::]:2379".to_string());
+    let listen_addr = std::env::var("RUDURRU_LISTEN").unwrap_or_else(|_| "[::]:2379".to_string());
 
     let store = Arc::new(Store::open(&wal_path).await?);
 
     let addr: SocketAddr = listen_addr.parse().context("parse listen address")?;
 
-    tracing::info!(git_revision = env!("GIT_REVISION"), "Rudurru listening on {addr}, WAL: {wal_path}");
+    tracing::info!(
+        git_revision = env!("GIT_REVISION"),
+        "Rudurru listening on {addr}, WAL: {wal_path}"
+    );
 
     // Periodic status logging (every 60s)
     let status_store = store.clone();
@@ -37,9 +38,7 @@ async fn main() -> anyhow::Result<()> {
                 let s = status_store.state.read().await;
                 (s.keys.len(), s.watchers.len(), s.leases.len())
             };
-            let wal_size = std::fs::metadata(&status_wal)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let wal_size = std::fs::metadata(&status_wal).map(|m| m.len()).unwrap_or(0);
             let rev = rudurru::storage::current_revision();
             tracing::info!(rev, keys, watchers, leases, wal_size, "rudurru status");
         }

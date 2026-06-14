@@ -25,7 +25,9 @@ fn compute_stats(latencies: &[Duration]) -> (f64, f64, f64) {
     let mut ms: Vec<f64> = latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
     ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = ms.len();
-    if n == 0 { return (0.0, 0.0, 0.0); }
+    if n == 0 {
+        return (0.0, 0.0, 0.0);
+    }
     let avg = ms.iter().sum::<f64>() / n as f64;
     let p50 = ms[n / 2];
     let p99_index = ((n as f64 * 0.99) as usize).min(n - 1);
@@ -59,7 +61,10 @@ async fn main() {
     }
     let elapsed = start.elapsed().as_secs_f64();
     let (avg, p50, p99) = compute_stats(&latencies);
-    println!("  Put:   avg={avg:.3}ms  p50={p50:.3}ms  p99={p99:.3}ms  ({:.0} ops/s)", 1000.0 / elapsed);
+    println!(
+        "  Put:   avg={avg:.3}ms  p50={p50:.3}ms  p99={p99:.3}ms  ({:.0} ops/s)",
+        1000.0 / elapsed
+    );
 
     let mut latencies = Vec::with_capacity(1000);
     for i in 0..1000u64 {
@@ -79,7 +84,9 @@ async fn main() {
         let get = client.get(key.as_str(), None).await.unwrap();
         let rev = get.kvs().first().map(|kv| kv.mod_revision()).unwrap_or(0);
         let cmp = Compare::mod_revision(key.as_str(), CompareOp::Equal, rev);
-        let txn = Txn::new().when(vec![cmp]).and_then(vec![TxnOp::put(key.as_str(), "txn", None)]);
+        let txn = Txn::new()
+            .when(vec![cmp])
+            .and_then(vec![TxnOp::put(key.as_str(), "txn", None)]);
         client.txn(txn).await.unwrap();
         latencies.push(t0.elapsed());
     }
@@ -100,7 +107,10 @@ async fn main() {
         }
         let elapsed = start.elapsed().as_secs_f64();
         let (avg, p50, p99) = compute_stats(&latencies);
-        println!("  {size:>5}B:  avg={avg:.3}ms  p50={p50:.3}ms  p99={p99:.3}ms  ({:.0} ops/s)", 500.0 / elapsed);
+        println!(
+            "  {size:>5}B:  avg={avg:.3}ms  p50={p50:.3}ms  p99={p99:.3}ms  ({:.0} ops/s)",
+            500.0 / elapsed
+        );
     }
 
     // ── Prefix scan scaling ─────────────────────────────────────────
@@ -141,9 +151,15 @@ async fn main() {
                 }
             }));
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
         let elapsed = start.elapsed().as_secs_f64();
-        println!("  {workers:>2} workers:  {:.0} ops/s ({:.3}s)", 2000.0 / elapsed, elapsed);
+        println!(
+            "  {workers:>2} workers:  {:.0} ops/s ({:.3}s)",
+            2000.0 / elapsed,
+            elapsed
+        );
     }
 
     // ── Memory usage ────────────────────────────────────────────────

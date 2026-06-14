@@ -25,27 +25,31 @@ fn read_old_records(path: &Path) -> io::Result<Vec<wal::WalRecord>> {
     Ok(records)
 }
 
-fn migrate(
-    _old_path: &Path,
-    new_path: &Path,
-    records: &[wal::WalRecord],
-) -> io::Result<()> {
+fn migrate(_old_path: &Path, new_path: &Path, records: &[wal::WalRecord]) -> io::Result<()> {
     let mut wal = wal::WalFile::open(new_path)?;
     let mut state: BTreeMap<Vec<u8>, (u64, i64, Vec<u8>, i64)> = BTreeMap::new();
     let total = records.len();
 
     for (i, rec) in records.iter().enumerate() {
         if (i + 1) % 10000 == 0 || i == 0 || i == total - 1 {
-            eprintln!("migrating record {}/{} (rev {})", i + 1, total, rec.revision);
+            eprintln!(
+                "migrating record {}/{} (rev {})",
+                i + 1,
+                total,
+                rec.revision
+            );
         }
 
         let deleted = (rec.flags & wal::DELETED) != 0;
         let has_lease = (rec.flags & wal::HAS_LEASE) != 0;
-        let lease = if has_lease { rec.lease_id.unwrap_or(0) } else { 0 };
+        let lease = if has_lease {
+            rec.lease_id.unwrap_or(0)
+        } else {
+            0
+        };
 
         if deleted {
-            if let Some((create_revision, version, ref value, prev_lease)) =
-                state.remove(&rec.key)
+            if let Some((create_revision, version, ref value, prev_lease)) = state.remove(&rec.key)
             {
                 let flags = wal::DELETED | if prev_lease != 0 { wal::HAS_LEASE } else { 0 };
                 let kv = wal::KvWalRecord::new(
@@ -88,7 +92,10 @@ fn migrate(
             );
             wal.append_kv(&kv)?;
 
-            state.insert(rec.key.clone(), (create_revision, version, rec.value.clone(), lease));
+            state.insert(
+                rec.key.clone(),
+                (create_revision, version, rec.value.clone(), lease),
+            );
         }
     }
 

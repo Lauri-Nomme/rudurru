@@ -34,7 +34,8 @@ impl etcdserverpb::lease_server::Lease for Lease {
         Ok(Response::new(resp))
     }
 
-    type LeaseKeepAliveStream = ReceiverStream<Result<etcdserverpb::LeaseKeepAliveResponse, Status>>;
+    type LeaseKeepAliveStream =
+        ReceiverStream<Result<etcdserverpb::LeaseKeepAliveResponse, Status>>;
 
     async fn lease_keep_alive(
         &self,

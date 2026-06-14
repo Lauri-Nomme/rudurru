@@ -3,9 +3,7 @@ fn git_version() -> String {
         .args(["describe", "--always", "--dirty", "--long"])
         .output();
     match describe {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => "unknown".to_string(),
     }
 }
@@ -29,19 +27,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc_patched = rpc_raw
         .replace(r#"import "kv.proto""#, r#"import "patched/kv.proto""#)
         .replace(r#"import "auth.proto""#, r#"import "patched/auth.proto""#)
-        .replace("repeated mvccpb.KeyValue kvs = 2;", "repeated bytes kvs = 2;")
+        .replace(
+            "repeated mvccpb.KeyValue kvs = 2;",
+            "repeated bytes kvs = 2;",
+        )
         .replace("mvccpb.KeyValue prev_kv = 2;", "bytes prev_kv = 2;")
-        .replace("repeated mvccpb.KeyValue prev_kvs = 3;", "repeated bytes prev_kvs = 3;");
+        .replace(
+            "repeated mvccpb.KeyValue prev_kvs = 3;",
+            "repeated bytes prev_kvs = 3;",
+        );
     std::fs::write("proto/patched/rpc.proto", &rpc_patched)?;
 
     std::fs::copy("proto/auth.proto", "proto/patched/auth.proto")?;
 
     tonic_prost_build::configure()
         .build_server(true)
-        .compile_protos(
-            &["proto/patched/rpc.proto"],
-            &[proto_root],
-        )?;
+        .compile_protos(&["proto/patched/rpc.proto"], &[proto_root])?;
 
     std::fs::remove_dir_all("proto/patched")?;
     Ok(())

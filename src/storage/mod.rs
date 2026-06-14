@@ -4,8 +4,8 @@ use crate::proto::etcdserverpb;
 use crate::proto::mvccpb;
 use prost::Message;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
@@ -146,16 +146,19 @@ impl StoreState {
         };
         entry.kv_bytes = make_kv_bytes(&key, &entry);
         self.keys.insert(key.clone(), entry.clone());
-        
+
         let event = WatchEvent {
             revision: rev,
             event_type: mvccpb::event::EventType::Put,
             key: key.clone(),
             kv_bytes: entry.kv_bytes.clone(),
-            prev_kv_bytes: prev.as_ref().map(|p| p.kv_bytes.clone()).unwrap_or_default(),
+            prev_kv_bytes: prev
+                .as_ref()
+                .map(|p| p.kv_bytes.clone())
+                .unwrap_or_default(),
         };
         self.notify_watchers(event);
-        
+
         prev
     }
 
@@ -164,7 +167,7 @@ impl StoreState {
         if prev.deleted {
             return None;
         }
-        
+
         // Create watch event for DELETE
         let event = WatchEvent {
             revision: rev,
@@ -174,7 +177,7 @@ impl StoreState {
             prev_kv_bytes: prev.kv_bytes.clone(),
         };
         self.notify_watchers(event);
-        
+
         Some(prev)
     }
 
@@ -198,11 +201,11 @@ impl StoreState {
             if !matches_range(bound.to_ref(), &event.key) {
                 continue;
             }
-            
+
             if event.revision < watcher.start_revision {
                 continue;
             }
-            
+
             let mut should_send = true;
             for &filter in &watcher.filters {
                 match filter {
@@ -217,11 +220,11 @@ impl StoreState {
                     _ => {}
                 }
             }
-            
+
             if !should_send {
                 continue;
             }
-            
+
             let _ = watcher.sender.send(event.clone());
         }
     }
@@ -257,7 +260,7 @@ impl Store {
         state.next_rev = max_rev + 1;
         NEXT_REV.store(state.next_rev, Ordering::SeqCst);
 
-            tracing::info!(
+        tracing::info!(
             "rudurru ready: revision={}, keys={}, compact_rev={}",
             max_rev,
             state.keys.len(),
@@ -307,10 +310,12 @@ impl Store {
             if req.max_mod_revision > 0 && (ks.mod_revision as i64) > req.max_mod_revision {
                 continue;
             }
-            if req.min_create_revision > 0 && (ks.create_revision as i64) < req.min_create_revision {
+            if req.min_create_revision > 0 && (ks.create_revision as i64) < req.min_create_revision
+            {
                 continue;
             }
-            if req.max_create_revision > 0 && (ks.create_revision as i64) > req.max_create_revision {
+            if req.max_create_revision > 0 && (ks.create_revision as i64) > req.max_create_revision
+            {
                 continue;
             }
 
@@ -355,7 +360,11 @@ impl Store {
 
         let key = req.key.clone();
         let value = if req.ignore_value {
-            state.keys.get(&key).map(|k| k.value.to_vec()).unwrap_or_default()
+            state
+                .keys
+                .get(&key)
+                .map(|k| k.value.to_vec())
+                .unwrap_or_default()
         } else {
             req.value
         };
@@ -391,7 +400,9 @@ impl Store {
 
         let header = Some(state.header());
         let prev_kv = if req.prev_kv {
-            prev.as_ref().map(|p| p.kv_bytes.clone()).unwrap_or_default()
+            prev.as_ref()
+                .map(|p| p.kv_bytes.clone())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -399,13 +410,18 @@ impl Store {
         etcdserverpb::PutResponse { header, prev_kv }
     }
 
-    pub async fn delete_range(&self, req: etcdserverpb::DeleteRangeRequest) -> etcdserverpb::DeleteRangeResponse {
+    pub async fn delete_range(
+        &self,
+        req: etcdserverpb::DeleteRangeRequest,
+    ) -> etcdserverpb::DeleteRangeResponse {
         let rev = next_revision();
         let mut state = self.state.write().await;
 
         let bound = resolve_range(&req.key, &req.range_end);
 
-        let keys_to_delete: Vec<Vec<u8>> = state.keys.iter()
+        let keys_to_delete: Vec<Vec<u8>> = state
+            .keys
+            .iter()
             .filter(|(k, ks)| {
                 if ks.deleted {
                     return false;
@@ -422,7 +438,9 @@ impl Store {
 
             if let Some(p) = &prev {
                 let mut flags = wal::DELETED;
-                if p.lease != 0 { flags |= wal::HAS_LEASE; }
+                if p.lease != 0 {
+                    flags |= wal::HAS_LEASE;
+                }
                 let record = wal::KvWalRecord::new(
                     flags,
                     key,
@@ -486,7 +504,9 @@ impl Store {
                 Some(etcdserverpb::request_op::Request::RequestDeleteRange(d)) => {
                     let resp = self.delete_range(d).await;
                     responses.push(etcdserverpb::ResponseOp {
-                        response: Some(etcdserverpb::response_op::Response::ResponseDeleteRange(resp)),
+                        response: Some(etcdserverpb::response_op::Response::ResponseDeleteRange(
+                            resp,
+                        )),
                     });
                 }
                 Some(etcdserverpb::request_op::Request::RequestTxn(_)) => {
@@ -516,7 +536,10 @@ impl Store {
         }
     }
 
-    pub async fn compact(&self, req: etcdserverpb::CompactionRequest) -> etcdserverpb::CompactionResponse {
+    pub async fn compact(
+        &self,
+        req: etcdserverpb::CompactionRequest,
+    ) -> etcdserverpb::CompactionResponse {
         let mut state = self.state.write().await;
         state.compact_rev = req.revision as u64;
 
@@ -532,12 +555,23 @@ impl Store {
 
     // ── Lease operations ────────────────────────────────────────────────
 
-    pub async fn lease_grant(&self, req: etcdserverpb::LeaseGrantRequest) -> etcdserverpb::LeaseGrantResponse {
+    pub async fn lease_grant(
+        &self,
+        req: etcdserverpb::LeaseGrantRequest,
+    ) -> etcdserverpb::LeaseGrantResponse {
         let mut state = self.state.write().await;
         let id = if req.id != 0 { req.id } else { next_lease_id() };
         let ttl = req.ttl;
         let expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
-        state.leases.insert(id, LeaseState { id, ttl, expires_at, key_count: 0 });
+        state.leases.insert(
+            id,
+            LeaseState {
+                id,
+                ttl,
+                expires_at,
+                key_count: 0,
+            },
+        );
         tracing::info!(id, ttl, "lease_granted");
         etcdserverpb::LeaseGrantResponse {
             header: Some(state.header()),
@@ -547,12 +581,17 @@ impl Store {
         }
     }
 
-    pub async fn lease_revoke(&self, req: etcdserverpb::LeaseRevokeRequest) -> etcdserverpb::LeaseRevokeResponse {
+    pub async fn lease_revoke(
+        &self,
+        req: etcdserverpb::LeaseRevokeRequest,
+    ) -> etcdserverpb::LeaseRevokeResponse {
         let mut state = self.state.write().await;
         let id = req.id;
         state.leases.remove(&id);
         tracing::info!(id, "lease_revoked");
-        let keys_to_delete: Vec<Vec<u8>> = state.keys.iter()
+        let keys_to_delete: Vec<Vec<u8>> = state
+            .keys
+            .iter()
             .filter(|(_, ks)| ks.lease == id && !ks.deleted)
             .map(|(k, _)| k.clone())
             .collect();
@@ -561,13 +600,14 @@ impl Store {
             let prev = state.keys.get(key).filter(|k| !k.deleted).cloned();
             state.apply_delete(key.clone(), rev);
 
-
             if let Some(p) = &prev {
                 let mut flags = wal::DELETED;
-                if p.lease != 0 { flags |= wal::HAS_LEASE; }
+                if p.lease != 0 {
+                    flags |= wal::HAS_LEASE;
+                }
                 let record = wal::KvWalRecord::new(
                     flags,
-                    &key,
+                    key,
                     &p.value,
                     p.create_revision as i64,
                     p.mod_revision as i64,
@@ -588,7 +628,8 @@ impl Store {
         let mut state = self.state.write().await;
         if let Some(ls) = state.leases.get_mut(&id) {
             let ttl = ls.ttl;
-            ls.expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
+            ls.expires_at =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
             etcdserverpb::LeaseKeepAliveResponse {
                 header: Some(state.header()),
                 id,
@@ -603,12 +644,20 @@ impl Store {
         }
     }
 
-    pub async fn lease_time_to_live(&self, req: etcdserverpb::LeaseTimeToLiveRequest) -> etcdserverpb::LeaseTimeToLiveResponse {
+    pub async fn lease_time_to_live(
+        &self,
+        req: etcdserverpb::LeaseTimeToLiveRequest,
+    ) -> etcdserverpb::LeaseTimeToLiveResponse {
         let state = self.state.read().await;
         if let Some(ls) = state.leases.get(&req.id) {
-            let remaining = (ls.expires_at.saturating_duration_since(tokio::time::Instant::now())).as_secs() as i64;
+            let remaining = (ls
+                .expires_at
+                .saturating_duration_since(tokio::time::Instant::now()))
+            .as_secs() as i64;
             let keys = if req.keys {
-                state.keys.iter()
+                state
+                    .keys
+                    .iter()
                     .filter(|(_, ks)| ks.lease == req.id && !ks.deleted)
                     .map(|(k, _)| k.clone())
                     .collect()
@@ -635,7 +684,11 @@ impl Store {
 
     pub async fn lease_leases(&self) -> etcdserverpb::LeaseLeasesResponse {
         let state = self.state.read().await;
-        let leases = state.leases.keys().map(|id| etcdserverpb::LeaseStatus { id: *id }).collect();
+        let leases = state
+            .leases
+            .keys()
+            .map(|id| etcdserverpb::LeaseStatus { id: *id })
+            .collect();
         etcdserverpb::LeaseLeasesResponse {
             header: Some(state.header()),
             leases,
@@ -646,7 +699,12 @@ impl Store {
 
     pub async fn db_size(&self) -> i64 {
         let state = self.state.read().await;
-        state.wal.file.metadata().map(|m| m.len() as i64).unwrap_or(0)
+        state
+            .wal
+            .file
+            .metadata()
+            .map(|m| m.len() as i64)
+            .unwrap_or(0)
     }
 
     pub async fn store_hash(&self) -> u64 {
@@ -654,7 +712,9 @@ impl Store {
         let state = self.state.read().await;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for (k, ks) in state.keys.iter() {
-            if ks.deleted { continue; }
+            if ks.deleted {
+                continue;
+            }
             k.hash(&mut hasher);
             ks.value.hash(&mut hasher);
         }
@@ -667,13 +727,17 @@ impl Store {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let mut s = state.write().await;
                 let now = tokio::time::Instant::now();
-                let expired: Vec<i64> = s.leases.iter()
+                let expired: Vec<i64> = s
+                    .leases
+                    .iter()
                     .filter(|(_, ls)| ls.expires_at <= now)
                     .map(|(id, _)| *id)
                     .collect();
                 for id in expired {
                     s.leases.remove(&id);
-                    let keys_to_delete: Vec<Vec<u8>> = s.keys.iter()
+                    let keys_to_delete: Vec<Vec<u8>> = s
+                        .keys
+                        .iter()
                         .filter(|(_, ks)| ks.lease == id && !ks.deleted)
                         .map(|(k, _)| k.clone())
                         .collect();
@@ -684,7 +748,9 @@ impl Store {
 
                         if let Some(p) = &prev {
                             let mut flags = wal::DELETED;
-                            if p.lease != 0 { flags |= wal::HAS_LEASE; }
+                            if p.lease != 0 {
+                                flags |= wal::HAS_LEASE;
+                            }
                             let record = wal::KvWalRecord::new(
                                 flags,
                                 key,

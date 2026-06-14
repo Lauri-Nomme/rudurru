@@ -8,13 +8,21 @@ async fn test_create_if_not_exists() {
     let key = key!("txn/create");
 
     let txn = Txn::new()
-        .when(vec![Compare::mod_revision(key.as_str(), CompareOp::Equal, 0)])
+        .when(vec![Compare::mod_revision(
+            key.as_str(),
+            CompareOp::Equal,
+            0,
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "first", None)]);
     let resp = client.txn(txn).await.unwrap();
     assert!(resp.succeeded(), "first create should succeed");
 
     let txn2 = Txn::new()
-        .when(vec![Compare::mod_revision(key.as_str(), CompareOp::Equal, 0)])
+        .when(vec![Compare::mod_revision(
+            key.as_str(),
+            CompareOp::Equal,
+            0,
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "second", None)]);
     let resp2 = client.txn(txn2).await.unwrap();
     assert!(!resp2.succeeded(), "second create should fail");
@@ -33,7 +41,11 @@ async fn test_update_if_match() {
     let mod_rev = get.kvs()[0].mod_revision();
 
     let txn = Txn::new()
-        .when(vec![Compare::mod_revision(key.as_str(), CompareOp::Equal, mod_rev)])
+        .when(vec![Compare::mod_revision(
+            key.as_str(),
+            CompareOp::Equal,
+            mod_rev,
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "updated", None)]);
     let resp = client.txn(txn).await.unwrap();
     assert!(resp.succeeded(), "update with correct mod_rev");
@@ -42,7 +54,11 @@ async fn test_update_if_match() {
     assert_eq!(get2.kvs()[0].value(), b"updated");
 
     let txn2 = Txn::new()
-        .when(vec![Compare::mod_revision(key.as_str(), CompareOp::Equal, mod_rev)])
+        .when(vec![Compare::mod_revision(
+            key.as_str(),
+            CompareOp::Equal,
+            mod_rev,
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "stale", None)]);
     let resp2 = client.txn(txn2).await.unwrap();
     assert!(!resp2.succeeded(), "update with stale mod_rev");
@@ -58,7 +74,11 @@ async fn test_delete_if_match() {
     let mod_rev = get.kvs()[0].mod_revision();
 
     let txn = Txn::new()
-        .when(vec![Compare::mod_revision(key.as_str(), CompareOp::Equal, mod_rev)])
+        .when(vec![Compare::mod_revision(
+            key.as_str(),
+            CompareOp::Equal,
+            mod_rev,
+        )])
         .and_then(vec![TxnOp::delete(key.as_str(), None)]);
     let resp = client.txn(txn).await.unwrap();
     assert!(resp.succeeded(), "delete with correct mod_rev");
@@ -74,7 +94,11 @@ async fn test_transaction_cas() {
     client.put(key.as_str(), "initial", None).await.unwrap();
 
     let txn = Txn::new()
-        .when(vec![Compare::value(key.as_str(), CompareOp::Equal, "initial")])
+        .when(vec![Compare::value(
+            key.as_str(),
+            CompareOp::Equal,
+            "initial",
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "updated", None)])
         .or_else(vec![TxnOp::put(key.as_str(), "failed", None)]);
     let resp = client.txn(txn).await.unwrap();
@@ -84,7 +108,11 @@ async fn test_transaction_cas() {
     assert_eq!(get.kvs()[0].value(), b"updated");
 
     let txn2 = Txn::new()
-        .when(vec![Compare::value(key.as_str(), CompareOp::Equal, "initial")])
+        .when(vec![Compare::value(
+            key.as_str(),
+            CompareOp::Equal,
+            "initial",
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "should_not_happen", None)])
         .or_else(vec![TxnOp::put(key.as_str(), "fallback", None)]);
     let resp2 = client.txn(txn2).await.unwrap();
@@ -134,7 +162,11 @@ async fn test_txn_compare_value_equal() {
 
     // Compare::value(..., Equal, "match_me") should succeed
     let txn = Txn::new()
-        .when(vec![Compare::value(key.as_str(), CompareOp::Equal, "match_me")])
+        .when(vec![Compare::value(
+            key.as_str(),
+            CompareOp::Equal,
+            "match_me",
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "matched", None)]);
     let resp = client.txn(txn).await.unwrap();
     assert!(resp.succeeded(), "value equal should succeed");
@@ -151,7 +183,11 @@ async fn test_txn_compare_value_not_equal() {
 
     // Compare::value(..., NotEqual, "wrong") should succeed
     let txn = Txn::new()
-        .when(vec![Compare::value(key.as_str(), CompareOp::NotEqual, "wrong")])
+        .when(vec![Compare::value(
+            key.as_str(),
+            CompareOp::NotEqual,
+            "wrong",
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "diff", None)]);
     let resp = client.txn(txn).await.unwrap();
     assert!(resp.succeeded(), "value not-equal should succeed");
@@ -177,7 +213,10 @@ async fn test_txn_compare_version() {
         .when(vec![Compare::version(key.as_str(), CompareOp::Equal, 1)])
         .and_then(vec![TxnOp::put(key.as_str(), "v2", None)]);
     let resp2 = client.txn(txn2).await.unwrap();
-    assert!(resp2.succeeded(), "version==1 should succeed after first put");
+    assert!(
+        resp2.succeeded(),
+        "version==1 should succeed after first put"
+    );
 }
 
 #[tokio::test]
@@ -190,14 +229,22 @@ async fn test_txn_compare_create_revision() {
     let create_rev = get.kvs()[0].create_revision();
 
     let txn = Txn::new()
-        .when(vec![Compare::create_revision(key.as_str(), CompareOp::Equal, create_rev)])
+        .when(vec![Compare::create_revision(
+            key.as_str(),
+            CompareOp::Equal,
+            create_rev,
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "checked", None)]);
     let resp = client.txn(txn).await.unwrap();
     assert!(resp.succeeded(), "create_revision match should succeed");
 
     // Now try with wrong create_revision
     let txn2 = Txn::new()
-        .when(vec![Compare::create_revision(key.as_str(), CompareOp::Equal, create_rev + 999)])
+        .when(vec![Compare::create_revision(
+            key.as_str(),
+            CompareOp::Equal,
+            create_rev + 999,
+        )])
         .and_then(vec![TxnOp::put(key.as_str(), "wrong", None)]);
     let resp2 = client.txn(txn2).await.unwrap();
     assert!(!resp2.succeeded(), "wrong create_revision should fail");

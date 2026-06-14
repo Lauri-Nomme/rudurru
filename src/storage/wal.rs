@@ -12,8 +12,8 @@ pub const HAS_LEASE: u8 = 0x04;
 /// The last byte only contributes 4 bits (bits 28-31).
 pub fn encode_overlong_u32(v: u32) -> [u8; 5] {
     let mut buf = [0u8; 5];
-    for i in 0..4 {
-        buf[i] = ((v >> (i * 7)) as u8 & 0x7f) | 0x80;
+    for (i, b) in buf.iter_mut().enumerate().take(4) {
+        *b = ((v >> (i * 7)) as u8 & 0x7f) | 0x80;
     }
     buf[4] = ((v >> 28) as u8) & 0x0f;
     buf
@@ -25,8 +25,8 @@ pub fn decode_overlong_u32(buf: &[u8]) -> Option<u32> {
         return None;
     }
     let mut v = 0u64;
-    for i in 0..5 {
-        v |= ((buf[i] & 0x7f) as u64) << (i * 7);
+    for (i, &b) in buf.iter().enumerate().take(5) {
+        v |= ((b & 0x7f) as u64) << (i * 7);
     }
     Some(v as u32)
 }
@@ -36,8 +36,8 @@ pub fn decode_overlong_u32(buf: &[u8]) -> Option<u32> {
 /// The last byte only contributes 1 bit (bit 63).
 pub fn encode_overlong_u64(v: u64) -> [u8; 10] {
     let mut buf = [0u8; 10];
-    for i in 0..9 {
-        buf[i] = ((v >> (i * 7)) as u8 & 0x7f) | 0x80;
+    for (i, b) in buf.iter_mut().enumerate().take(9) {
+        *b = ((v >> (i * 7)) as u8 & 0x7f) | 0x80;
     }
     buf[9] = ((v >> 63) as u8) & 0x01;
     buf
@@ -49,8 +49,8 @@ pub fn decode_overlong_u64(buf: &[u8]) -> Option<u64> {
         return None;
     }
     let mut v = 0u64;
-    for i in 0..10 {
-        v |= ((buf[i] & 0x7f) as u64) << (i * 7);
+    for (i, &b) in buf.iter().enumerate().take(10) {
+        v |= ((b & 0x7f) as u64) << (i * 7);
     }
     Some(v)
 }
@@ -101,12 +101,10 @@ pub fn encode_kv(
     lease: i64,
 ) -> (Vec<u8>, u16, u16) {
     let mut buf = Vec::new();
-    let key_offset;
-    let mod_rev_offset;
 
     // Field 1: key (bytes, wire type 2, field number 1)
     buf.push(0x0a); // tag = (1 << 3) | 2
-    key_offset = buf.len() as u16;
+    let key_offset = buf.len() as u16;
     buf.extend_from_slice(&encode_overlong_u32(key.len() as u32));
     buf.extend_from_slice(key);
 
@@ -116,7 +114,7 @@ pub fn encode_kv(
 
     // Field 3: mod_revision (int64, wire type 0, field number 3)
     buf.push(0x18); // tag = (3 << 3) | 0
-    mod_rev_offset = buf.len() as u16;
+    let mod_rev_offset = buf.len() as u16;
     buf.extend_from_slice(&encode_overlong_u64(mod_revision as u64));
 
     // Field 4: version (int64, wire type 0, field number 4)
@@ -236,12 +234,9 @@ impl KvWalRecord {
         }
 
         let flags = data[0];
-        let key_offset =
-            u16::from_le_bytes([data[1], data[2]]);
-        let mod_rev_offset =
-            u16::from_le_bytes([data[3], data[4]]);
-        let rec_len =
-            u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
+        let key_offset = u16::from_le_bytes([data[1], data[2]]);
+        let mod_rev_offset = u16::from_le_bytes([data[3], data[4]]);
+        let rec_len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
 
         if (rec_len as usize) > data.len() {
             return Err(io::Error::new(
@@ -256,15 +251,16 @@ impl KvWalRecord {
         let crc_start = kv_end;
 
         let kv_bytes = data[kv_start..kv_end].to_vec();
-        let stored_crc =
-            u32::from_le_bytes([data[crc_start], data[crc_start + 1], data[crc_start + 2], data[crc_start + 3]]);
+        let stored_crc = u32::from_le_bytes([
+            data[crc_start],
+            data[crc_start + 1],
+            data[crc_start + 2],
+            data[crc_start + 3],
+        ]);
 
         let computed = crc32c(&data[..kv_end]);
         if computed != stored_crc {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "CRC mismatch",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch"));
         }
 
         if (key_offset as usize) >= kv_bytes.len()
@@ -430,12 +426,10 @@ impl WalRecord {
         let _stored_crc = u32::from_le_bytes(data[ofs..ofs + 4].try_into().unwrap());
         ofs += 4;
 
-        let key_len =
-            u32::from_le_bytes(data[ofs..ofs + 4].try_into().unwrap()) as usize;
+        let key_len = u32::from_le_bytes(data[ofs..ofs + 4].try_into().unwrap()) as usize;
         ofs += 4;
 
-        let val_len =
-            u32::from_le_bytes(data[ofs..ofs + 4].try_into().unwrap()) as usize;
+        let val_len = u32::from_le_bytes(data[ofs..ofs + 4].try_into().unwrap()) as usize;
         ofs += 4;
 
         let flags = data[ofs];
@@ -444,7 +438,10 @@ impl WalRecord {
         let flags_ofs = ofs - 1;
         let payload_end = ofs + key_len + val_len;
         if data.len() < payload_end {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated payload"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated payload",
+            ));
         }
 
         let key = data[ofs..ofs + key_len].to_vec();
@@ -454,7 +451,10 @@ impl WalRecord {
 
         let lease_id = if flags & HAS_LEASE != 0 {
             if data.len() < ofs + 8 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated lease"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated lease",
+                ));
             }
             let lid = i64::from_le_bytes(data[ofs..ofs + 8].try_into().unwrap());
             ofs += 8;
@@ -506,7 +506,18 @@ mod tests {
 
     #[test]
     fn test_overlong_u32_roundtrip() {
-        let cases = [0u32, 1, 127, 128, 255, 65535, 1 << 20, (1 << 28) - 1, 12345678, 0xDEADBEAF];
+        let cases = [
+            0u32,
+            1,
+            127,
+            128,
+            255,
+            65535,
+            1 << 20,
+            (1 << 28) - 1,
+            12345678,
+            0xDEADBEAF,
+        ];
         for &v in &cases {
             let enc = encode_overlong_u32(v);
             let dec = decode_overlong_u32(&enc).unwrap();
@@ -658,7 +669,10 @@ mod tests {
             IS_CREATE | HAS_LEASE,
             b"lease_key",
             b"lease_val",
-            10, 20, 1, 777,
+            10,
+            20,
+            1,
+            777,
         );
 
         let serialized = rec.serialize();
@@ -687,10 +701,7 @@ mod tests {
 
         match KvWalRecord::deserialize(&serialized) {
             Ok(_) => panic!("expected CRC mismatch error"),
-            Err(e) => assert!(
-                e.to_string().contains("CRC"),
-                "unexpected error: {e}"
-            ),
+            Err(e) => assert!(e.to_string().contains("CRC"), "unexpected error: {e}"),
         }
     }
 
@@ -788,7 +799,9 @@ mod tests {
             let rec1 = KvWalRecord::new(IS_CREATE, b"good", b"data", 1, 1, 1, 0);
             wal.append_kv(&rec1).unwrap();
             use std::io::Write;
-            wal.file.write_all(b"GARBAGE_DATA_THAT_IS_NOT_A_VALID_RECORD").unwrap();
+            wal.file
+                .write_all(b"GARBAGE_DATA_THAT_IS_NOT_A_VALID_RECORD")
+                .unwrap();
             wal.file.sync_all().unwrap();
             let rec2 = KvWalRecord::new(IS_CREATE, b"after", b"garbage", 2, 2, 2, 0);
             wal.append_kv(&rec2).unwrap();
@@ -838,7 +851,10 @@ mod tests {
             IS_CREATE | HAS_LEASE,
             b"compat_key",
             b"compat_value",
-            42, 100, 7, 888,
+            42,
+            100,
+            7,
+            888,
         );
 
         let decoded = mvccpb::KeyValue::decode(&rec.kv_bytes[..]).unwrap();
@@ -856,8 +872,13 @@ mod tests {
         use prost::Message;
 
         let rec = KvWalRecord::new(
-            IS_CREATE, b"k", b"v",
-            i64::MAX, i64::MAX, i64::MAX, i64::MAX,
+            IS_CREATE,
+            b"k",
+            b"v",
+            i64::MAX,
+            i64::MAX,
+            i64::MAX,
+            i64::MAX,
         );
 
         let decoded = mvccpb::KeyValue::decode(&rec.kv_bytes[..]).unwrap();

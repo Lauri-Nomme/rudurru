@@ -14,10 +14,10 @@
 //! a full replay naturally recovers all data. This tool confirms
 //! the WAL is intact and shows the reconstructed state.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io::Read;
-use std::collections::BTreeMap;
 
 type Revision = u64;
 
@@ -30,6 +30,7 @@ struct KeyState {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct WalRecord {
     revision: u64,
     key: Vec<u8>,
@@ -103,14 +104,18 @@ fn scan_wal(path: &str) -> Result<(Vec<WalRecord>, u64, u64), String> {
         pos += 1;
 
         // payload
-        if pos + key_len + val_len > buf.len() { break; }
+        if pos + key_len + val_len > buf.len() {
+            break;
+        }
         let key = buf[pos..pos + key_len].to_vec();
         pos += key_len;
         let value = buf[pos..pos + val_len].to_vec();
         pos += val_len;
 
         let lease_id = if flags & HAS_LEASE != 0 {
-            if pos + 8 > buf.len() { break; }
+            if pos + 8 > buf.len() {
+                break;
+            }
             let lid = i64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
             Some(lid)
@@ -127,11 +132,22 @@ fn scan_wal(path: &str) -> Result<(Vec<WalRecord>, u64, u64), String> {
         }
 
         total += 1;
-        records.push(WalRecord { revision, key, value, flags, lease_id });
+        records.push(WalRecord {
+            revision,
+            key,
+            value,
+            flags,
+            lease_id,
+        });
     }
 
-    eprintln!("WAL: file_size={} records={} crc_errors={} trailing={}",
-        buf.len(), total, crc_errors, buf.len() - pos);
+    eprintln!(
+        "WAL: file_size={} records={} crc_errors={} trailing={}",
+        buf.len(),
+        total,
+        crc_errors,
+        buf.len() - pos
+    );
     Ok((records, crc_errors, total))
 }
 
@@ -162,14 +178,18 @@ fn reconstruct_state(records: &[WalRecord]) -> (BTreeMap<Vec<u8>, KeyState>, Vec
     }
 
     let compact_rev: Revision = 8000;
-    let lost: Vec<_> = keys.iter()
+    let lost: Vec<_> = keys
+        .iter()
         .filter(|(_, ks)| ks.mod_revision < compact_rev && ks.create_revision < compact_rev)
         .map(|(k, _)| k.clone())
         .collect();
 
     eprintln!();
-    eprintln!("Reconstructed state: total_keys={} lost_by_compact(8000)={}",
-        keys.len(), lost.len());
+    eprintln!(
+        "Reconstructed state: total_keys={} lost_by_compact(8000)={}",
+        keys.len(),
+        lost.len()
+    );
     eprintln!();
 
     (keys, lost)
@@ -189,21 +209,33 @@ fn main() {
 
     let (records, crc_errors, total) = match scan_wal(path) {
         Ok(r) => r,
-        Err(e) => { eprintln!("Error: {e}"); return; }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return;
+        }
     };
 
     let (state, lost_keys) = reconstruct_state(&records);
 
-    println!("RESULT records={} crc_errors={} keys={} lost={}",
-        total, crc_errors, state.len(), lost_keys.len());
+    println!(
+        "RESULT records={} crc_errors={} keys={} lost={}",
+        total,
+        crc_errors,
+        state.len(),
+        lost_keys.len()
+    );
 
     if do_dump {
         for (k, ks) in &state {
             let val_sample = String::from_utf8_lossy(&ks.value[..ks.value.len().min(100)]);
-            println!("{{\"key\":{}, \"cr\":{}, \"mr\":{}, \"v\":{}, \"val\":{}}}",
+            println!(
+                "{{\"key\":{}, \"cr\":{}, \"mr\":{}, \"v\":{}, \"val\":{}}}",
                 serde_json::to_string(&String::from_utf8_lossy(k)).unwrap(),
-                ks.create_revision, ks.mod_revision, ks.version,
-                serde_json::to_string(&val_sample).unwrap());
+                ks.create_revision,
+                ks.mod_revision,
+                ks.version,
+                serde_json::to_string(&val_sample).unwrap()
+            );
         }
     }
 }

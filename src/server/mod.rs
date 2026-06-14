@@ -1,9 +1,9 @@
-mod kv;
-mod watch;
-mod lease;
-mod cluster;
-mod maintenance;
 mod auth;
+mod cluster;
+mod kv;
+mod lease;
+mod maintenance;
+mod watch;
 
 use crate::proto::etcdserverpb;
 use crate::storage::Store;
@@ -21,11 +21,15 @@ pub fn new_lease(store: Arc<Store>) -> etcdserverpb::lease_server::LeaseServer<l
     etcdserverpb::lease_server::LeaseServer::new(lease::Lease::new(store))
 }
 
-pub fn new_cluster(store: Arc<Store>) -> etcdserverpb::cluster_server::ClusterServer<cluster::Cluster> {
+pub fn new_cluster(
+    store: Arc<Store>,
+) -> etcdserverpb::cluster_server::ClusterServer<cluster::Cluster> {
     etcdserverpb::cluster_server::ClusterServer::new(cluster::Cluster::new(store))
 }
 
-pub fn new_maintenance(store: Arc<Store>) -> etcdserverpb::maintenance_server::MaintenanceServer<maintenance::Maintenance> {
+pub fn new_maintenance(
+    store: Arc<Store>,
+) -> etcdserverpb::maintenance_server::MaintenanceServer<maintenance::Maintenance> {
     etcdserverpb::maintenance_server::MaintenanceServer::new(maintenance::Maintenance::new(store))
 }
 
