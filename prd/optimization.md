@@ -350,6 +350,170 @@ Each `watch_replay` log now includes:
 | `scan_us` | Phase 2 scan + register under lock |
 | `key` | Watched key prefix |
 
+## P7 — Zero-copy WAL → gRPC (protobuf-native WAL)
+
+### Concept
+
+Structure each WAL record so its bytes can be directly sent as gRPC
+response payloads, eliminating protobuf serialization entirely. Today,
+every response (Range, Watch, Put) decodes a `WalRecord` from disk,
+constructs a `mvccpb::KeyValue` struct in memory, then re-encodes it
+with prost. This is CPU work that produces the same bytes that were
+already on disk.
+
+### Current data path
+
+```
+WAL read → WalRecord.parse() → construct KeyValue → prost::encode() → gRPC
+  (raw bytes)    (struct)          (struct)          (Vec<u8>)     (send)
+```
+
+For a Range response returning 5000 keys: 5000× struct construction +
+5000× prost encoding. See `src/server/kv.rs` line 84-93, `src/server/watch.rs`
+`rec_to_event()`.
+
+### Proposal: embed protobuf `mvccpb::KeyValue` in WAL records
+
+#### New WAL record layout
+
+```
+┌──────────┬─────────────────────────────────────┬──────────┐
+│ flags(1) │  mvccpb.KeyValue protobuf message   │ crc32(4) │
+│          │  (self-describing wire format)       │          │
+└──────────┴─────────────────────────────────────┴──────────┘
+
+flags: bit 0 = IS_CREATE (vs DELETE)
+       bit 1 = HAS_LEASE
+
+KeyValue protobuf (per rpc.proto):
+  field 1: key             → tag(0x0a) + len + bytes
+  field 2: create_revision → tag(0x10) + varint
+  field 3: mod_revision    → tag(0x18) + varint
+  field 4: version         → tag(0x20) + varint
+  field 5: value           → tag(0x2a) + len + bytes
+  field 6: lease           → tag(0x30) + varint
+
+CRC32C covers: flags(1) + kv_protobuf(N)
+```
+
+#### What changes
+
+**WAL write** (`src/storage/wal.rs`, `src/storage/mod.rs`):
+- Build `mvccpb::KeyValue` from the in-memory `KeyState` at write time
+- Encode with `prost::Message::encode_to_vec()`
+- Append: `flags(1) + kv_bytes(N) + crc32(4)`
+- `WalRecord` struct becomes: `{ flags: u8, kv_bytes: Vec<u8>, crc: u32 }`
+- The revision is embedded in `kv_bytes` (in `mod_revision` field)
+
+**WAL scan** (wal.rs):
+- Parse: read flags, read kv_bytes (rest of data minus CRC), verify CRC
+- For watch filtering: decode `kv_bytes` to extract `key` and `mod_revision`
+  (prost partial decode is fast — just walk fields)
+- `rec_to_event()` returns `kv_bytes` directly; no struct construction
+
+**Range/Put responses** (`src/server/kv.rs`):
+- `StoreState.keys` stores `kv_bytes: Vec<u8>` per key (from the latest WAL
+  record)
+- Range response: collect `kv_bytes` from matched keys, wrap in
+  `RangeResponse { kvs }`, no per-key encoding
+- Put response: use the WAL record's `kv_bytes` directly
+
+**Watch events** (`src/server/watch.rs`):
+- During Phase 1+2 replay, send `kv_bytes` as event payload
+- Event forwarding: emit pre-encoded `kv_bytes` without re-serialization
+
+**Write-time cost**: One `prost::encode()` per write (slightly more than
+current binary serialization, but writes are rare at k3s load).
+
+**Read-time savings**: Zero serialization for every response. Range
+responses that hit 1000+ keys benefit most.
+
+### Key guarantees
+
+| Property | Current | Proposed |
+|----------|---------|----------|
+| `create_revision` correctness | rec_to_event() uses `rec.revision` (BUG: always current rev, not original) | Embedded in kv_bytes at write time from `KeyState.create_revision` — always correct |
+| `version` correctness | rec_to_event() uses `version: 1` (BUG: always 1) | Embedded in kv_bytes at write time from `KeyState.version` — always correct |
+| WAL integrity | CRC32C over all fields | Same, just different field boundaries |
+| Random access (read key from record) | Fixed offset | Must parse varint tags |
+| Record length | Deterministic from format | Must parse protobuf or use known length from read |
+
+Note: The `create_revision` and `version` bugs in `rec_to_event()` are
+pre-existing and would be automatically fixed by this change (since
+kv_bytes would contain the correct values from the write path).
+
+### Zero-copy options
+
+**Option A: WAL → wire** (full zero-copy)
+- `kv_bytes` vector is sent directly as the protobuf response field
+- No deserialization at all during response construction
+- Requires `kv_bytes` to be a valid `mvccpb::KeyValue` protobuf
+
+**Option B: Cache in memory** (simpler, less intrusive)
+- Instead of changing WAL format, just cache `kv_bytes` in `KeyState`
+- Compute at write time, store in memory, reuse for responses
+- WAL remains backward-compatible
+- Trade-off: 2× memory for values, restart loses cache
+
+Option A is the full vision. Option B is a practical first step.
+
+### Prost compatibility details
+
+Prost encodes `mvccpb::KeyValue` deterministically (field order matches
+proto declaration). The WAL record's kv_bytes must be a valid prost
+encoding. We verify this by using `prost::Message::encode()` on the
+write path.
+
+The flags byte is NOT part of the protobuf — it's a custom prefix for
+fast scan filtering (DELETE vs CREATE). This avoids encoding flags as
+a protobuf field and having to decode the entire message just to check
+the record type.
+
+### Concerns
+
+1. **WAL version incompatibility**: New format won't read old WALs.
+   Either add a format version at file header, or break compatibility
+   (acceptable since Raft is not involved and migration from kine is
+   a one-shot event).
+
+2. **Memory overhead of `kv_bytes`**: Each KeyValue takes ~O(data)
+   bytes. Currently we store the same data key+value separately in
+   `KeyState.value`. Would roughly double the in-memory representation
+   unless we stop storing raw value and only keep kv_bytes.
+
+3. **CRC cost**: CRC32C over the full protobuf is slightly more
+   expensive (covers more bytes) but negligibly so.
+
+4. **Partial protobuf decoding for scan**: During WAL re-scan, we
+   need `key` and `mod_revision` to match watchers. With protobuf
+   we must walk the varint-tagged fields to find them. This is
+   slightly slower than fixed-offset access but still fast
+   (~50ns per field walk vs ~5ns for fixed offset).
+
+### Potential savings estimate
+
+| Operation | Current | Proposed | Savings |
+|-----------|---------|----------|---------|
+| Range (1 key) | 1× WalRecord.parse + 1× KeyValue.encode | 1× kv_bytes copy | ~200ns |
+| Range (5000 keys) | 5000× parse + 5000× encode | 5000× kv_bytes copy | ~1ms |
+| Watch event | 1× rec_to_event + 1× encode | 1× kv_bytes copy | ~200ns |
+| Put response | 1× KeyValue.encode | 1× kv_bytes copy | ~100ns |
+
+Savings are modest per-operation but compound over the server's
+lifetime. The main win is architectural cleanliness: the WAL format
+becomes the wire format, eliminating a conversion layer.
+
+### Implementation path
+
+1. **Phase 1**: Store kv_bytes in KeyState in memory (cache), without
+   changing WAL format. Validate byte counts and correctness.
+2. **Phase 2**: Change WAL format to embed protobuf. Write migration
+   or version header.
+3. **Phase 3**: Remove `value`/`create_revision`/`version` from
+   `KeyState` — derive everything from kv_bytes.
+4. **Phase 4**: Zero-copy responses — pass kv_bytes slices directly
+   to tonic without allocation.
+
 ## Recommendation
 
 | # | Proposal | Effort | Impact | Status |
@@ -357,5 +521,6 @@ Each `watch_replay` log now includes:
 | P1 | Split timing | trivial | diagnostic | ✅ done |
 | P2 | Per-stream batching | moderate | replaced by P6 | ✅ done |
 | P5 | Checkpoint rev+offset | trivial | eliminates ~283ms worst case, no race | ✅ done |
-| P6 | Cross-stream batching | moderate | 140 watchers → 1 Phase 1 + 1 lock (32µs) | ✅ done |
+| P6 | Cross-stream batching | high | 140 watchers → 1 Phase 1 + 1 lock (32µs) | ✅ done |
+| P7 | Protobuf-native WAL (zero-copy) | high | eliminates serialization entirely | analyzed |
 | P4 | mmap | moderate | reduces allocation/copy | future |
