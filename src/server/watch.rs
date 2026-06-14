@@ -116,6 +116,8 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     continue;
                                 }
 
+                                let t0 = std::time::Instant::now();
+
                                 let phase1_end = if start_revision > 0 && start_revision <= checkpoint_rev {
                                     if let Ok(mut reader) = wal::WalFile::open(&store.wal_path().await) {
                                         let bound = storage::resolve_range(&key, &range_end);
@@ -134,8 +136,11 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     0
                                 };
 
+                                let t1 = std::time::Instant::now();
+                                let phase1_us = t1.duration_since(t0).as_micros();
+
                                 // Phase 2: under lock, catch up events after checkpoint_rev, then register
-                                {
+                                let phase2_us = {
                                     let mut state = store.state.write().await;
 
                                     if start_revision > 0 {
@@ -159,7 +164,18 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                         filters: create.filters.to_vec(),
                                         prev_kv: create.prev_kv,
                                     });
-                                }
+
+                                    t1.elapsed().as_micros()
+                                };
+
+                                tracing::info!(
+                                    watch_id,
+                                    start_revision,
+                                    phase1_us,
+                                    phase2_us,
+                                    key = %String::from_utf8_lossy(&key),
+                                    "watch_replay"
+                                );
 
                                 let resp = etcdserverpb::WatchResponse {
                                     header: Some(make_header(current_revision() as i64)),
