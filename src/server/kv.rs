@@ -1,5 +1,5 @@
 use crate::proto::etcdserverpb;
-use crate::storage::{self, Store};
+use crate::storage::Store;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
