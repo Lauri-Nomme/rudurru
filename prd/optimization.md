@@ -175,16 +175,36 @@ and releases. Across the entire startup batch:
 - `scan_us`: 5–32 µs across all watchers
 - **Writes are NEVER blocked for more than ~50µs**
 
-### P5 — Stale watcher skip
+### P5 — Checkpoint rev + file offset, scan from checkpointed offset
 
-Watchers with `start_revision > current_revision()` now skip the WAL
-scan entirely (`scan_us=0`). Previously these scanned the full 77 MB
-WAL under the write lock (~283ms). Observed:
+**First attempt (racy)**: Skipped WAL scan when
+`start_revision > current_revision()` at Phase 2 time. Race: new data
+could appear between the atomic load and the write lock acquisition,
+causing missed events.
+
+**Final fix**: Checkpoint both `checkpoint_rev` and `checkpoint_offset`
+(the file length at that moment) under the read lock BEFORE any WAL
+scans. Phase 1 (no lock) replays revisions `<= checkpoint_rev`. Phase 2
+(under lock) always scans from `checkpoint_offset` — not from
+`phase1_end` (which was 0 when Phase 1 was skipped). This guarantees:
+
+1. No records missed: Phase 2 scans the exact byte range written since
+   the checkpoint, regardless of whether Phase 1 ran.
+2. No full-WAL scan: Even when Phase 1 is skipped, Phase 2 starts from
+   `checkpoint_offset` (near end-of-file), not byte 0.
+3. No race: The rev+offset snapshot is taken atomically under the read
+   lock before any concurrent Phase 1 scans begin.
+
+Observed with stale watcher (start_revision=33,686,456):
 
 ```
-watch_replay watch_id=21 start_revision=33686456
-  phase1_us=0 lock_us=0 scan_us=0  ← was 283ms
-  key=/registry/events/
+# Before: Phase 2 scanned full 77 MB WAL under lock
+watch_replay watch_id=26 start_revision=33686456
+  phase1_us=0 phase2_us=283237  ← 283ms
+
+# After: Phase 2 scans only post-checkpoint bytes (microseconds)
+watch_replay watch_id=29 start_revision=33686456
+  phase1_us=0 lock_us=0 scan_us=21  ← 21µs
 ```
 
 ### Tradeoff: Startup time
@@ -202,6 +222,6 @@ availability during startup is more important than startup speed.
 |---|----------|--------|--------|--------|
 | P1 | Split timing | trivial | diagnostic | ✅ done |
 | P3 | Phase 1 semaphore | trivial | eliminates lock contention | ✅ done |
-| P5 | Stale watcher error | trivial | eliminates ~283ms worst case | ✅ done |
+| P5 | Checkpoint rev+offset | trivial | eliminates ~283ms worst case, no race | ✅ done |
 | P2 | Batch creation | moderate | further reduces startup time | future |
 | P4 | mmap | moderate | reduces allocation/copy | future |

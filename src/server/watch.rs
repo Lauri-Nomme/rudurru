@@ -105,7 +105,23 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 let start_revision = create.start_revision as u64;
                                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-                                let checkpoint_rev = if start_revision > 0 { current_revision() } else { 0 };
+                                // Checkpoint both revision and file offset before any WAL scans.
+                                // Phase 1 (no lock) replays revisions <= checkpoint_rev.
+                                // Phase 2 (under lock) scans from checkpoint_offset and replays
+                                // revisions > checkpoint_rev. This avoids scanning from byte 0
+                                // when Phase 1 is skipped (start_revision > checkpoint_rev),
+                                // and eliminates the race where new data appears between the
+                                // P5-style current_revision() check and the write lock acquisition.
+                                let (checkpoint_rev, checkpoint_offset) = if start_revision > 0 {
+                                    let state = store.state.read().await;
+                                    let rev = current_revision();
+                                    let off = std::fs::metadata(&state.wal.path)
+                                        .map(|m| m.len())
+                                        .unwrap_or(0);
+                                    (rev, off)
+                                } else {
+                                    (0, 0)
+                                };
 
                                 if start_revision > 0 && start_revision < store.compact_rev().await {
                                     let compact_rev = store.compact_rev().await;
@@ -131,28 +147,23 @@ impl etcdserverpb::watch_server::Watch for Watch {
 
                                 // Phase 1: scan WAL without the write lock.
                                 // Semaphore limits concurrent readers to prevent IO thrash.
-                                let (phase1_end, phase1_us) = {
+                                let phase1_us = {
                                     let _permit = PHASE1_SEM.acquire().await;
                                     let t0 = std::time::Instant::now();
-                                    let end = if start_revision > 0 && start_revision <= checkpoint_rev {
+                                    if start_revision > 0 && start_revision <= checkpoint_rev {
                                         if let Ok(mut reader) = wal::WalFile::open(&store.wal_path().await) {
                                             let bound = storage::resolve_range(&key, &range_end);
-                                            reader.scan(0, |rec| {
+                                            let _ = reader.scan(0, |rec| {
                                                 if rec.revision >= start_revision
                                                     && rec.revision <= checkpoint_rev
                                                     && storage::matches_range(bound.to_ref(), &rec.key)
                                                 {
                                                     let _ = event_tx.send(rec_to_event(rec));
                                                 }
-                                            }).unwrap_or(0)
-                                        } else {
-                                            0
+                                            });
                                         }
-                                    } else {
-                                        0
-                                    };
-                                    let elapsed = t0.elapsed().as_micros();
-                                    (end, elapsed)
+                                    }
+                                    t0.elapsed().as_micros()
                                 };
 
                                 // Phase 2: under lock, catch up events after checkpoint_rev, then register
@@ -161,9 +172,15 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 let lock_us = t_lock.elapsed().as_micros();
 
                                 let t_work = std::time::Instant::now();
-                                if start_revision > 0 && start_revision <= current_revision() {
+                                if start_revision > 0 {
+                                    // Scan from checkpoint_offset (not phase1_end) to avoid
+                                    // re-scanning the entire WAL when Phase 1 was skipped.
+                                    // Records with revision > checkpoint_rev are new since
+                                    // the checkpoint; records <= checkpoint_rev were already
+                                    // handled by Phase 1 (if it ran) or are below our
+                                    // start_revision (if Phase 1 was skipped).
                                     let bound = storage::resolve_range(&key, &range_end);
-                                    let _ = state.wal.scan(phase1_end, |rec| {
+                                    let _ = state.wal.scan(checkpoint_offset, |rec| {
                                         if rec.revision > checkpoint_rev
                                             && storage::matches_range(bound.to_ref(), &rec.key)
                                         {
