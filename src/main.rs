@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: SocketAddr = listen_addr.parse().context("parse listen address")?;
 
-    tracing::info!("Rudurru listening on {addr}, WAL: {wal_path}");
+    tracing::info!(git_revision = env!("GIT_REVISION"), "Rudurru listening on {addr}, WAL: {wal_path}");
 
     // Periodic status logging (every 60s)
     let status_store = store.clone();
