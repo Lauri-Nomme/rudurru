@@ -588,5 +588,375 @@ becomes the wire format, eliminating a conversion layer.
 | P2 | Per-stream batching | moderate | replaced by P6 | ✅ done |
 | P5 | Checkpoint rev+offset | trivial | eliminates ~283ms worst case, no race | ✅ done |
 | P6 | Cross-stream batching | high | 140 watchers → 1 Phase 1 + 1 lock (32µs) | ✅ done |
-| P7 | Protobuf-native WAL (zero-copy) | high | eliminates serialization entirely | analyzed |
+| P7 | Protobuf-native WAL (zero-copy) | high | eliminates serialization entirely | ✅ done |
 | P4 | mmap | moderate | reduces allocation/copy | future |
+
+---
+
+## Codebase-Wide Bottleneck Analysis (2026-06-14)
+
+Identified by systematic code review after P7 zero-copy implementation.
+Organized by priority tier: **Critical** (blocks all ops), **High** (significant
+waste), **Moderate** (measurable but steady-state).
+
+### A. CRITICAL: WAL fsync Under Write Lock
+
+**Every mutation path** (`put`, `delete_range`, `lease_revoke`, expiry task)
+calls `self.file.sync_all()` while holding the RwLock write lock. fsync is
+~1-10ms on typical SSDs, blocking ALL readers (range scans, watch replay) and
+ALL other writers during that time.
+
+**Files:**
+- `src/storage/wal.rs:333` — `append_kv` calls `sync_all()` per record
+- `src/storage/mod.rs:395-397` — put calls `append_kv` inside write lock
+- `src/storage/mod.rs:453-454` — delete_range same pattern
+- `src/storage/mod.rs:617-618` — lease_revoke same pattern  
+- `src/storage/mod.rs:763-764` — expiry task same pattern
+
+**Fix:** Move WAL write + fsync outside the write lock. Options:
+
+| Approach | Complexity | Risk |
+|----------|-----------|------|
+| Write to buffer, fsync on timer | low | up to 50ms data loss on crash |
+| Separate WAL writer thread (mpsc channel) | moderate | ordering guarantees needed |
+| Dedicated fsync thread, serialized writes in-memory | moderate | same |
+
+For the k3s workload (~72 writes/sec), a 50ms fsync timer with an in-memory
+buffer eliminates 99.9% of fsync calls while losing at most 50ms of writes on
+crash (acceptable for k3s — etcd has the same trade-off with its raft commit).
+
+### B. CRITICAL: Watch Replay Phase 1 Reads Entire WAL Into Memory
+
+`WalFile::scan_kv` calls `self.file.read_to_end(&mut buf)` loading the entire
+WAL into a `Vec<u8>`. For a 1GB WAL, that's 1GB allocated. On every batch of
+watch creations (though amortized by cross-stream batching, P6).
+
+**File:** `src/storage/wal.rs:311-312`
+
+**Fix:** Mem-map the WAL. `mmap` provides:
+- Zero-copy reads (kernel manages page cache)
+- Shared pages across concurrent Phase 1 scans (P6 batching already mitigates
+  this, but mmap is still cheaper)
+- No allocation for the read buffer
+- Lazy page faults — only hot pages are resident
+
+Alternatively: bounded streaming reader using `read_exact` for each record's
+`rec_len`. Since `rec_len` is available in the 9-byte header, we can read one
+record at a time without loading the entire file.
+
+### C. CRITICAL: Lease Expiry Polls Every 500ms
+
+`start_expiry_task` runs every 500ms with `tokio::time::sleep(500ms)` and
+acquires the **write lock**. Even with zero leases, it iterates, checks,
+and releases. The 500ms poll contributes 2% of CPU in the perf profile
+(see `prd/perf-test.md`).
+
+**File:** `src/storage/mod.rs:727-731`
+
+**Fix:** Use `tokio::time::sleep_until(earliest_expiring)`. Maintain a
+BTreeMap or binary heap of `(expires_at, lease_id)`. When a lease is granted
+or refreshed, push the new expiry and update the wake-up timer. When the
+timer fires, pop all expired leases and process them. This makes expiry
+event-driven rather than polling.
+
+Cost: Adds a min-heap. Risk: minimal — sleep_until with a past time resolves
+immediately.
+
+### D. HIGH: notify_watchers Clones Entire Watcher List
+
+Every `put` or `delete` calls `notify_watchers`, which does:
+```rust
+let watchers: Vec<WatchRegistration> = self.watchers.clone();
+```
+This clones ALL watchers (including `Vec<u8>` keys, `mpsc::UnboundedSender`s,
+filters) while holding the write lock. For 10K watchers, this is megabytes of
+allocation.
+
+**File:** `src/storage/mod.rs:193`
+
+**Fix:** Iterate `self.watchers` directly instead of cloning. `WatchRegistration`
+is `Clone` (derived) but we can iterate with a regular `for w in &self.watchers`.
+The borrow checker may require `watchers` to be in a `RefCell` or use an index
+loop, but the clone is unnecessary — no other code holds a mutable borrow at
+this point.
+
+With the current design (`notify_watchers` called from `apply`/`apply_delete`
+which hold `&mut self`), we can iterate with indices:
+```rust
+for i in (0..self.watchers.len()).rev() {
+    let watcher = &self.watchers[i];
+    // ... check and send ...
+}
+```
+This avoids the clone entirely.
+
+### E. HIGH: resolve_range Called Per-Watcher Per-Event
+
+`notify_watchers` calls `resolve_range(&watcher.key, &watcher.range_end)` for
+every watcher on every notification. `resolve_range` allocates new `Vec<u8>`
+for each bound type.
+
+**File:** `src/storage/mod.rs:195-196`
+
+**Fix:** Pre-compute and cache `RangeBound` in `WatchRegistration` at
+registration time:
+```rust
+pub struct WatchRegistration {
+    pub key: Vec<u8>,
+    pub range_end: Vec<u8>,
+    pub bound: RangeBound,  // cached at registration
+    // ...
+}
+```
+Then `notify_watchers` just calls `matches_range(watcher.bound.to_ref(), &event.key)`.
+
+Cost: Adds one `resolve_range` call at registration time (negligible). Saves
+one per event per watcher for the lifetime of the watch.
+
+### F. HIGH: kv_bytes Cloned Per Range Result
+
+`Store::range` clones `ks.kv_bytes.clone()` for every matching key. For a
+10K-key range with 1KB values, this is 10MB of allocations.
+
+**File:** `src/storage/mod.rs:326`
+
+**Fix options:**
+1. **Arc<Vec<u8>>**: Store kv_bytes in `Arc<Vec<u8>>` and clone the Arc (cheap
+   atomic increment). The Vec is immutable after creation — perfect for Arc.
+   Cost: one extra atomic op per clone. Impact: clone becomes ~2ns instead of
+   O(data) memcpy.
+2. **Borrow from KeyState**: Change range to return references. Impossible
+   with the current RwLock ownership (can't return references to guard).
+
+Option 1 (Arc) is the clear winner. Changes `KeyState.kv_bytes` from
+`Vec<u8>` to `Arc<Vec<u8>>`, and all response construction clones the Arc.
+
+### G. HIGH: Clone Chain in Put
+
+A single `put` with `prev_kv=true` can clone kv_bytes 3+ times:
+1. `prev = state.keys.get(&key).cloned()` — clones entire KeyState
+2. `entry.clone()` on insert — clones entire KeyState again
+3. `event.kv_bytes = entry.kv_bytes.clone()` — clones kv_bytes for watch event
+4. `prev.as_ref().map(|p| p.kv_bytes.clone())` — clones for prev_kv response
+
+**File:** `src/storage/mod.rs:382, 148, 154, 404`
+
+**Fix:** Arc<Vec<u8>> for kv_bytes eliminates all deep copies — all clones
+become Arc clones (atomic increment).
+
+### H. HIGH: range Scans All Keys Including Deleted Tombstones
+
+`range` iterates the full BTreeMap, including deleted-flagged entries. The
+`ks.deleted` check on each iteration filters them out, but the loop still
+visits them. Over time, deleted keys (tombstones) accumulate, degrading
+range performance.
+
+**File:** `src/storage/mod.rs:300-315`
+
+**Fix options:**
+1. **Tombstone compaction**: Periodically purge deleted entries from
+   `state.keys`. Run on a timer or after N deletes.
+2. **Separate live-key index**: Maintain a second BTreeMap or HashSet of
+   active keys. Range queries iterate the live index.
+3. **BTreeMap range API**: Use `BTreeMap::range()` for prefix/point queries
+   instead of full iteration. This is already partially supported via
+   `resolve_range` but not actually used — the current code iterates ALL
+   keys and filters.
+
+Option 3 is the most impactful: replace the full scan with `BTreeMap::range()`
+bounds. For prefix queries, use `range(prefix..prefix_successor)`. For range
+queries, use `range(start..end)`. This turns O(n) scans into O(log n + k)
+where k is the result count.
+
+### I. HIGH: delete_range Clones All Keys Upfront
+
+`delete_range` collects all matching keys into `Vec<Vec<u8>>` before iterating.
+This requires a full scan of `state.keys` under the write lock, cloning each
+matching key.
+
+**File:** `src/storage/mod.rs:422-432`
+
+**Fix:** Use `BTreeMap::range()` to collect a range iterator, then drain it
+with `drain_filter` or by collecting keys in a bounded range. Alternatively,
+use `split_off` to split the BTreeMap at range boundaries and iterate the
+split portion.
+
+### J. HIGH: No Early Termination for Limited Ranges
+
+When `req.limit = 10` but there are 1M keys, the entire BTreeMap is scanned.
+The kvs Vec is truncated after scanning all matching keys.
+
+**File:** `src/storage/mod.rs:300-329`
+
+**Fix:** Use `BTreeMap::range()` and stop after collecting `limit` results.
+This is the same fix as H (use BTreeMap range API).
+
+### K. HIGH: lease_revoke Does Per-Key WAL Appends
+
+For N keys on a lease: N `next_revision()` calls, N WAL appends, N fsyncs,
+all under the write lock.
+
+**File:** `src/storage/mod.rs:598-621`
+
+**Fix:** Batch all WAL records into a single `append_kv_batch` call with one
+fsync. Also compute all revisions upfront with a single atomic batch
+(currently not supported by AtomicU64 — would need to add
+`fetch_add(N, Ordering::SeqCst)`).
+
+### L. HIGH: Event Forwarding Spawns Per-Watch Task
+
+Each successful watch creation spawns a new `tokio::spawn` to forward events
+from `event_rx` to the gRPC `tx`. For 10K watches, 10K tokio tasks.
+
+**File:** `src/server/watch.rs:179`
+
+**Fix:** Share a single per-stream forwarding task. Multiple watchers on the
+same stream can share a single event multiplexer task that reads from all
+event_rx channels and writes to the gRPC tx. Or, use `tokio::select!` in a
+shared loop.
+
+### M. MODERATE: Compact_rev Uses Full RwLock
+
+`compact_rev` is read-only (always increased) but acquires the full
+`RwLock<StoreState>`. This needlessly blocks writers.
+
+**File:** `src/storage/mod.rs:277`
+
+**Fix:** Use `AtomicU64` for `compact_rev`. It's only ever written by
+`compact()` (write lock already held for other reasons) and read by `range()`
+(read lock held). Move it out of `StoreState` into a standalone `AtomicU64`.
+
+### N. MODERATE: Range Has No Pre-Allocation for kvs Vec
+
+`kvs: Vec<Vec<u8>>` starts empty and grows dynamically. Each push may
+reallocate.
+
+**File:** `src/storage/mod.rs:285`
+
+**Fix:** After counting matching keys, pre-allocate: `Vec::with_capacity(count)`.
+Or at minimum, use an approximate upper bound.
+
+### O. MODERATE: Periodic Status Acquires Read Lock
+
+The 60s periodic status task acquires the read lock to log revision, keys
+count, etc. This is harmless in steady state but blocks writers during
+lock acquisition.
+
+**File:** `src/main.rs:52-61`
+
+**Fix:** Use atomics for `rev` and `keys` counters. These are monotonically
+increasing/decreasing and can be tracked with `AtomicU64`/`AtomicI64`
+outside the RwLock.
+
+### P. MODERATE: WAL CRC32C Is Software Bit-by-Bit
+
+The CRC32C implementation in `wal.rs` is a pure-software bit loop. Hardware
+CRC32C (SSE4.2 `_mm_crc32_u32`/`_mm_crc32_u8`) is available on all x86-64
+processors since 2010.
+
+**File:** `src/storage/wal.rs:611-623`
+
+**Fix:** Replace with `crc32c` crate (uses hardware acceleration when
+available). On modern CPUs, hardware CRC32C is ~10× faster than software.
+
+### Q. MODERATE: Txn Comparison + Execute Has TOCTOU Race
+
+`txn` evaluates comparisons under the read lock, drops it, then re-acquires
+the write lock for execution. Between the drop and re-acquire, the state can
+change, making the comparison stale.
+
+**File:** `src/storage/mod.rs:473-480`
+
+**Fix:** For true linearizable transactions, re-evaluate comparisons under
+the write lock. The current behavior is non-atomic and could cause
+unexpected failures under concurrent writes. For k3s workloads this is
+unlikely to trigger (low write concurrency), but is semantically incorrect
+per etcd spec.
+
+### R. LOW: KvWalRecord::new Allocates Temporary CRC Buffer
+
+`KvWalRecord::new` builds a temporary `crc_data` Vec to compute the CRC.
+This duplicates work already done in `encode_kv` and the header assembly.
+
+**File:** `src/storage/wal.rs:197-202`
+
+**Fix:** Compute CRC incrementally: CRC the flags byte, then fold in
+header fields, then fold in kv_bytes. Avoids the temporary Vec.
+
+### S. LOW: Graceful Shutdown Missing
+
+Ctrl+C kills the process without WAL sync. Unwritten kernel buffers may be
+lost. With O_APPEND + write, the window is small but nonzero.
+
+**File:** `src/main.rs` (no signal handler)
+
+**Fix:** Add `tokio::signal::ctrl_c()` and call `wal.sync_all()` before exit.
+
+### T. LOW: encode_kv Uses Variable-Length Varint for Value Length
+
+`encode_kv` uses `encode_varint` for value length. Since values can be up
+to 1.5MB in etcd (but typically <1KB in k3s), the varint is 1-3 bytes.
+Using a fixed 4-byte length field (like key_length uses 5-byte overlong)
+would enable O(1) value offset access for tools that want to skip to
+value data without parsing.
+
+**File:** `src/storage/wal.rs:112-113`
+
+### U. LOW: Store Hash Acquires Read Lock
+
+`store_hash` acquires the read lock to iterate keys. This is called by
+etcd's `Hash` RPC (maintenance).
+
+**File:** `src/storage/mod.rs:689`
+
+**Fix:** Maintain a running hash that's updated on every write. Trade-off:
+hash updates on write path adds overhead. For k3s workloads where Hash is
+rarely called, the current approach is acceptable.
+
+---
+
+## Priority Matrix
+
+| Priority | Item | Impact | Effort |
+|----------|------|--------|--------|
+| A | WAL fsync outside write lock | eliminates ~1-10ms stall per write | moderate |
+| B | mmap WAL reads | eliminates 1GB+ allocation per startup | moderate |
+| C | Event-driven lease expiry | eliminates 2% CPU polling, write lock contention | low |
+| D | Stop cloning watcher list | eliminates MB-scale alloc per put with 10K watchers | trivial |
+| E | Cache RangeBound in WatchRegistration | eliminates per-event per-watcher resolve_range | trivial |
+| F | Arc<Vec<u8>> for kv_bytes | eliminates deep clones in range/put/watch | low |
+| G | Arc chain in put | same as F, sub-item | low |
+| H | BTreeMap::range() not full scan | O(n) → O(log n + k) for range queries | low |
+| I | BTreeMap range for delete_range | O(n) → O(log n + k) | low |
+| J | Early termination with limit | avoids scanning entire map for limited queries | low |
+| K | Batch WAL in lease_revoke | reduces fsync calls from N to 1 | low |
+| L | Per-stream event multiplexing | 10K → 1 tokio tasks per stream | moderate |
+| M | AtomicU64 for compact_rev | eliminates unnecessary lock contention | trivial |
+| N | Pre-allocate kvs Vec | reduces reallocation during range | trivial |
+| O | Atomics for status counters | eliminates periodic read lock acquisition | low |
+| P | Hardware CRC32C | ~10× faster CRC computation | trivial |
+| Q | Linearizable txn | fixes correctness race | low |
+| R | Inline CRC in KvWalRecord::new | eliminates temporary Vec | trivial |
+| S | Graceful shutdown | prevents data loss on SIGTERM | trivial |
+| T | Fixed-length value length | O(1) value offset access | trivial |
+| U | Running hash for store_hash | eliminates read lock for maintenance RPC | low |
+
+## Immediate Next Steps (highest ROI)
+
+1. **Arc<Vec<u8>> for kv_bytes** (F+G) — one change eliminates clone chains
+   across range, put, watch, and replay. ~30 minutes work.
+
+2. **Cache RangeBound in WatchRegistration** (E) — trivial change, eliminates
+   resolve_range allocation from every watcher notification.
+
+3. **Stop cloning watcher list** (D) — index iteration instead of clone.
+   Trivial change, large impact with many watchers.
+
+4. **BTreeMap::range() for bounded iteration** (H+J) — replaces O(n) full
+   scans with O(log n + k) for range and prefix queries.
+
+5. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
+   improvement available. Requires design work for crash semantics.
+
+Items D, E, F, H, J deliver high impact with low effort and can be done
+quickly.
