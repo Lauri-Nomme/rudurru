@@ -705,6 +705,8 @@ impl Store {
     }
 }
 
+/// Apply a KvWalRecord during startup replay. Rebuilds in-memory state
+/// and fires watch events for any watchers caught up during replay.
 fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
     let deleted = (rec.flags & wal::DELETED) != 0;
 
