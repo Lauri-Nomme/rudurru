@@ -32,27 +32,22 @@ fn make_header(revision: i64) -> etcdserverpb::ResponseHeader {
 fn event_to_proto(event: &WatchEvent) -> mvccpb::Event {
     mvccpb::Event {
         r#type: event.event_type as i32,
-        kv: Some(event.kv.clone()),
-        prev_kv: event.prev_kv.clone(),
+        kv: event.kv_bytes.clone(),
+        prev_kv: event.prev_kv_bytes.clone(),
     }
 }
 
-fn rec_to_event(rec: &wal::WalRecord) -> WatchEvent {
+fn kvrec_to_event(rec: &wal::KvWalRecord) -> Option<WatchEvent> {
     let deleted = (rec.flags & wal::DELETED) != 0;
-    let has_lease = (rec.flags & wal::HAS_LEASE) != 0;
-    WatchEvent {
-        revision: rec.revision,
+    let rev = rec.mod_revision().unwrap_or(0) as u64;
+    let key = rec.key()?.to_vec();
+    Some(WatchEvent {
+        revision: rev,
         event_type: if deleted { mvccpb::event::EventType::Delete } else { mvccpb::event::EventType::Put },
-        kv: mvccpb::KeyValue {
-            key: rec.key.clone(),
-            create_revision: rec.revision as i64,
-            mod_revision: rec.revision as i64,
-            version: 1,
-            value: rec.value.clone(),
-            lease: if has_lease { rec.lease_id.unwrap_or(0) } else { 0 },
-        },
-        prev_kv: None,
-    }
+        key,
+        kv_bytes: rec.kv_bytes.clone(),
+        prev_kv_bytes: Vec::new(),
+    })
 }
 
 struct PendingCreate {
@@ -356,15 +351,24 @@ async fn flush_global_batch(
         let t0 = Instant::now();
         let wal_path = store.wal_path().await;
         if let Ok(mut reader) = wal::WalFile::open(&wal_path) {
-            let _ = reader.scan(0, |rec| {
-                if rec.revision > checkpoint_rev {
+            let _ = reader.scan_kv(0, |rec| {
+                let rev = rec.mod_revision().unwrap_or(0) as u64;
+                if rev > checkpoint_rev {
                     return;
                 }
+                let key = match rec.key() {
+                    Some(k) => k,
+                    None => return,
+                };
+                let event = match kvrec_to_event(rec) {
+                    Some(e) => e,
+                    None => return,
+                };
                 for ctx in &active {
-                    if rec.revision >= ctx.start_revision
-                        && storage::matches_range(ctx.bound.to_ref(), &rec.key)
+                    if rev >= ctx.start_revision
+                        && storage::matches_range(ctx.bound.to_ref(), key)
                     {
-                        let _ = ctx.event_tx.send(rec_to_event(rec));
+                        let _ = ctx.event_tx.send(event.clone());
                     }
                 }
             });
@@ -379,13 +383,22 @@ async fn flush_global_batch(
 
     let t_work = Instant::now();
 
-    let _ = state.wal.scan(checkpoint_offset, |rec| {
-        if rec.revision <= checkpoint_rev {
+    let _ = state.wal.scan_kv(checkpoint_offset, |rec| {
+        let rev = rec.mod_revision().unwrap_or(0) as u64;
+        if rev <= checkpoint_rev {
             return;
         }
+        let key = match rec.key() {
+            Some(k) => k,
+            None => return,
+        };
+        let event = match kvrec_to_event(rec) {
+            Some(e) => e,
+            None => return,
+        };
         for ctx in &active {
-            if storage::matches_range(ctx.bound.to_ref(), &rec.key) {
-                let _ = ctx.event_tx.send(rec_to_event(rec));
+            if storage::matches_range(ctx.bound.to_ref(), key) {
+                let _ = ctx.event_tx.send(event.clone());
             }
         }
     });

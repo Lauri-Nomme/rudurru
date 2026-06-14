@@ -2,6 +2,7 @@ pub mod wal;
 
 use crate::proto::etcdserverpb;
 use crate::proto::mvccpb;
+use prost::Message;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -34,10 +35,19 @@ pub struct KeyState {
     pub version: i64,
     pub lease: i64,
     pub deleted: bool,
+    pub kv_bytes: Vec<u8>,
 }
 
 impl KeyState {
+    /// Decode the pre-encoded kv_bytes into a mvccpb::KeyValue.
+    /// Falls back to constructing from fields if kv_bytes is empty (WAL replay from old format).
     pub fn to_key_value(&self, key: &[u8]) -> mvccpb::KeyValue {
+        if !self.kv_bytes.is_empty() {
+            if let Ok(mut kv) = mvccpb::KeyValue::decode(&self.kv_bytes[..]) {
+                kv.key = key.to_vec();
+                return kv;
+            }
+        }
         mvccpb::KeyValue {
             key: key.to_vec(),
             create_revision: self.create_revision as i64,
@@ -47,6 +57,19 @@ impl KeyState {
             lease: self.lease,
         }
     }
+}
+
+/// Pre-encode a KeyValue protobuf with overlong varints for use as kv_bytes.
+fn make_kv_bytes(key: &[u8], ks: &KeyState) -> Vec<u8> {
+    let (kv_bytes, _, _) = wal::encode_kv(
+        key,
+        &ks.value,
+        ks.create_revision as i64,
+        ks.mod_revision as i64,
+        ks.version,
+        ks.lease,
+    );
+    kv_bytes
 }
 
 #[derive(Debug)]
@@ -73,8 +96,9 @@ pub struct WatchRegistration {
 pub struct WatchEvent {
     pub revision: u64,
     pub event_type: mvccpb::event::EventType,
-    pub kv: mvccpb::KeyValue,
-    pub prev_kv: Option<mvccpb::KeyValue>,
+    pub key: Vec<u8>,
+    pub kv_bytes: Vec<u8>,
+    pub prev_kv_bytes: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -111,28 +135,24 @@ impl StoreState {
     fn apply(&mut self, key: Vec<u8>, value: Vec<u8>, lease: i64, rev: u64) -> Option<KeyState> {
         let prev = self.keys.get(&key).filter(|k| !k.deleted).cloned();
 
-        let entry = KeyState {
+        let mut entry = KeyState {
             value: Arc::from(value.into_boxed_slice()),
             mod_revision: rev,
             create_revision: prev.as_ref().map(|k| k.create_revision).unwrap_or(rev),
             version: prev.as_ref().map(|k| k.version + 1).unwrap_or(1),
             lease,
             deleted: false,
+            kv_bytes: Vec::new(),
         };
+        entry.kv_bytes = make_kv_bytes(&key, &entry);
         self.keys.insert(key.clone(), entry.clone());
         
         let event = WatchEvent {
             revision: rev,
             event_type: mvccpb::event::EventType::Put,
-            kv: mvccpb::KeyValue {
-                key: key.clone(),
-                create_revision: entry.create_revision as i64,
-                mod_revision: entry.mod_revision as i64,
-                version: entry.version,
-                value: entry.value.to_vec(),
-                lease: entry.lease,
-            },
-            prev_kv: prev.as_ref().map(|p| p.to_key_value(&key)),
+            key: key.clone(),
+            kv_bytes: entry.kv_bytes.clone(),
+            prev_kv_bytes: prev.as_ref().map(|p| p.kv_bytes.clone()).unwrap_or_default(),
         };
         self.notify_watchers(event);
         
@@ -149,15 +169,9 @@ impl StoreState {
         let event = WatchEvent {
             revision: rev,
             event_type: mvccpb::event::EventType::Delete,
-            kv: mvccpb::KeyValue {
-                key: key.clone(),
-                create_revision: prev.create_revision as i64,
-                mod_revision: prev.mod_revision as i64,
-                version: prev.version,
-                value: prev.value.to_vec(),
-                lease: prev.lease,
-            },
-            prev_kv: Some(prev.to_key_value(&key)),
+            key: key.clone(),
+            kv_bytes: prev.kv_bytes.clone(),
+            prev_kv_bytes: prev.kv_bytes.clone(),
         };
         self.notify_watchers(event);
         
@@ -181,7 +195,7 @@ impl StoreState {
         let watchers: Vec<WatchRegistration> = self.watchers.clone();
         for watcher in watchers {
             let bound = resolve_range(&watcher.key, &watcher.range_end);
-            if !matches_range(bound.to_ref(), &event.kv.key) {
+            if !matches_range(bound.to_ref(), &event.key) {
                 continue;
             }
             
@@ -224,18 +238,19 @@ impl Store {
     /// Rebuilds in-memory state from the WAL on startup.
     pub async fn open(wal_path: &str) -> anyhow::Result<Self> {
         let mut wal = wal::WalFile::open(wal_path)?;
-        let records = wal.scan_collect()?;
+        let records = wal.scan_kv_collect()?;
 
         let mut state = StoreState::new(wal);
         let mut max_rev = 0u64;
 
         for rec in &records {
-            if rec.revision <= state.compact_rev {
+            let rev = rec.mod_revision().unwrap_or(0) as u64;
+            if rev <= state.compact_rev {
                 continue;
             }
             apply_record(&mut state, rec);
-            if rec.revision > max_rev {
-                max_rev = rec.revision;
+            if rev > max_rev {
+                max_rev = rev;
             }
         }
 
@@ -277,7 +292,7 @@ impl Store {
         }
 
         let bound = resolve_range(&req.key, &req.range_end);
-        let mut kvs: Vec<mvccpb::KeyValue> = Vec::new();
+        let mut kvs: Vec<Vec<u8>> = Vec::new();
 
         for (k, ks) in state.keys.iter() {
             if ks.deleted {
@@ -300,12 +315,10 @@ impl Store {
             }
 
             let kv = if req.keys_only {
-                mvccpb::KeyValue {
-                    key: k.clone(),
-                    ..Default::default()
-                }
+                let (kv_bytes, _, _) = wal::encode_kv(k, b"", 0, 0, 0, 0);
+                kv_bytes
             } else {
-                ks.to_key_value(k)
+                ks.kv_bytes.clone()
             };
             kvs.push(kv);
         }
@@ -356,14 +369,21 @@ impl Store {
         if lease != 0 {
             flags |= wal::HAS_LEASE;
         }
-        let record = wal::WalRecord {
-            revision: rev,
-            key: key.clone(),
-            value: value.clone(),
+
+        let prev = state.keys.get(&key).filter(|k| !k.deleted).cloned();
+        let create_revision = prev.as_ref().map(|k| k.create_revision).unwrap_or(rev);
+        let version = prev.as_ref().map(|k| k.version + 1).unwrap_or(1);
+
+        let record = wal::KvWalRecord::new(
             flags,
-            lease_id: if lease != 0 { Some(lease) } else { None },
-        };
-        if let Err(e) = state.wal.append(&record) {
+            &key,
+            &value,
+            create_revision as i64,
+            rev as i64,
+            version,
+            lease,
+        );
+        if let Err(e) = state.wal.append_kv(&record) {
             tracing::error!("WAL append failed: {e}");
         }
 
@@ -371,9 +391,9 @@ impl Store {
 
         let header = Some(state.header());
         let prev_kv = if req.prev_kv {
-            prev.map(|p| p.to_key_value(&key))
+            prev.as_ref().map(|p| p.kv_bytes.clone()).unwrap_or_default()
         } else {
-            None
+            Vec::new()
         };
 
         etcdserverpb::PutResponse { header, prev_kv }
@@ -397,23 +417,30 @@ impl Store {
 
         let mut prev_kvs = Vec::new();
         for key in &keys_to_delete {
-            let prev = state.apply_delete(key.clone(), rev);
+            let prev = state.keys.get(key).filter(|k| !k.deleted).cloned();
+            state.apply_delete(key.clone(), rev);
 
-            if req.prev_kv {
-                if let Some(p) = prev {
-                    prev_kvs.push(p.to_key_value(key));
+            if let Some(p) = &prev {
+                let mut flags = wal::DELETED;
+                if p.lease != 0 { flags |= wal::HAS_LEASE; }
+                let record = wal::KvWalRecord::new(
+                    flags,
+                    key,
+                    &p.value,
+                    p.create_revision as i64,
+                    p.mod_revision as i64,
+                    p.version,
+                    p.lease,
+                );
+                if let Err(e) = state.wal.append_kv(&record) {
+                    tracing::error!("WAL append failed: {e}");
                 }
             }
 
-            let record = wal::WalRecord {
-                revision: rev,
-                key: key.clone(),
-                value: vec![],
-                flags: wal::DELETED,
-                lease_id: None,
-            };
-            if let Err(e) = state.wal.append(&record) {
-                tracing::error!("WAL append failed: {e}");
+            if req.prev_kv {
+                if let Some(p) = prev {
+                    prev_kvs.push(p.kv_bytes.clone());
+                }
             }
         }
 
@@ -531,16 +558,25 @@ impl Store {
             .collect();
         for key in &keys_to_delete {
             let rev = next_revision();
+            let prev = state.keys.get(key).filter(|k| !k.deleted).cloned();
             state.apply_delete(key.clone(), rev);
-            let record = wal::WalRecord {
-                revision: rev,
-                key: key.clone(),
-                value: vec![],
-                flags: wal::DELETED,
-                lease_id: None,
-            };
-            if let Err(e) = state.wal.append(&record) {
-                tracing::error!("WAL append failed on lease revoke: {e}");
+
+
+            if let Some(p) = &prev {
+                let mut flags = wal::DELETED;
+                if p.lease != 0 { flags |= wal::HAS_LEASE; }
+                let record = wal::KvWalRecord::new(
+                    flags,
+                    &key,
+                    &p.value,
+                    p.create_revision as i64,
+                    p.mod_revision as i64,
+                    p.version,
+                    p.lease,
+                );
+                if let Err(e) = state.wal.append_kv(&record) {
+                    tracing::error!("WAL append failed on lease revoke: {e}");
+                }
             }
         }
         etcdserverpb::LeaseRevokeResponse {
@@ -643,16 +679,24 @@ impl Store {
                         .collect();
                     for key in &keys_to_delete {
                         let rev = next_revision();
+                        let prev = s.keys.get(key).filter(|k| !k.deleted).cloned();
                         s.apply_delete(key.clone(), rev);
-                        let record = wal::WalRecord {
-                            revision: rev,
-                            key: key.clone(),
-                            value: vec![],
-                            flags: wal::DELETED,
-                            lease_id: None,
-                        };
-                        if let Err(e) = s.wal.append(&record) {
-                            tracing::error!("WAL append failed on lease expiry: {e}");
+
+                        if let Some(p) = &prev {
+                            let mut flags = wal::DELETED;
+                            if p.lease != 0 { flags |= wal::HAS_LEASE; }
+                            let record = wal::KvWalRecord::new(
+                                flags,
+                                key,
+                                &p.value,
+                                p.create_revision as i64,
+                                p.mod_revision as i64,
+                                p.version,
+                                p.lease,
+                            );
+                            if let Err(e) = s.wal.append_kv(&record) {
+                                tracing::error!("WAL append failed on lease expiry: {e}");
+                            }
                         }
                     }
                 }
@@ -661,51 +705,41 @@ impl Store {
     }
 }
 
-fn apply_record(state: &mut StoreState, rec: &wal::WalRecord) {
+fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
     let deleted = (rec.flags & wal::DELETED) != 0;
-    let has_lease = (rec.flags & wal::HAS_LEASE) != 0;
-    let lease = if has_lease { rec.lease_id.unwrap_or(0) } else { 0 };
 
     if deleted {
-        // Create watch event for DELETE during replay
+        let key = rec.key().unwrap_or_default().to_vec();
         let event = WatchEvent {
-            revision: rec.revision,
+            revision: rec.mod_revision().unwrap_or(0) as u64,
             event_type: mvccpb::event::EventType::Delete,
-            kv: mvccpb::KeyValue {
-                key: rec.key.clone(),
-                create_revision: rec.revision as i64,
-                mod_revision: rec.revision as i64,
-                version: 1,
-                value: vec![],
-                lease: 0,
-            },
-            prev_kv: None,
+            key: key.clone(),
+            kv_bytes: rec.kv_bytes.clone(),
+            prev_kv_bytes: rec.kv_bytes.clone(),
         };
-        state.keys.remove(&rec.key);
+        state.keys.remove(&key);
         state.notify_watchers(event);
-    } else {
-        let event = WatchEvent {
-            revision: rec.revision,
-            event_type: mvccpb::event::EventType::Put,
-            kv: mvccpb::KeyValue {
-                key: rec.key.clone(),
-                create_revision: rec.revision as i64,
-                mod_revision: rec.revision as i64,
-                version: 1, // During replay, we don't have original version
-                value: rec.value.clone(),
-                lease,
-            },
-            prev_kv: None, // During replay, we don't have previous KV
-        };
+    } else if let Ok(kv) = mvccpb::KeyValue::decode(&rec.kv_bytes[..]) {
+        let key = kv.key.clone();
+        let value = kv.value.clone();
         let entry = KeyState {
-            value: Arc::from(rec.value.clone().into_boxed_slice()),
-            mod_revision: rec.revision,
-            create_revision: rec.revision,
-            version: 1,
-            lease,
+            value: Arc::from(value.into_boxed_slice()),
+            mod_revision: kv.mod_revision as u64,
+            create_revision: kv.create_revision as u64,
+            version: kv.version,
+            lease: kv.lease,
             deleted: false,
+            kv_bytes: rec.kv_bytes.clone(),
         };
-        state.keys.insert(rec.key.clone(), entry);
+        state.keys.insert(key.clone(), entry);
+
+        let event = WatchEvent {
+            revision: rec.mod_revision().unwrap_or(0) as u64,
+            event_type: mvccpb::event::EventType::Put,
+            key,
+            kv_bytes: rec.kv_bytes.clone(),
+            prev_kv_bytes: Vec::new(),
+        };
         state.notify_watchers(event);
     }
 }

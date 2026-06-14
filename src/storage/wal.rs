@@ -1,18 +1,12 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-pub const MAGIC: u16 = 0x5255; // "RU"
 pub const DELETED: u8 = 0x01;
 pub const IS_CREATE: u8 = 0x02;
 pub const HAS_LEASE: u8 = 0x04;
 
-const HEADER_SIZE: usize = 23; // magic(2) + revision(8) + crc32(4) + key_len(4) + val_len(4) + flags(1)
-
 // ── Overlong varint helpers ───────────────────────────────────────
 
-/// Encode a u32 as a 5-byte overlong protobuf varint.
-/// 5 bytes × 7 bits = 35 bits, enough for any u32 (max 32 bits).
-/// The last byte only contributes 4 bits (bits 28-31).
 pub fn encode_overlong_u32(v: u32) -> [u8; 5] {
     let mut buf = [0u8; 5];
     for i in 0..4 {
@@ -22,7 +16,6 @@ pub fn encode_overlong_u32(v: u32) -> [u8; 5] {
     buf
 }
 
-/// Decode a fixed 5-byte overlong protobuf varint.
 pub fn decode_overlong_u32(buf: &[u8]) -> Option<u32> {
     if buf.len() < 5 {
         return None;
@@ -34,9 +27,6 @@ pub fn decode_overlong_u32(buf: &[u8]) -> Option<u32> {
     Some(v as u32)
 }
 
-/// Encode a u64 as a 10-byte overlong protobuf varint.
-/// 10 bytes × 7 bits = 70 bits, enough for any u64 (max 64 bits).
-/// The last byte only contributes 1 bit (bit 63).
 pub fn encode_overlong_u64(v: u64) -> [u8; 10] {
     let mut buf = [0u8; 10];
     for i in 0..9 {
@@ -46,7 +36,6 @@ pub fn encode_overlong_u64(v: u64) -> [u8; 10] {
     buf
 }
 
-/// Decode a fixed 10-byte overlong protobuf varint.
 pub fn decode_overlong_u64(buf: &[u8]) -> Option<u64> {
     if buf.len() < 10 {
         return None;
@@ -73,7 +62,6 @@ pub fn encode_varint(mut v: u64) -> Vec<u8> {
 }
 
 /// Decode a standard protobuf varint from the start of `buf`.
-/// Returns (value, bytes_consumed).
 pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0;
@@ -92,10 +80,6 @@ pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
 
 // ── Protobuf kv_bytes encoder ─────────────────────────────────────
 
-/// Encodes a `mvccpb.KeyValue` protobuf message with overlong varints
-/// for key_length (4B) and mod_revision (8B). Returns (kv_bytes,
-/// key_offset, mod_rev_offset) where offsets point to the varint data
-/// within kv_bytes (past the field tag).
 pub fn encode_kv(
     key: &[u8],
     value: &[u8],
@@ -108,39 +92,31 @@ pub fn encode_kv(
     let key_offset;
     let mod_rev_offset;
 
-    // Field 1: key (bytes, wire type 2, field number 1)
-    buf.push(0x0a); // tag = (1 << 3) | 2
+    buf.push(0x0a);
     key_offset = buf.len() as u16;
     buf.extend_from_slice(&encode_overlong_u32(key.len() as u32));
     buf.extend_from_slice(key);
 
-    // Field 2: create_revision (int64, wire type 0, field number 2)
-    buf.push(0x10); // tag = (2 << 3) | 0
+    buf.push(0x10);
     buf.extend_from_slice(&encode_varint(create_revision as u64));
 
-    // Field 3: mod_revision (int64, wire type 0, field number 3)
-    buf.push(0x18); // tag = (3 << 3) | 0
+    buf.push(0x18);
     mod_rev_offset = buf.len() as u16;
     buf.extend_from_slice(&encode_overlong_u64(mod_revision as u64));
 
-    // Field 4: version (int64, wire type 0, field number 4)
-    buf.push(0x20); // tag = (4 << 3) | 0
+    buf.push(0x20);
     buf.extend_from_slice(&encode_varint(version as u64));
 
-    // Field 5: value (bytes, wire type 2, field number 5)
-    buf.push(0x2a); // tag = (5 << 3) | 2
+    buf.push(0x2a);
     buf.extend_from_slice(&encode_varint(value.len() as u64));
     buf.extend_from_slice(value);
 
-    // Field 6: lease (int64, wire type 0, field number 6)
-    buf.push(0x30); // tag = (6 << 3) | 0
+    buf.push(0x30);
     buf.extend_from_slice(&encode_varint(lease as u64));
 
     (buf, key_offset, mod_rev_offset)
 }
 
-/// Read the key bytes from a kv_bytes buffer using the stored offset.
-/// `kv_bytes` must be valid protobuf encoded by `encode_kv`.
 pub fn read_key_from_kv(kv_bytes: &[u8], key_offset: u16) -> Option<&[u8]> {
     let ofs = key_offset as usize;
     if ofs >= kv_bytes.len() {
@@ -155,8 +131,6 @@ pub fn read_key_from_kv(kv_bytes: &[u8], key_offset: u16) -> Option<&[u8]> {
     Some(&kv_bytes[start..start + key_len])
 }
 
-/// Read the mod_revision from a kv_bytes buffer using the stored offset.
-/// The revision is stored as a 10-byte overlong varint.
 pub fn read_mod_revision_from_kv(kv_bytes: &[u8], mod_rev_offset: u16) -> Option<i64> {
     let ofs = mod_rev_offset as usize;
     if ofs + 10 > kv_bytes.len() {
@@ -165,20 +139,11 @@ pub fn read_mod_revision_from_kv(kv_bytes: &[u8], mod_rev_offset: u16) -> Option
     decode_overlong_u64(&kv_bytes[ofs..]).map(|v| v as i64)
 }
 
-// ── New WAL record (protobuf-native) ──────────────────────────────
+// ── KvWalRecord (protobuf-native WAL format) ──────────────────────
 
-pub const KV_HEADER_SIZE: usize = 9; // flags(1) + key_offset(2) + mod_rev_offset(2) + rec_len(4)
+pub const KV_HEADER_SIZE: usize = 9;
 pub const KV_CRC_SIZE: usize = 4;
 
-/// A WAL record in the protobuf-native format.
-///
-/// Layout on disk:
-///   [flags(1) | key_offset(2) | mod_rev_offset(2) | rec_len(4) |
-///    kv_bytes(N) | crc32(4)]
-///
-/// `kv_bytes` is a valid `mvccpb.KeyValue` protobuf message with
-/// overlong varints for key_length and mod_revision (allowing O(1)
-/// field access during scan via the header offsets).
 #[derive(Debug, Clone)]
 pub struct KvWalRecord {
     pub flags: u8,
@@ -190,8 +155,6 @@ pub struct KvWalRecord {
 }
 
 impl KvWalRecord {
-    /// Create a new record from its components. Computes kv_bytes,
-    /// offsets, rec_len, and CRC.
     pub fn new(
         flags: u8,
         key: &[u8],
@@ -205,7 +168,6 @@ impl KvWalRecord {
             encode_kv(key, value, create_revision, mod_revision, version, lease);
         let rec_len = (KV_HEADER_SIZE + kv_bytes.len() + KV_CRC_SIZE) as u32;
 
-        // CRC covers header + kv_bytes
         let mut crc_data = Vec::with_capacity(KV_HEADER_SIZE + kv_bytes.len());
         crc_data.push(flags);
         crc_data.extend_from_slice(&key_offset.to_le_bytes());
@@ -224,7 +186,6 @@ impl KvWalRecord {
         }
     }
 
-    /// Serialize the record to bytes for writing to the WAL.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.rec_len as usize);
         buf.push(self.flags);
@@ -236,7 +197,6 @@ impl KvWalRecord {
         buf
     }
 
-    /// Deserialize a record from raw bytes. Returns (record, bytes_consumed).
     pub fn deserialize(data: &[u8]) -> io::Result<(Self, usize)> {
         if data.len() < KV_HEADER_SIZE + KV_CRC_SIZE {
             return Err(io::Error::new(
@@ -269,7 +229,6 @@ impl KvWalRecord {
         let stored_crc =
             u32::from_le_bytes([data[crc_start], data[crc_start + 1], data[crc_start + 2], data[crc_start + 3]]);
 
-        // Verify CRC over header + kv_bytes
         let computed = crc32c(&data[..kv_end]);
         if computed != stored_crc {
             return Err(io::Error::new(
@@ -278,7 +237,6 @@ impl KvWalRecord {
             ));
         }
 
-        // Validate offsets point within kv_bytes
         if (key_offset as usize) >= kv_bytes.len()
             || (mod_rev_offset as usize) + 10 > kv_bytes.len()
         {
@@ -301,20 +259,17 @@ impl KvWalRecord {
         ))
     }
 
-    /// Extract the key from kv_bytes using the stored offset (O(1), no protobuf decode).
     pub fn key(&self) -> Option<&[u8]> {
         read_key_from_kv(&self.kv_bytes, self.key_offset)
     }
 
-    /// Extract the mod_revision from kv_bytes using the stored offset (O(1)).
     pub fn mod_revision(&self) -> Option<i64> {
         read_mod_revision_from_kv(&self.kv_bytes, self.mod_rev_offset)
     }
 }
 
-// ── WalFile with both old and new format support ──────────────────
+// ── WalFile ───────────────────────────────────────────────────────
 
-/// Append-only WAL file.
 #[derive(Debug)]
 pub struct WalFile {
     pub file: std::fs::File,
@@ -334,37 +289,6 @@ impl WalFile {
         })
     }
 
-    /// Scan WAL records from `offset`, calling `f` for each.
-    /// Returns the byte offset after the last byte consumed.
-    pub fn scan<F>(&mut self, offset: u64, f: F) -> io::Result<u64>
-    where
-        F: FnMut(&WalRecord),
-    {
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = Vec::new();
-        self.file.read_to_end(&mut buf)?;
-        let mut f = f;
-        let mut ofs = 0;
-        while ofs < buf.len() {
-            match WalRecord::deserialize(&buf[ofs..]) {
-                Ok((rec, consumed)) => {
-                    f(&rec);
-                    ofs += consumed;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        wal_offset = offset + ofs as u64,
-                        error = %e,
-                        "wal_record_error"
-                    );
-                    break;
-                }
-            }
-        }
-        Ok(offset + buf.len() as u64)
-    }
-
-    /// Scan WAL records in the new protobuf-native format from `offset`.
     pub fn scan_kv<F>(&mut self, offset: u64, f: F) -> io::Result<u64>
     where
         F: FnMut(&KvWalRecord),
@@ -393,29 +317,12 @@ impl WalFile {
         Ok(offset + buf.len() as u64)
     }
 
-    /// Convenience: scan all old-format records into a Vec.
-    pub fn scan_collect(&mut self) -> io::Result<Vec<WalRecord>> {
-        let mut records = Vec::new();
-        self.scan(0, |rec| records.push(rec.clone()))?;
-        Ok(records)
-    }
-
-    /// Convenience: scan all new-format records into a Vec.
     pub fn scan_kv_collect(&mut self) -> io::Result<Vec<KvWalRecord>> {
         let mut records = Vec::new();
         self.scan_kv(0, |rec| records.push(rec.clone()))?;
         Ok(records)
     }
 
-    /// Append a single old-format record.
-    pub fn append(&mut self, rec: &WalRecord) -> io::Result<()> {
-        let data = rec.serialize();
-        self.file.write_all(&data)?;
-        self.file.sync_all()?;
-        Ok(())
-    }
-
-    /// Append a single new-format record.
     pub fn append_kv(&mut self, rec: &KvWalRecord) -> io::Result<()> {
         let data = rec.serialize();
         self.file.write_all(&data)?;
@@ -423,17 +330,6 @@ impl WalFile {
         Ok(())
     }
 
-    /// Append multiple old-format records.
-    pub fn append_batch(&mut self, recs: &[WalRecord]) -> io::Result<()> {
-        for rec in recs {
-            let data = rec.serialize();
-            self.file.write_all(&data)?;
-        }
-        self.file.sync_all()?;
-        Ok(())
-    }
-
-    /// Append multiple new-format records.
     pub fn append_kv_batch(&mut self, recs: &[KvWalRecord]) -> io::Result<()> {
         for rec in recs {
             let data = rec.serialize();
@@ -444,7 +340,9 @@ impl WalFile {
     }
 }
 
-// ── Old-format WalRecord (preserved for backward compat) ──────────
+// ── Legacy old-format WalRecord (for migration tool only) ─────────
+
+pub const MAGIC: u16 = 0x5255;
 
 #[derive(Debug, Clone)]
 pub struct WalRecord {
@@ -457,22 +355,23 @@ pub struct WalRecord {
 
 impl WalRecord {
     pub fn serialize(&self) -> Vec<u8> {
+        const HEADER_SIZE: usize = 23;
         let lease_size: usize = if self.flags & HAS_LEASE != 0 { 8 } else { 0 };
         let total = HEADER_SIZE + self.key.len() + self.value.len() + lease_size;
         let mut buf = Vec::with_capacity(total);
 
-        buf.extend_from_slice(&MAGIC.to_le_bytes()); // 2
-        buf.extend_from_slice(&self.revision.to_le_bytes()); // 8
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&self.revision.to_le_bytes());
         let crc_ofs = buf.len();
-        buf.extend_from_slice(&[0u8; 4]); // 4 (CRC placeholder)
-        buf.extend_from_slice(&(self.key.len() as u32).to_le_bytes()); // 4
-        buf.extend_from_slice(&(self.value.len() as u32).to_le_bytes()); // 4
-        buf.push(self.flags); // 1
-        buf.extend_from_slice(&self.key); // N
-        buf.extend_from_slice(&self.value); // M
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(&(self.key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.value.len() as u32).to_le_bytes());
+        buf.push(self.flags);
+        buf.extend_from_slice(&self.key);
+        buf.extend_from_slice(&self.value);
 
         if let Some(lid) = self.lease_id {
-            buf.extend_from_slice(&lid.to_le_bytes()); // 8
+            buf.extend_from_slice(&lid.to_le_bytes());
         }
 
         let crc = crc32c(&buf[22..]);
@@ -481,6 +380,7 @@ impl WalRecord {
     }
 
     pub fn deserialize(data: &[u8]) -> io::Result<(Self, usize)> {
+        const HEADER_SIZE: usize = 23;
         if data.len() < HEADER_SIZE {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short record"));
         }
@@ -551,7 +451,7 @@ impl WalRecord {
 
 // ── CRC32C ─────────────────────────────────────────────────────────
 
-fn crc32c(data: &[u8]) -> u32 {
+pub fn crc32c(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFFFFFF;
     for &byte in data {
         crc ^= byte as u32;
@@ -572,8 +472,6 @@ fn crc32c(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    // ── Overlong varint tests ──────────────────────────────────────
-
     #[test]
     fn test_overlong_u32_roundtrip() {
         let cases = [0u32, 1, 127, 128, 255, 65535, 1 << 20, (1 << 28) - 1, 12345678, 0xDEADBEAF];
@@ -592,11 +490,7 @@ mod tests {
 
     #[test]
     fn test_overlong_u32_prost_compatible() {
-        // Our overlong encoding is valid protobuf: the standard varint
-        // decoder must accept it (per spec §2.2).
-        // Value 42 encoded as 5-byte overlong:
         let enc = encode_overlong_u32(42);
-        // Standard decoder should also handle it
         let (dec, consumed) = decode_varint(&enc).unwrap();
         assert_eq!(dec, 42);
         assert_eq!(consumed, 5, "standard decoder consumed all 5 bytes");
@@ -640,14 +534,11 @@ mod tests {
 
     #[test]
     fn test_standard_varint_decode_overlong() {
-        // decode_varint should handle overlong encodings (per protobuf spec)
-        let enc = encode_overlong_u32(42); // returns 5-byte overlong
+        let enc = encode_overlong_u32(42);
         let (dec, consumed) = decode_varint(&enc).unwrap();
         assert_eq!(dec, 42);
-        assert_eq!(consumed, 5, "standard decoder consumed all {len} bytes", len = enc.len());
+        assert_eq!(consumed, 5);
     }
-
-    // ── kv_bytes encoder tests ─────────────────────────────────────
 
     #[test]
     fn test_encode_kv_roundtrip() {
@@ -658,7 +549,6 @@ mod tests {
         let value = b"test_value";
         let (kv_bytes, key_ofs, rev_ofs) = encode_kv(key, value, 1, 100, 5, 999);
 
-        // Can prost decode it?
         let decoded = mvccpb::KeyValue::decode(&kv_bytes[..]).unwrap();
         assert_eq!(decoded.key, key);
         assert_eq!(decoded.value, value);
@@ -667,10 +557,8 @@ mod tests {
         assert_eq!(decoded.version, 5);
         assert_eq!(decoded.lease, 999);
 
-        // Verify offsets
         let read_key = read_key_from_kv(&kv_bytes, key_ofs).unwrap();
         assert_eq!(read_key, key);
-
         let read_rev = read_mod_revision_from_kv(&kv_bytes, rev_ofs).unwrap();
         assert_eq!(read_rev, 100);
     }
@@ -718,8 +606,6 @@ mod tests {
         assert!(read_mod_revision_from_kv(&kv_bytes, 9999).is_none());
     }
 
-    // ── KvWalRecord serialization/deserialization tests ────────────
-
     #[test]
     fn test_kvwal_record_roundtrip() {
         let rec = KvWalRecord::new(IS_CREATE, b"my_key", b"my_value", 1, 42, 5, 0);
@@ -727,17 +613,10 @@ mod tests {
         let serialized = rec.serialize();
         let (deserialized, consumed) = KvWalRecord::deserialize(&serialized).unwrap();
         assert_eq!(consumed, serialized.len());
-
         assert_eq!(deserialized.flags, IS_CREATE);
         assert_eq!(deserialized.key(), Some(&b"my_key"[..]));
         assert_eq!(deserialized.mod_revision(), Some(42));
-        assert_eq!(
-            deserialized.kv_bytes,
-            rec.kv_bytes,
-            "kv_bytes differ"
-        );
-
-        // Verify CRC match
+        assert_eq!(deserialized.kv_bytes, rec.kv_bytes);
         assert_eq!(deserialized.crc, rec.crc);
     }
 
@@ -747,15 +626,11 @@ mod tests {
             IS_CREATE | HAS_LEASE,
             b"lease_key",
             b"lease_val",
-            10,
-            20,
-            1,
-            777,
+            10, 20, 1, 777,
         );
 
         let serialized = rec.serialize();
         let (deserialized, _) = KvWalRecord::deserialize(&serialized).unwrap();
-
         assert_eq!(deserialized.flags, IS_CREATE | HAS_LEASE);
         assert_eq!(deserialized.key(), Some(&b"lease_key"[..]));
         assert_eq!(deserialized.mod_revision(), Some(20));
@@ -767,7 +642,6 @@ mod tests {
 
         let serialized = rec.serialize();
         let (deserialized, _) = KvWalRecord::deserialize(&serialized).unwrap();
-
         assert_eq!(deserialized.flags, DELETED);
         assert_eq!(deserialized.key(), Some(&b"del_key"[..]));
         assert_eq!(deserialized.mod_revision(), Some(6));
@@ -777,8 +651,6 @@ mod tests {
     fn test_kvwal_record_crc_corruption() {
         let rec = KvWalRecord::new(IS_CREATE, b"key", b"value", 1, 2, 3, 0);
         let mut serialized = rec.serialize();
-
-        // Corrupt a byte in kv_bytes
         serialized[KV_HEADER_SIZE + 2] ^= 0xFF;
 
         match KvWalRecord::deserialize(&serialized) {
@@ -811,8 +683,6 @@ mod tests {
         assert_eq!(deserialized.key(), Some(&key[..]));
         assert_eq!(deserialized.mod_revision(), Some(999999));
     }
-
-    // ── WalFile (new format) integration tests ─────────────────────
 
     fn temp_wal_path() -> std::path::PathBuf {
         let dir = std::env::temp_dir();
@@ -885,7 +755,6 @@ mod tests {
             let mut wal = WalFile::open(&path).unwrap();
             let rec1 = KvWalRecord::new(IS_CREATE, b"good", b"data", 1, 1, 1, 0);
             wal.append_kv(&rec1).unwrap();
-            // Append garbage
             use std::io::Write;
             wal.file.write_all(b"GARBAGE_DATA_THAT_IS_NOT_A_VALID_RECORD").unwrap();
             wal.file.sync_all().unwrap();
@@ -895,7 +764,6 @@ mod tests {
         {
             let mut wal = WalFile::open(&path).unwrap();
             let records = wal.scan_kv_collect().unwrap();
-            // Should stop at the garbage, only get the first record
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].key(), Some(&b"good"[..]));
         }
@@ -914,13 +782,11 @@ mod tests {
         }
         {
             let mut wal = WalFile::open(&path).unwrap();
-            // Scan all records to find the first record's size
             let all = wal.scan_kv_collect().unwrap();
             let rec1_size = all[0].rec_len;
             assert_eq!(all.len(), 2);
             drop(all);
 
-            // Now open a fresh handle scanning from rec1_size
             let mut wal2 = WalFile::open(&path).unwrap();
             let mut records = Vec::new();
             wal2.scan_kv(rec1_size as u64, |r| records.push(r.clone()))
@@ -931,8 +797,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ── Format backward compat (prost decode of kv_bytes) ──────────
-
     #[test]
     fn test_kvwal_prost_compat_all_fields() {
         use crate::proto::mvccpb;
@@ -942,10 +806,7 @@ mod tests {
             IS_CREATE | HAS_LEASE,
             b"compat_key",
             b"compat_value",
-            42,
-            100,
-            7,
-            888,
+            42, 100, 7, 888,
         );
 
         let decoded = mvccpb::KeyValue::decode(&rec.kv_bytes[..]).unwrap();
@@ -963,13 +824,8 @@ mod tests {
         use prost::Message;
 
         let rec = KvWalRecord::new(
-            IS_CREATE,
-            b"k",
-            b"v",
-            i64::MAX,
-            i64::MAX,
-            i64::MAX,
-            i64::MAX,
+            IS_CREATE, b"k", b"v",
+            i64::MAX, i64::MAX, i64::MAX, i64::MAX,
         );
 
         let decoded = mvccpb::KeyValue::decode(&rec.kv_bytes[..]).unwrap();
@@ -979,19 +835,15 @@ mod tests {
         assert_eq!(decoded.lease, i64::MAX);
     }
 
-    // ── CRC correctness ────────────────────────────────────────────
-
     #[test]
     fn test_kvwal_crc_consistency() {
         let rec = KvWalRecord::new(IS_CREATE, b"crc_test", b"crc_value", 1, 2, 3, 0);
         let serialized = rec.serialize();
 
-        // Manually compute CRC from the serialized bytes (header + kv_bytes)
         let kv_end = KV_HEADER_SIZE + rec.kv_bytes.len();
         let manual_crc = crc32c(&serialized[..kv_end]);
         assert_eq!(manual_crc, rec.crc, "stored CRC doesn't match manual CRC");
 
-        // Deserialize and verify
         let (deserialized, _) = KvWalRecord::deserialize(&serialized).unwrap();
         assert_eq!(deserialized.crc, rec.crc);
     }
