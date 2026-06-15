@@ -305,11 +305,33 @@ impl Store {
         };
         let mut kvs: Vec<Vec<u8>> = Vec::with_capacity(cap);
 
-        for (k, ks) in state.keys.iter() {
-            if ks.deleted {
-                continue;
+        let (range_start, range_end): (Option<Vec<u8>>, Option<Vec<u8>>) = match bound.to_ref() {
+            RangeBoundRef::All => (None, None),
+            RangeBoundRef::Point(k) => (Some(k.to_vec()), None),
+            RangeBoundRef::From(k) => (Some(k.to_vec()), None),
+            RangeBoundRef::Prefix(p) => (Some(p.to_vec()), None),
+            RangeBoundRef::Range(start, end) => (Some(start.to_vec()), Some(end.to_vec())),
+        };
+
+        let iter: Box<dyn Iterator<Item = (&Vec<u8>, &KeyState)>> = match (range_start, range_end) {
+            (Some(start), Some(end)) => Box::new(state.keys.range(start..end)),
+            (Some(start), None) => Box::new(state.keys.range(start..)),
+            (None, Some(end)) => Box::new(state.keys.range(..end)),
+            (None, None) => Box::new(state.keys.iter()),
+        };
+
+        let prefix_key = match bound.to_ref() {
+            RangeBoundRef::Prefix(p) => Some(p),
+            _ => None,
+        };
+
+        for (k, ks) in iter {
+            if let Some(p) = prefix_key {
+                if !k.starts_with(p) {
+                    break;
+                }
             }
-            if !matches_range(bound.to_ref(), k) {
+            if ks.deleted {
                 continue;
             }
             if req.min_mod_revision > 0 && (ks.mod_revision as i64) < req.min_mod_revision {
@@ -318,11 +340,13 @@ impl Store {
             if req.max_mod_revision > 0 && (ks.mod_revision as i64) > req.max_mod_revision {
                 continue;
             }
-            if req.min_create_revision > 0 && (ks.create_revision as i64) < req.min_create_revision
+            if req.min_create_revision > 0
+                && (ks.create_revision as i64) < req.min_create_revision
             {
                 continue;
             }
-            if req.max_create_revision > 0 && (ks.create_revision as i64) > req.max_create_revision
+            if req.max_create_revision > 0
+                && (ks.create_revision as i64) > req.max_create_revision
             {
                 continue;
             }
@@ -365,7 +389,6 @@ impl Store {
     pub async fn put(&self, req: etcdserverpb::PutRequest) -> etcdserverpb::PutResponse {
         let rev = next_revision();
         let mut state = self.state.write().await;
-
         let key = req.key.clone();
         let value = if req.ignore_value {
             state
@@ -429,17 +452,52 @@ impl Store {
 
         let bound = resolve_range(&req.key, &req.range_end);
 
-        let keys_to_delete: Vec<Vec<u8>> = state
-            .keys
-            .iter()
-            .filter(|(k, ks)| {
-                if ks.deleted {
-                    return false;
-                }
-                matches_range(bound.to_ref(), k)
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
+        let keys_to_delete: Vec<Vec<u8>> = match bound.to_ref() {
+            RangeBoundRef::Point(k) => {
+                state
+                    .keys
+                    .get(k)
+                    .filter(|ks| !ks.deleted)
+                    .map(|_| k.to_vec())
+                    .into_iter()
+                    .collect()
+            }
+            RangeBoundRef::From(k) => {
+                let start = k.to_vec();
+                state
+                    .keys
+                    .range(start..)
+                    .filter(|(_, ks)| !ks.deleted)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            }
+            RangeBoundRef::Prefix(p) => {
+                let start = p.to_vec();
+                state
+                    .keys
+                    .range(start..)
+                    .take_while(|(k, _)| k.starts_with(p))
+                    .filter(|(_, ks)| !ks.deleted)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            }
+            RangeBoundRef::Range(start, end) => {
+                let start = start.to_vec();
+                let end = end.to_vec();
+                state
+                    .keys
+                    .range(start..end)
+                    .filter(|(_, ks)| !ks.deleted)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            }
+            RangeBoundRef::All => state
+                .keys
+                .iter()
+                .filter(|(_, ks)| !ks.deleted)
+                .map(|(k, _)| k.clone())
+                .collect(),
+        };
 
         let mut prev_kvs = Vec::new();
         for key in &keys_to_delete {

@@ -777,6 +777,14 @@ bounds. For prefix queries, use `range(prefix..prefix_successor)`. For range
 queries, use `range(start..end)`. This turns O(n) scans into O(log n + k)
 where k is the result count.
 
+**Result:** `range()` now uses `BTreeMap::range()` for From, Prefix, Range, and
+Point bounds. Only the All case (`range_end = [0,0]` with empty key) still does a
+full scan. Point queries use `get_key_value()` (O(log n)). From/Prefix/Range
+queries use `range(start..)` or `range(start..end)` with O(log n + k)
+iteration. Prefix queries break early when key no longer matches. Combined
+with limit-based cap and pre-allocated kvs Vec, limited queries now stop
+after `limit` results instead of scanning the entire map.
+
 ### I. HIGH: delete_range Clones All Keys Upfront
 
 `delete_range` collects all matching keys into `Vec<Vec<u8>>` before iterating.
@@ -790,6 +798,11 @@ with `drain_filter` or by collecting keys in a bounded range. Alternatively,
 use `split_off` to split the BTreeMap at range boundaries and iterate the
 split portion.
 
+**Result:** `delete_range()` uses the same BTreeMap range approach as `range()`.
+Point queries use `get()` (direct O(log n) lookup). From/Prefix/Range use
+`range()` iteration. Prefix queries use `take_while(|(k,_)| k.starts_with(p))`
+to stop at the first non-matching key.
+
 ### J. HIGH: No Early Termination for Limited Ranges
 
 When `req.limit = 10` but there are 1M keys, the entire BTreeMap is scanned.
@@ -799,6 +812,12 @@ The kvs Vec is truncated after scanning all matching keys.
 
 **Fix:** Use `BTreeMap::range()` and stop after collecting `limit` results.
 This is the same fix as H (use BTreeMap range API).
+
+**Result:** The BTreeMap range iteration combined with pre-allocated `kvs` Vec
+(`Vec::with_capacity(req.limit)`) means limited queries stop after collecting
+`limit` matching keys. The iterator visits at most `limit` non-deleted matching
+keys plus any non-matching keys before the first match. This is O(log n + limit)
+instead of O(n).
 
 ### K. HIGH: lease_revoke Does Per-Key WAL Appends
 
@@ -959,9 +978,9 @@ rarely called, the current approach is acceptable.
 | E | Cache RangeBound in WatchRegistration | eliminates per-event per-watcher resolve_range | trivial | ✅ done |
 | F | Arc<Vec<u8>> for kv_bytes | eliminates deep clones in range/put/watch | low |
 | G | Arc chain in put | same as F, sub-item | low |
-| H | BTreeMap::range() not full scan | O(n) → O(log n + k) for range queries | low |
-| I | BTreeMap range for delete_range | O(n) → O(log n + k) | low |
-| J | Early termination with limit | avoids scanning entire map for limited queries | low |
+| H | BTreeMap::range() not full scan | O(n) → O(log n + k) for range queries | low | ✅ done |
+| I | BTreeMap range for delete_range | O(n) → O(log n + k) | low | ✅ done |
+| J | Early termination with limit | avoids scanning entire map for limited queries | low | ✅ done |
 | K | Batch WAL in lease_revoke | reduces fsync calls from N to 1 | low |
 | L | Per-stream event multiplexing | 10K → 1 tokio tasks per stream | moderate |
 | M | AtomicU64 for compact_rev | eliminates unnecessary lock contention | trivial | ✅ done |
@@ -986,9 +1005,7 @@ rarely called, the current approach is acceptable.
 6. ~~**Hardware CRC32C** (P) — done.~~
 7. ~~**Inline CRC** (R) — done.~~
 8. ~~**Graceful shutdown** (S) — done.~~
-9. **BTreeMap::range() for bounded iteration** (H+J) — replaces O(n) full
-   scans with O(log n + k) for range and prefix queries.
-
-(Showing lines 977-989 of 990. Use offset=990 to continue.)
-6. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
-   improvement available. Requires design work for crash semantics.
+9. ~~**BTreeMap::range() for bounded iteration** (H+J+I) — done.~~
+10. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
+    improvement available. Requires design work for crash semantics. Requires design work for crash semantics.
+11. **Batch WAL in lease_revoke** (K) — reduces fsync calls from N to 1.
