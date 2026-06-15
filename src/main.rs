@@ -44,6 +44,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("shutdown signal received, draining...");
+    };
+
     Server::builder()
         .add_service(server::new_kv(store.clone()))
         .add_service(server::new_watch(store.clone()))
@@ -51,8 +56,9 @@ async fn main() -> anyhow::Result<()> {
         .add_service(server::new_cluster(store.clone()))
         .add_service(server::new_maintenance(store.clone()))
         .add_service(server::new_auth(store))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown)
         .await?;
 
+    tracing::info!("shutdown complete");
     Ok(())
 }

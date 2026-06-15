@@ -920,6 +920,11 @@ lost. With O_APPEND + write, the window is small but nonzero.
 
 **Fix:** Add `tokio::signal::ctrl_c()` and call `wal.sync_all()` before exit.
 
+**Result:** `Server::serve` replaced with `serve_with_shutdown(addr, ctrl_c())`.
+Ctrl+C triggers tonic's graceful shutdown (drains in-flight requests), then
+exits. WAL sync is already done per-write by `append_kv()` — this adds the
+shutdown signal handling to prevent abrupt termination of in-flight operations.
+
 ### T. LOW: encode_kv Uses Variable-Length Varint for Value Length
 
 `encode_kv` uses `encode_varint` for value length. Since values can be up
@@ -965,7 +970,7 @@ rarely called, the current approach is acceptable.
 | P | Hardware CRC32C | ~10× faster CRC computation | trivial | ✅ done |
 | Q | Linearizable txn | fixes correctness race | low |
 | R | Inline CRC in KvWalRecord::new | eliminates temporary Vec | trivial | ✅ done |
-| S | Graceful shutdown | prevents data loss on SIGTERM | trivial |
+| S | Graceful shutdown | prevents data loss on SIGTERM | trivial | ✅ done |
 | T | Fixed-length value length | O(1) value offset access | trivial |
 | U | Running hash for store_hash | eliminates read lock for maintenance RPC | low |
 
@@ -977,7 +982,13 @@ rarely called, the current approach is acceptable.
 2. ~~**Cache RangeBound in WatchRegistration** (E) — done.~~
 3. ~~**Stop cloning watcher list** (D) — done.~~
 4. ~~**AtomicU64 for compact_rev** (M) — done.~~
-5. **BTreeMap::range() for bounded iteration** (H+J) — replaces O(n) full
+5. ~~**Pre-allocate kvs Vec** (N) — done.~~
+6. ~~**Hardware CRC32C** (P) — done.~~
+7. ~~**Inline CRC** (R) — done.~~
+8. ~~**Graceful shutdown** (S) — done.~~
+9. **BTreeMap::range() for bounded iteration** (H+J) — replaces O(n) full
    scans with O(log n + k) for range and prefix queries.
+
+(Showing lines 977-989 of 990. Use offset=990 to continue.)
 6. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
    improvement available. Requires design work for crash semantics.
