@@ -831,6 +831,12 @@ fsync. Also compute all revisions upfront with a single atomic batch
 (currently not supported by AtomicU64 — would need to add
 `fetch_add(N, Ordering::SeqCst)`).
 
+**Result:** `lease_revoke` now collects all WAL records into a Vec and calls
+`append_kv_batch(&records)` once, issuing a single `sync_all()` instead of N.
+Each key still gets its own revision (independent `next_revision()` calls).
+`append_kv_batch` was already implemented but never called — it writes all
+records then calls `sync_all()` once.
+
 ### L. HIGH: Event Forwarding Spawns Per-Watch Task
 
 Each successful watch creation spawns a new `tokio::spawn` to forward events
@@ -981,7 +987,7 @@ rarely called, the current approach is acceptable.
 | H | BTreeMap::range() not full scan | O(n) → O(log n + k) for range queries | low | ✅ done |
 | I | BTreeMap range for delete_range | O(n) → O(log n + k) | low | ✅ done |
 | J | Early termination with limit | avoids scanning entire map for limited queries | low | ✅ done |
-| K | Batch WAL in lease_revoke | reduces fsync calls from N to 1 | low |
+| K | Batch WAL in lease_revoke | reduces fsync calls from N to 1 | low | ✅ done |
 | L | Per-stream event multiplexing | 10K → 1 tokio tasks per stream | moderate |
 | M | AtomicU64 for compact_rev | eliminates unnecessary lock contention | trivial | ✅ done |
 | N | Pre-allocate kvs Vec | reduces reallocation during range | trivial | ✅ done |
@@ -1007,5 +1013,5 @@ rarely called, the current approach is acceptable.
 8. ~~**Graceful shutdown** (S) — done.~~
 9. ~~**BTreeMap::range() for bounded iteration** (H+J+I) — done.~~
 10. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
-    improvement available. Requires design work for crash semantics. Requires design work for crash semantics.
-11. **Batch WAL in lease_revoke** (K) — reduces fsync calls from N to 1.
+    improvement available. Requires design work for crash semantics.
+11. ~~**Batch WAL in lease_revoke** (K) — done.~~

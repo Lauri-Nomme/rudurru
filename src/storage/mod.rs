@@ -670,6 +670,7 @@ impl Store {
             .filter(|(_, ks)| ks.lease == id && !ks.deleted)
             .map(|(k, _)| k.clone())
             .collect();
+        let mut records = Vec::with_capacity(keys_to_delete.len());
         for key in &keys_to_delete {
             let rev = next_revision();
             let prev = state.keys.get(key).filter(|k| !k.deleted).cloned();
@@ -689,10 +690,11 @@ impl Store {
                     p.version,
                     p.lease,
                 );
-                if let Err(e) = state.wal.append_kv(&record) {
-                    tracing::error!("WAL append failed on lease revoke: {e}");
-                }
+                records.push(record);
             }
+        }
+        if let Err(e) = state.wal.append_kv_batch(&records) {
+            tracing::error!("WAL batch append failed on lease revoke: {e}");
         }
         etcdserverpb::LeaseRevokeResponse {
             header: Some(state.header()),
