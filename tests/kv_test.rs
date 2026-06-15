@@ -264,3 +264,51 @@ async fn test_range_with_start_equals_end() {
         .unwrap();
     assert_eq!(resp.count(), 0, "empty range should return 0 keys");
 }
+
+#[tokio::test]
+async fn test_put_delete_put_create_revision() {
+    let mut client = common::connect().await;
+    let key = key!("kv/pdp_cr");
+
+    // First put
+    let r1 = client.put(key.as_str(), "v1", None).await.unwrap();
+    let rev1 = r1.header().unwrap().revision();
+
+    let get1 = client.get(key.as_str(), None).await.unwrap();
+    assert_eq!(get1.kvs()[0].create_revision(), rev1);
+    assert_eq!(get1.kvs()[0].mod_revision(), rev1);
+    assert_eq!(get1.kvs()[0].version(), 1);
+
+    // Delete
+    client.delete(key.as_str(), None).await.unwrap();
+
+    // Second put — should be a fresh create
+    let r2 = client.put(key.as_str(), "v2", None).await.unwrap();
+    let rev2 = r2.header().unwrap().revision();
+    assert!(rev2 > rev1);
+
+    let get2 = client.get(key.as_str(), None).await.unwrap();
+    assert_eq!(get2.kvs()[0].create_revision(), rev2);
+    assert_eq!(get2.kvs()[0].mod_revision(), rev2);
+    assert_eq!(get2.kvs()[0].version(), 1);
+}
+
+#[tokio::test]
+async fn test_put_update_keeps_create_revision() {
+    let mut client = common::connect().await;
+    let key = key!("kv/upd_cr");
+
+    client.put(key.as_str(), "a", None).await.unwrap();
+    let create_rev = {
+        let get = client.get(key.as_str(), None).await.unwrap();
+        get.kvs()[0].create_revision()
+    };
+
+    // Update — create_revision must stay the same
+    client.put(key.as_str(), "b", None).await.unwrap();
+    let get = client.get(key.as_str(), None).await.unwrap();
+    let kv = &get.kvs()[0];
+    assert_eq!(kv.create_revision(), create_rev, "create_revision unchanged on update");
+    assert!(kv.mod_revision() > create_rev, "mod_revision increases on update");
+    assert_eq!(kv.version(), 2, "version increments on update");
+}

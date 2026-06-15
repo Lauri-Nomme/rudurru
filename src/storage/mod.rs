@@ -225,7 +225,11 @@ impl StoreState {
                 continue;
             }
 
-            let _ = watcher.sender.send(event.clone());
+            let mut event = event.clone();
+            if !watcher.prev_kv {
+                event.prev_kv_bytes = Vec::new();
+            }
+            let _ = watcher.sender.send(event);
         }
     }
 }
@@ -374,12 +378,14 @@ impl Store {
             req.lease
         };
 
-        let mut flags = wal::IS_CREATE;
+        let prev = state.keys.get(&key).filter(|k| !k.deleted).cloned();
+        let mut flags = 0u8;
+        if prev.is_none() {
+            flags |= wal::IS_CREATE;
+        }
         if lease != 0 {
             flags |= wal::HAS_LEASE;
         }
-
-        let prev = state.keys.get(&key).filter(|k| !k.deleted).cloned();
         let create_revision = prev.as_ref().map(|k| k.create_revision).unwrap_or(rev);
         let version = prev.as_ref().map(|k| k.version + 1).unwrap_or(1);
 
@@ -446,7 +452,7 @@ impl Store {
                     key,
                     &p.value,
                     p.create_revision as i64,
-                    p.mod_revision as i64,
+                    rev as i64,
                     p.version,
                     p.lease,
                 );
@@ -610,7 +616,7 @@ impl Store {
                     key,
                     &p.value,
                     p.create_revision as i64,
-                    p.mod_revision as i64,
+                    rev as i64,
                     p.version,
                     p.lease,
                 );
@@ -756,7 +762,7 @@ impl Store {
                                 key,
                                 &p.value,
                                 p.create_revision as i64,
-                                p.mod_revision as i64,
+                                rev as i64,
                                 p.version,
                                 p.lease,
                             );

@@ -238,6 +238,14 @@ impl KvWalRecord {
         let mod_rev_offset = u16::from_le_bytes([data[3], data[4]]);
         let rec_len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
 
+        let min_rec_len = KV_HEADER_SIZE + KV_CRC_SIZE;
+        if (rec_len as usize) < min_rec_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rec_len too small",
+            ));
+        }
+
         if (rec_len as usize) > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -899,5 +907,22 @@ mod tests {
 
         let (deserialized, _) = KvWalRecord::deserialize(&serialized).unwrap();
         assert_eq!(deserialized.crc, rec.crc);
+    }
+
+    #[test]
+    fn test_deserialize_rec_len_underflow() {
+        let rec = KvWalRecord {
+            flags: DELETED,
+            kv_bytes: vec![0x0a, 0x01, 0x61],
+            key_offset: 1,
+            mod_rev_offset: 0,
+            rec_len: KV_HEADER_SIZE as u32 + KV_CRC_SIZE as u32 - 1,
+            crc: 0,
+        };
+        let serialized = rec.serialize();
+        let result = KvWalRecord::deserialize(&serialized);
+        assert!(result.is_err(), "should reject rec_len < min");
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
