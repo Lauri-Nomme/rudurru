@@ -690,6 +690,10 @@ for i in (0..self.watchers.len()).rev() {
 ```
 This avoids the clone entirely.
 
+**Result:** Clone of entire watcher Vec (~28KB for 141 watchers) eliminated per
+notify_watchers call. Each put/delete now skips this allocation entirely.
+Index iteration has no overhead vs. iterator over owned Vec.
+
 ### E. HIGH: resolve_range Called Per-Watcher Per-Event
 
 `notify_watchers` calls `resolve_range(&watcher.key, &watcher.range_end)` for
@@ -712,6 +716,11 @@ Then `notify_watchers` just calls `matches_range(watcher.bound.to_ref(), &event.
 
 Cost: Adds one `resolve_range` call at registration time (negligible). Saves
 one per event per watcher for the lifetime of the watch.
+
+**Result:** `RangeBound` now derived `Clone + Debug` and cached in
+`WatchRegistration.bound`. `notify_watchers` no longer calls `resolve_range`
+per-watcher — uses `watcher.bound.to_ref()` directly. Eliminates one
+`Vec<u8>` allocation per watcher per put/delete event.
 
 ### F. HIGH: kv_bytes Cloned Per Range Result
 
@@ -826,6 +835,11 @@ shared loop.
 `compact()` (write lock already held for other reasons) and read by `range()`
 (read lock held). Move it out of `StoreState` into a standalone `AtomicU64`.
 
+**Result:** `COMPACT_REV` is a global `AtomicU64`. `range()` and `compact_rev()`
+read it without acquiring any RwLock. `compact()` writes it under `store()`.
+Eliminates a read lock acquisition from every range query and from the
+`compact_rev()` method used by watch creation flow.
+
 ### N. MODERATE: Range Has No Pre-Allocation for kvs Vec
 
 `kvs: Vec<Vec<u8>>` starts empty and grows dynamically. Each push may
@@ -922,8 +936,8 @@ rarely called, the current approach is acceptable.
 | A | WAL fsync outside write lock | eliminates ~1-10ms stall per write | moderate |
 | B | mmap WAL reads | eliminates 1GB+ allocation per startup | moderate |
 | C | Event-driven lease expiry | eliminates 2% CPU polling, write lock contention | low |
-| D | Stop cloning watcher list | eliminates MB-scale alloc per put with 10K watchers | trivial |
-| E | Cache RangeBound in WatchRegistration | eliminates per-event per-watcher resolve_range | trivial |
+| D | Stop cloning watcher list | eliminates MB-scale alloc per put with 10K watchers | trivial | ✅ done |
+| E | Cache RangeBound in WatchRegistration | eliminates per-event per-watcher resolve_range | trivial | ✅ done |
 | F | Arc<Vec<u8>> for kv_bytes | eliminates deep clones in range/put/watch | low |
 | G | Arc chain in put | same as F, sub-item | low |
 | H | BTreeMap::range() not full scan | O(n) → O(log n + k) for range queries | low |
@@ -931,7 +945,7 @@ rarely called, the current approach is acceptable.
 | J | Early termination with limit | avoids scanning entire map for limited queries | low |
 | K | Batch WAL in lease_revoke | reduces fsync calls from N to 1 | low |
 | L | Per-stream event multiplexing | 10K → 1 tokio tasks per stream | moderate |
-| M | AtomicU64 for compact_rev | eliminates unnecessary lock contention | trivial |
+| M | AtomicU64 for compact_rev | eliminates unnecessary lock contention | trivial | ✅ done |
 | N | Pre-allocate kvs Vec | reduces reallocation during range | trivial |
 | O | Atomics for status counters | eliminates periodic read lock acquisition | low |
 | P | Hardware CRC32C | ~10× faster CRC computation | trivial |
@@ -944,19 +958,12 @@ rarely called, the current approach is acceptable.
 ## Immediate Next Steps (highest ROI)
 
 1. **Arc<Vec<u8>> for kv_bytes** (F+G) — one change eliminates clone chains
-   across range, put, watch, and replay. ~30 minutes work.
+   across range, put, watch, and replay. ~30 minutes work. *(next)*
 
-2. **Cache RangeBound in WatchRegistration** (E) — trivial change, eliminates
-   resolve_range allocation from every watcher notification.
-
-3. **Stop cloning watcher list** (D) — index iteration instead of clone.
-   Trivial change, large impact with many watchers.
-
-4. **BTreeMap::range() for bounded iteration** (H+J) — replaces O(n) full
+2. ~~**Cache RangeBound in WatchRegistration** (E) — done.~~
+3. ~~**Stop cloning watcher list** (D) — done.~~
+4. ~~**AtomicU64 for compact_rev** (M) — done.~~
+5. **BTreeMap::range() for bounded iteration** (H+J) — replaces O(n) full
    scans with O(log n + k) for range and prefix queries.
-
-5. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
+6. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
    improvement available. Requires design work for crash semantics.
-
-Items D, E, F, H, J deliver high impact with low effort and can be done
-quickly.

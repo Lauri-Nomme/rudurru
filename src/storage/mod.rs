@@ -21,6 +21,7 @@ pub fn current_revision() -> u64 {
 }
 
 static NEXT_LEASE_ID: AtomicI64 = AtomicI64::new(1);
+static COMPACT_REV: AtomicU64 = AtomicU64::new(0);
 
 fn next_lease_id() -> i64 {
     NEXT_LEASE_ID.fetch_add(1, Ordering::SeqCst)
@@ -90,6 +91,7 @@ pub struct WatchRegistration {
     pub progress_notify: bool,
     pub filters: Vec<i32>,
     pub prev_kv: bool,
+    pub(crate) bound: RangeBound,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +108,6 @@ pub struct StoreState {
     pub keys: BTreeMap<Vec<u8>, KeyState>,
     pub leases: BTreeMap<i64, LeaseState>,
     pub watchers: Vec<WatchRegistration>,
-    pub compact_rev: u64,
     pub next_rev: u64,
     pub wal: wal::WalFile,
 }
@@ -117,7 +118,6 @@ impl StoreState {
             keys: BTreeMap::new(),
             leases: BTreeMap::new(),
             watchers: Vec::new(),
-            compact_rev: 0,
             next_rev: 1,
             wal,
         }
@@ -195,10 +195,9 @@ impl StoreState {
     }
 
     fn notify_watchers(&mut self, event: WatchEvent) {
-        let watchers: Vec<WatchRegistration> = self.watchers.clone();
-        for watcher in watchers {
-            let bound = resolve_range(&watcher.key, &watcher.range_end);
-            if !matches_range(bound.to_ref(), &event.key) {
+        for i in 0..self.watchers.len() {
+            let watcher = &self.watchers[i];
+            if !matches_range(watcher.bound.to_ref(), &event.key) {
                 continue;
             }
 
@@ -252,7 +251,7 @@ impl Store {
 
         for rec in &records {
             let rev = rec.mod_revision().unwrap_or(0) as u64;
-            if rev <= state.compact_rev {
+            if rev <= COMPACT_REV.load(Ordering::Relaxed) {
                 continue;
             }
             apply_record(&mut state, rec);
@@ -268,7 +267,7 @@ impl Store {
             "rudurru ready: revision={}, keys={}, compact_rev={}",
             max_rev,
             state.keys.len(),
-            state.compact_rev,
+            COMPACT_REV.load(Ordering::Relaxed),
         );
 
         let state = Arc::new(RwLock::new(state));
@@ -278,7 +277,7 @@ impl Store {
     }
 
     pub async fn compact_rev(&self) -> u64 {
-        self.state.read().await.compact_rev
+        COMPACT_REV.load(Ordering::Relaxed)
     }
 
     pub async fn wal_path(&self) -> String {
@@ -289,7 +288,7 @@ impl Store {
 
     pub async fn range(&self, req: etcdserverpb::RangeRequest) -> etcdserverpb::RangeResponse {
         let state = self.state.read().await;
-        if req.revision > 0 && (req.revision as u64) < state.compact_rev {
+        if req.revision > 0 && (req.revision as u64) < COMPACT_REV.load(Ordering::Relaxed) {
             return etcdserverpb::RangeResponse {
                 header: Some(state.header()),
                 kvs: vec![],
@@ -546,8 +545,8 @@ impl Store {
         &self,
         req: etcdserverpb::CompactionRequest,
     ) -> etcdserverpb::CompactionResponse {
-        let mut state = self.state.write().await;
-        state.compact_rev = req.revision as u64;
+        let state = self.state.write().await;
+        COMPACT_REV.store(req.revision as u64, Ordering::SeqCst);
 
         // NOTE: etcd's Compact does NOT delete current key-values from the store.
         // It only sets compact_rev to allow garbage collection of old MVCC revisions.
@@ -856,6 +855,7 @@ pub(crate) fn resolve_range(key: &[u8], range_end: &[u8]) -> RangeBound {
     RangeBound::Range(key.to_vec(), range_end.to_vec())
 }
 
+#[derive(Clone, Debug)]
 pub(crate) enum RangeBound {
     All,
     Point(Vec<u8>),

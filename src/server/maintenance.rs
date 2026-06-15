@@ -83,10 +83,7 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
         _req: Request<etcdserverpb::HashKvRequest>,
     ) -> Result<Response<etcdserverpb::HashKvResponse>, Status> {
         let h = self.store.store_hash().await;
-        let compact_rev = {
-            let state = self.store.state.read().await;
-            state.compact_rev
-        };
+        let compact_rev = self.store.compact_rev().await;
         Ok(Response::new(etcdserverpb::HashKvResponse {
             header: Some(header()),
             hash: h as u32,

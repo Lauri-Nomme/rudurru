@@ -410,6 +410,7 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
             progress_notify: ctx.progress_notify,
             filters: ctx.filters.clone(),
             prev_kv: ctx.prev_kv,
+            bound: ctx.bound.clone(),
         });
     }
 
