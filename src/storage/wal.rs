@@ -125,7 +125,7 @@ pub fn encode_kv(
 
     // Field 5: value (bytes, wire type 2, field number 5)
     buf.push(0x2a); // tag = (5 << 3) | 2
-    buf.extend_from_slice(&encode_varint(value.len() as u64));
+    buf.extend_from_slice(&encode_overlong_u32(value.len() as u32));
     buf.extend_from_slice(value);
 
     // Field 6: lease (int64, wire type 0, field number 6)
