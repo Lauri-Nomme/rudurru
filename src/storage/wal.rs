@@ -194,13 +194,11 @@ impl KvWalRecord {
             encode_kv(key, value, create_revision, mod_revision, version, lease);
         let rec_len = (KV_HEADER_SIZE + kv_bytes.len() + KV_CRC_SIZE) as u32;
 
-        let mut crc_data = Vec::with_capacity(KV_HEADER_SIZE + kv_bytes.len());
-        crc_data.push(flags);
-        crc_data.extend_from_slice(&key_offset.to_le_bytes());
-        crc_data.extend_from_slice(&mod_rev_offset.to_le_bytes());
-        crc_data.extend_from_slice(&rec_len.to_le_bytes());
-        crc_data.extend_from_slice(&kv_bytes);
-        let crc = crc32c(&crc_data);
+        let crc = crc32c(&[flags]);
+        let crc = crc32c_append(crc, &key_offset.to_le_bytes());
+        let crc = crc32c_append(crc, &mod_rev_offset.to_le_bytes());
+        let crc = crc32c_append(crc, &rec_len.to_le_bytes());
+        let crc = crc32c_append(crc, &kv_bytes);
 
         Self {
             flags,
@@ -493,6 +491,10 @@ impl WalRecord {
 
 pub fn crc32c(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
+}
+
+pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
+    crc32c::crc32c_append(crc, data)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

@@ -906,6 +906,11 @@ This duplicates work already done in `encode_kv` and the header assembly.
 **Fix:** Compute CRC incrementally: CRC the flags byte, then fold in
 header fields, then fold in kv_bytes. Avoids the temporary Vec.
 
+**Result:** `KvWalRecord::new` now uses `crc32c_append` to compute CRC
+incrementally over the 4 header fields and kv_bytes. No temporary Vec
+allocation per WAL record written (previously one `Vec::with_capacity(header
++ kv_len)` per record).
+
 ### S. LOW: Graceful Shutdown Missing
 
 Ctrl+C kills the process without WAL sync. Unwritten kernel buffers may be
@@ -959,7 +964,7 @@ rarely called, the current approach is acceptable.
 | O | Atomics for status counters | eliminates periodic read lock acquisition | low |
 | P | Hardware CRC32C | ~10× faster CRC computation | trivial | ✅ done |
 | Q | Linearizable txn | fixes correctness race | low |
-| R | Inline CRC in KvWalRecord::new | eliminates temporary Vec | trivial |
+| R | Inline CRC in KvWalRecord::new | eliminates temporary Vec | trivial | ✅ done |
 | S | Graceful shutdown | prevents data loss on SIGTERM | trivial |
 | T | Fixed-length value length | O(1) value offset access | trivial |
 | U | Running hash for store_hash | eliminates read lock for maintenance RPC | low |
