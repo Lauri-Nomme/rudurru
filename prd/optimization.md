@@ -850,6 +850,11 @@ reallocate.
 **Fix:** After counting matching keys, pre-allocate: `Vec::with_capacity(count)`.
 Or at minimum, use an approximate upper bound.
 
+**Result:** Pre-allocates with `state.keys.len()` as upper bound (or `req.limit`
+when set). Eliminates incremental reallocation during the main iteration loop.
+Reallocations are amortized O(1) per push, but the Vec grows ~2× each time,
+temporarily doubling memory usage during the growth phase.
+
 ### O. MODERATE: Periodic Status Acquires Read Lock
 
 The 60s periodic status task acquires the read lock to log revision, keys
@@ -946,7 +951,7 @@ rarely called, the current approach is acceptable.
 | K | Batch WAL in lease_revoke | reduces fsync calls from N to 1 | low |
 | L | Per-stream event multiplexing | 10K → 1 tokio tasks per stream | moderate |
 | M | AtomicU64 for compact_rev | eliminates unnecessary lock contention | trivial | ✅ done |
-| N | Pre-allocate kvs Vec | reduces reallocation during range | trivial |
+| N | Pre-allocate kvs Vec | reduces reallocation during range | trivial | ✅ done |
 | O | Atomics for status counters | eliminates periodic read lock acquisition | low |
 | P | Hardware CRC32C | ~10× faster CRC computation | trivial |
 | Q | Linearizable txn | fixes correctness race | low |

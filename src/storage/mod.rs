@@ -298,7 +298,12 @@ impl Store {
         }
 
         let bound = resolve_range(&req.key, &req.range_end);
-        let mut kvs: Vec<Vec<u8>> = Vec::new();
+        let cap = if req.limit > 0 {
+            req.limit as usize
+        } else {
+            state.keys.len()
+        };
+        let mut kvs: Vec<Vec<u8>> = Vec::with_capacity(cap);
 
         for (k, ks) in state.keys.iter() {
             if ks.deleted {
