@@ -314,6 +314,33 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
             continue;
         }
 
+        let cur_rev = current_revision();
+        if c.pending.start_revision > cur_rev {
+            tracing::info!(
+                start_revision = c.pending.start_revision,
+                current_revision = cur_rev,
+                key = %String::from_utf8_lossy(&c.pending.key),
+                stream_id = c.stream_id,
+                remote_addr = %c.remote_addr,
+                "watch_too_large"
+            );
+            let resp = etcdserverpb::WatchResponse {
+                header: Some(make_header(cur_rev as i64)),
+                watch_id: -1,
+                created: false,
+                canceled: true,
+                compact_revision: 0,
+                cancel_reason: format!(
+                    "too large resource version: {}, current: {}",
+                    c.pending.start_revision, cur_rev
+                ),
+                events: vec![],
+                fragment: false,
+            };
+            let _ = c.reply.send(Ok(resp));
+            continue;
+        }
+
         let bound = storage::resolve_range(&c.pending.key, &c.pending.range_end);
         active.push(WatchContext {
             key: c.pending.key,
