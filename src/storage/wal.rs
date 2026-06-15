@@ -1,5 +1,7 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub const DELETED: u8 = 0x01;
 pub const IS_CREATE: u8 = 0x02;
@@ -306,8 +308,9 @@ impl KvWalRecord {
 
 #[derive(Debug)]
 pub struct WalFile {
-    pub file: std::fs::File,
+    pub file: Arc<Mutex<std::fs::File>>,
     pub path: String,
+    pub dirty: Arc<AtomicBool>,
 }
 
 impl WalFile {
@@ -318,8 +321,9 @@ impl WalFile {
             .append(true)
             .open(path.as_ref())?;
         Ok(Self {
-            file,
+            file: Arc::new(Mutex::new(file)),
             path: path.as_ref().to_string_lossy().to_string(),
+            dirty: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -327,9 +331,11 @@ impl WalFile {
     where
         F: FnMut(&KvWalRecord),
     {
-        self.file.seek(SeekFrom::Start(offset))?;
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
         let mut buf = Vec::new();
-        self.file.read_to_end(&mut buf)?;
+        file.read_to_end(&mut buf)?;
+        drop(file);
         let mut f = f;
         let mut ofs = 0;
         while ofs < buf.len() {
@@ -357,19 +363,34 @@ impl WalFile {
         Ok(records)
     }
 
+    /// Append a single record. The write is issued immediately; fsync
+    /// is deferred to a background task (runs every ~50ms).
     pub fn append_kv(&mut self, rec: &KvWalRecord) -> io::Result<()> {
         let data = rec.serialize();
-        self.file.write_all(&data)?;
-        self.file.sync_all()?;
+        let mut file = self.file.lock().unwrap();
+        file.write_all(&data)?;
+        self.dirty.store(true, Ordering::Release);
         Ok(())
     }
 
+    /// Append multiple records, then set the dirty flag. The single
+    /// fsync is deferred to the background task.
     pub fn append_kv_batch(&mut self, recs: &[KvWalRecord]) -> io::Result<()> {
+        let mut file = self.file.lock().unwrap();
         for rec in recs {
             let data = rec.serialize();
-            self.file.write_all(&data)?;
+            file.write_all(&data)?;
         }
-        self.file.sync_all()?;
+        self.dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Synchronously fsync the WAL file. Called during graceful shutdown
+    /// and by the background fsync task.
+    pub fn sync_all(&self) -> io::Result<()> {
+        let file = self.file.lock().unwrap();
+        file.sync_all()?;
+        self.dirty.store(false, Ordering::Release);
         Ok(())
     }
 }
@@ -798,10 +819,11 @@ mod tests {
             let rec1 = KvWalRecord::new(IS_CREATE, b"good", b"data", 1, 1, 1, 0);
             wal.append_kv(&rec1).unwrap();
             use std::io::Write;
-            wal.file
-                .write_all(b"GARBAGE_DATA_THAT_IS_NOT_A_VALID_RECORD")
+            let mut f = wal.file.lock().unwrap();
+            f.write_all(b"GARBAGE_DATA_THAT_IS_NOT_A_VALID_RECORD")
                 .unwrap();
-            wal.file.sync_all().unwrap();
+            f.sync_all().unwrap();
+            drop(f);
             let rec2 = KvWalRecord::new(IS_CREATE, b"after", b"garbage", 2, 2, 2, 0);
             wal.append_kv(&rec2).unwrap();
         }

@@ -5,8 +5,8 @@ use crate::proto::mvccpb;
 use prost::bytes::Bytes;
 use prost::Message;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
@@ -272,9 +272,31 @@ impl Store {
         );
 
         let state = Arc::new(RwLock::new(state));
+        Self::start_fsync_task(
+            state.read().await.wal.file.clone(),
+            state.read().await.wal.dirty.clone(),
+        );
         Self::start_expiry_task(state.clone());
 
         Ok(Self { state })
+    }
+
+    fn start_fsync_task(file: Arc<Mutex<std::fs::File>>, dirty: Arc<AtomicBool>) {
+        // fsync at most every 50ms. WAL writes set the dirty flag;
+        // this background task picks it up and issues the fsync
+        // without blocking readers/writers on the store lock.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if dirty.swap(false, Ordering::AcqRel) {
+                    if let Ok(f) = file.lock() {
+                        if let Err(e) = f.sync_all() {
+                            tracing::error!("WAL background fsync failed: {e}");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub async fn compact_rev(&self) -> u64 {
@@ -777,12 +799,8 @@ impl Store {
 
     pub async fn db_size(&self) -> i64 {
         let state = self.state.read().await;
-        state
-            .wal
-            .file
-            .metadata()
-            .map(|m| m.len() as i64)
-            .unwrap_or(0)
+        let md = state.wal.file.lock().unwrap().metadata();
+        md.map(|m| m.len() as i64).unwrap_or(0)
     }
 
     pub async fn store_hash(&self) -> u64 {
