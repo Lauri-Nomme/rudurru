@@ -5,6 +5,7 @@ use crate::proto::mvccpb;
 use prost::bytes::Bytes;
 use prost::Message;
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -290,14 +291,16 @@ impl Store {
             COMPACT_REV.load(Ordering::Relaxed),
         );
 
-        let state = Arc::new(RwLock::new(state));
+        let state_arc = Arc::new(RwLock::new(state));
         Self::start_fsync_task(
-            state.read().await.wal.file.clone(),
-            state.read().await.wal.dirty.clone(),
+            state_arc.read().await.wal.file.clone(),
+            state_arc.read().await.wal.dirty.clone(),
         );
-        Self::start_expiry_task(state.clone());
+        Self::start_expiry_task(state_arc.clone());
+        let store = Self { state: state_arc };
+        Self::start_compaction_task(store.clone(), wal_path.to_string());
 
-        Ok(Self { state })
+        Ok(store)
     }
 
     fn start_fsync_task(file: Arc<Mutex<std::fs::File>>, dirty: Arc<AtomicBool>) {
@@ -923,6 +926,160 @@ impl Store {
             }
         });
     }
+
+    /// Compact the WAL: snapshot active keys, write compacted file,
+    /// then append any writes that occurred during snapshotting (tail).
+    pub async fn compact_wal(&self) -> anyhow::Result<()> {
+        let t0 = std::time::Instant::now();
+        let wal_path = self.wal_path().await;
+        let target = format!("{}.compact", wal_path);
+
+        // ── Phase A: Snapshot active keys under write lock ──────────
+        let t_a = std::time::Instant::now();
+        let records: Vec<wal::KvWalRecord>;
+        let snapshot_rev: u64;
+        let snapshot_wal_size: u64;
+
+        {
+            let state = self.state.read().await;
+            snapshot_rev = current_revision();
+            snapshot_wal_size = state.wal.file.lock().unwrap().metadata()?.len();
+            let mut recs = Vec::with_capacity(state.keys.len());
+            for (key, ks) in state.keys.iter() {
+                if ks.deleted {
+                    continue;
+                }
+                let flags = if ks.lease != 0 { wal::HAS_LEASE } else { 0 };
+                recs.push(wal::KvWalRecord::new(
+                    flags,
+                    key,
+                    &ks.value,
+                    ks.create_revision as i64,
+                    ks.mod_revision as i64,
+                    ks.version,
+                    ks.lease,
+                ));
+            }
+            records = recs;
+        }
+        let phase_a_us = t_a.elapsed().as_micros() as u64;
+
+        // ── Phase B: Write snapshot records to temp file (no lock) ──
+        let t_b = std::time::Instant::now();
+        let snapshot_bytes: usize;
+        {
+            use std::io::Write;
+            let mut compact = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&target)?;
+            for rec in &records {
+                let data = rec.serialize();
+                compact.write_all(&data)?;
+            }
+            compact.sync_all()?;
+            snapshot_bytes = compact.metadata()?.len() as usize;
+        }
+        let phase_b_us = t_b.elapsed().as_micros() as u64;
+
+        // ── Phase C: Append tail + swap under write lock ────────────
+        let t_c = std::time::Instant::now();
+        let tail_bytes: usize;
+        let tail_count: usize;
+        let old_wal_size: u64;
+        let new_wal_size: u64;
+
+        {
+            let state = self.state.write().await;
+
+            // Read tail bytes from the active WAL (writes during Phase B)
+            let tail = {
+                let mut f = state.wal.file.lock().unwrap();
+                let current_len = f.metadata()?.len();
+                if current_len > snapshot_wal_size {
+                    f.seek(SeekFrom::Start(snapshot_wal_size))?;
+                    let mut buf = Vec::new();
+                    f.read_to_end(&mut buf)?;
+                    buf
+                } else {
+                    Vec::new()
+                }
+            };
+
+            tail_bytes = tail.len();
+            tail_count = wal::count_wal_records(&tail);
+
+            // Append tail bytes to the compacted file
+            if !tail.is_empty() {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&target)?;
+                f.write_all(&tail)?;
+                f.sync_all()?;
+                new_wal_size = f.metadata()?.len();
+            } else {
+                new_wal_size = snapshot_bytes as u64;
+            }
+
+            old_wal_size = snapshot_wal_size + tail_bytes as u64;
+
+            // Atomically replace the active WAL
+            std::fs::rename(&target, &wal_path)?;
+
+            // Open the new WAL and swap into the shared file handle
+            let new_file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&wal_path)?;
+            *state.wal.file.lock().unwrap() = new_file;
+            state.wal.dirty.store(true, Ordering::Release);
+        }
+        let phase_c_us = t_c.elapsed().as_micros() as u64;
+
+        let total_us = t0.elapsed().as_micros() as u64;
+
+        tracing::info!(
+            snapshot_keys = records.len(),
+            snapshot_rev,
+            snapshot_bytes,
+            phase_a_us,
+            phase_b_us,
+            phase_c_us,
+            total_us,
+            tail_bytes,
+            tail_count,
+            old_wal_size,
+            new_wal_size,
+            "wal_compacted"
+        );
+
+        Ok(())
+    }
+
+    fn start_compaction_task(store: Store, wal_path: String) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            interval.tick().await; // skip immediate tick
+            loop {
+                interval.tick().await;
+                let size = match std::fs::metadata(&wal_path) {
+                    Ok(m) => m.len(),
+                    Err(_) => continue,
+                };
+                if size < 64 * 1024 * 1024 {
+                    continue;
+                }
+                tracing::info!(wal_size = size, "wal_compaction_triggered");
+                if let Err(e) = store.compact_wal().await {
+                    tracing::error!(error = %e, "wal_compaction_failed");
+                }
+            }
+        });
+    }
 }
 
 /// Apply a KvWalRecord during startup replay. Rebuilds in-memory state
@@ -1130,5 +1287,249 @@ fn target_from_i32(v: i32) -> etcdserverpb::compare::CompareTarget {
         3 => etcdserverpb::compare::CompareTarget::Value,
         4 => etcdserverpb::compare::CompareTarget::Lease,
         _ => etcdserverpb::compare::CompareTarget::Version,
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    fn temp_wal() -> String {
+        let dir = std::env::temp_dir();
+        let name = format!("rudurru_compact_{}.wal", std::process::id());
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_compact_basic() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        // Create stale records by updating keys multiple times
+        for i in 0u64..5 {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: b"k1".to_vec(),
+                    value: format!("v{i}").into_bytes(),
+                    ..Default::default()
+                })
+                .await;
+        }
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        let size_before = {
+            let s = store.state.read().await;
+            let f = s.wal.file.lock().unwrap();
+            f.metadata().unwrap().len()
+        };
+        store.compact_wal().await.unwrap();
+        let size_after = {
+            let s = store.state.read().await;
+            let f = s.wal.file.lock().unwrap();
+            f.metadata().unwrap().len()
+        };
+
+        // 5 stale records for k1 + 1 for k2 = 6 before; 2 after
+        assert!(
+            size_after < size_before,
+            "WAL should shrink: {size_after} >= {size_before}"
+        );
+        assert!(size_after > 0, "WAL should not be empty");
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(resp.count, 2, "keys preserved after compaction");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_compact_empty_store() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store.compact_wal().await.unwrap();
+        // Empty store → 0 snapshot records + 0 tail = 0-byte WAL (valid)
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(resp.count, 0, "no keys in empty store");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_compact_with_deletes() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        store
+            .delete_range(etcdserverpb::DeleteRangeRequest {
+                key: b"k1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        store.compact_wal().await.unwrap();
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(resp.count, 1, "only k2 after compact");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_compact_restart_recovery() {
+        let path = temp_wal();
+        let final_rev;
+
+        // Phase 1: write, compact, write more (simulating tail)
+        {
+            let store = Store::open(&path).await.unwrap();
+
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                    ..Default::default()
+                })
+                .await;
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: b"k2".to_vec(),
+                    value: b"v2".to_vec(),
+                    ..Default::default()
+                })
+                .await;
+
+            store.compact_wal().await.unwrap();
+
+            // Writes after compaction (simulating writes during Phase B)
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: b"k3".to_vec(),
+                    value: b"v3".to_vec(),
+                    ..Default::default()
+                })
+                .await;
+
+            final_rev = current_revision();
+        }
+
+        // Phase 2: reopen from compacted WAL
+        let store2 = Store::open(&path).await.unwrap();
+
+        let resp = store2
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(resp.count, 3, "all 3 keys after restart from compacted WAL");
+        assert_eq!(
+            current_revision(),
+            final_rev,
+            "revision matches after restart"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_compact_tail_preserves_concurrent_writes() {
+        let path = temp_wal();
+        let store = std::sync::Arc::new(Store::open(&path).await.unwrap());
+
+        // Seed some data
+        for i in 0u64..10 {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: format!("k{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                    ..Default::default()
+                })
+                .await;
+        }
+
+        // Write more during Phase B happens naturally because compact_wal
+        // releases the write lock between Phase A and Phase C.
+        // We spawn a concurrent writer that fires just after Phase A.
+        let store_clone = store.clone();
+        let write_handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            store_clone
+                .put(etcdserverpb::PutRequest {
+                    key: b"concurrent".to_vec(),
+                    value: b"c".to_vec(),
+                    ..Default::default()
+                })
+                .await;
+        });
+
+        store.compact_wal().await.unwrap();
+        write_handle.await.unwrap();
+
+        // Verify concurrent write is visible
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"concurrent".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(resp.count, 1, "concurrent write preserved after compact");
+
+        // Restart and verify
+        drop(store);
+        let store2 = Store::open(&path).await.unwrap();
+        let resp2 = store2
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(resp2.count, 11, "all 11 keys after restart");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

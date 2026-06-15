@@ -518,6 +518,24 @@ pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
     crc32c::crc32c_append(crc, data)
 }
 
+/// Fast count of KvWalRecords in a byte buffer by reading rec_len
+/// from each header. Only validates header size bounds, not CRC.
+pub fn count_wal_records(data: &[u8]) -> usize {
+    let mut count = 0;
+    let mut ofs = 0;
+    while ofs + KV_HEADER_SIZE + KV_CRC_SIZE <= data.len() {
+        let rec_len =
+            u32::from_le_bytes([data[ofs + 5], data[ofs + 6], data[ofs + 7], data[ofs + 8]]);
+        let rec_len = rec_len as usize;
+        if rec_len < KV_HEADER_SIZE + KV_CRC_SIZE || rec_len > data.len() - ofs {
+            break;
+        }
+        count += 1;
+        ofs += rec_len;
+    }
+    count
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
