@@ -55,35 +55,44 @@ Current WAL content (approximate):
 
 ## Design Options
 
-### Option 1: WAL Rotation with Full-State Snapshot
+### Option 1: WAL Rotation with Full-State Snapshot (Recommended)
 
-Write a full snapshot of all active keys to a new WAL file, then
-atomically swap files.
+Write a full snapshot of all active keys to a new WAL file, then copy
+the tail of the old WAL (writes that happened during snapshotting) as
+raw bytes, then atomically swap files.
 
 **Flow:**
 ```
-1. [write lock] Snapshot: collect all (key, kv_bytes) into compacted Vec
-                + record current_revision as snapshot_rev
-2. [write lock] Write all records to compaction_target.wal
-3. [write lock] Write a SnapshotFooter record (magic + snapshot_rev)
-4. [write lock] sync_all() on target
-5. [write lock] Rename: compaction_target.wal → wal (replaces active WAL)
-6. [write lock] Unlink old WAL
-7. [write lock] Open new WAL file, seek to end for future appends
+Phase A [write lock]: Snapshot: collect all (key, kv_bytes) into Vec
+                      + record snapshot_rev + snapshot_wal_size (file length)
+Phase B [no lock]:    Write snapshot records to wal.compact
+                      (active WAL continues accepting writes — tail grows)
+Phase C [write lock]: Read tail bytes (snapshot_wal_size..current_size)
+                        from active WAL
+                      Append tail bytes verbatim to wal.compact
+                      sync_all() + rename wal.compact → wal
+                      Open new WAL file at wal
 ```
 
-**Crash safety:** If crash before step 5, old WAL is intact — restart
-works as before with full history. If crash during step 5 (rename),
-the old WAL and target WAL coexist — next startup can pick the
-valid one (prefer the one with SnapshotFooter, or the larger one).
+**Crash safety:**
+- Crash in Phase A: all writes before lock release are in the old WAL.
+  No compaction file exists yet.
+- Crash in Phase B: old WAL is intact, `wal.compact` is discarded on
+  restart (or detected as incomplete).
+- Crash in Phase C (rename): `rename(2)` is atomic on Linux. The file
+  at `wal` is either the old WAL or the new compacted WAL — never a
+  partial write.
 
-**Cost:** Step 1 copies 2,251 kv_bytes (Bytes::clone = refcount inc).
-Step 2 serializes and writes ~1.6 MB. Total lock time: ~1-5ms (I/O
-bound by write).
+**Cost:** Phase A copies 2,251 kv_bytes under write lock (~100µs).
+Phase B serializes and writes ~2 MB outside any lock.
+Phase C copies tail bytes (~50KB for a few seconds of writes) + rename
+under write lock (~1ms).
 
-**Pros:** Simple, crash-safe, low write lock time.
-**Cons:** Double disk space during compaction (target + active).
-Holds write lock for the entire duration (1-5ms is acceptable).
+**Pros:** Simple, crash-safe, zero data loss (tail copy preserves all
+writes). Low write lock time (split across Phase A and C).
+**Cons:** Double disk space during compaction (~266 MB temporary).
+Requires the WAL file to be readable at `snapshot_wal_size..end` during
+Phase C (always true on Linux).
 
 ### Option 2: Inline Compaction (rewrite WAL in place)
 
@@ -201,167 +210,181 @@ Not a solution for continuous operation.
 
 ## Implementation Plan
 
-### Phase 1: Snapshot Footer Record
+### Design (tail-copy approach)
 
-Define a new WAL record type `SnapshotFooter` that marks the end of a
-compacted WAL and records the snapshot revision:
+The core insight: **capture the current WAL file size in Phase A, then in
+Phase C copy the bytes that were appended during Phase B as raw tail data
+into the new compacted WAL.** This ensures zero data loss — every write
+that committed during compaction is preserved verbatim.
 
 ```
-┌──────────┬──────────────┬────────────────┬──────────┐
-│ flags=0xFF│ rev(8)       │ crc32(4)      │          │
-│   (1)    │   (8)        │   (4)          │          │
-└──────────┴──────────────┴────────────────┴──────────┘
-rec_len = 1 + 8 + 4 = 13
+Phase A (write lock): snapshot all active keys + snapshot_wal_size
+Phase B (no lock):    write snapshot records to wal.compact
+Phase C (write lock): copy old WAL tail bytes → wal.compact,
+                      rename wal.compact → wal, reopen
 ```
 
-When `WalFile::open` encounters a `SnapshotFooter` as the last record,
-set `snapshot_rev` on the file. Phase 1 WAL replay starts from byte 0
-but only processes records with revision > `snapshot_rev`.
+### Phase A: Snapshot Under Write Lock
 
-### Phase 2: Compaction Task in Store
-
-Add a method `compact_wal()` to `Store`:
+Acquire the write lock, iterate `state.keys`, collect all active (non-deleted)
+key-value pairs as `KvWalRecord` entries. Also record:
+- `snapshot_rev = current_revision()`
+- `snapshot_wal_size` = byte length of the active WAL file at this moment
 
 ```rust
-pub async fn compact_wal(&self) -> anyhow::Result<()> {
-    let wal_path = self.wal_path().await;
-    let target = format!("{}.compact", wal_path);
-
-    // Phase A: Snapshot active keys under write lock
-    let (records, snapshot_rev) = {
-        let mut state = self.state.write().await;
-        let rev = current_revision();
-        let mut recs = Vec::with_capacity(state.keys.len());
-        for (key, ks) in state.keys.iter() {
-            if ks.deleted { continue; }
-            let flags = if ks.lease != 0 { wal::HAS_LEASE } else { 0 };
-            recs.push(wal::KvWalRecord::new(
-                flags, key, &ks.value,
-                ks.create_revision as i64, ks.mod_revision as i64,
-                ks.version, ks.lease,
-            ));
-        }
-        (recs, rev)
-    };
-
-    // Phase B: Write compacted WAL
-    let mut compact = wal::WalFile::open(&target)?;
-    for rec in &records {
-        compact.append_kv(rec)?;
+let (records, snapshot_rev, snapshot_wal_size) = {
+    let mut state = self.state.write().await;
+    let rev = current_revision();
+    let wal_len = state.wal.file.lock().unwrap().metadata()?.len();
+    let mut recs = Vec::with_capacity(state.keys.len());
+    for (key, ks) in state.keys.iter() {
+        if ks.deleted { continue; }
+        let flags = if ks.lease != 0 { wal::HAS_LEASE } else { 0 };
+        recs.push(wal::KvWalRecord::new(
+            flags, key, &ks.value,
+            ks.create_revision as i64, ks.mod_revision as i64,
+            ks.version, ks.lease,
+        ));
     }
-    compact.write_snapshot_footer(snapshot_rev)?;
-    compact.sync_all()?;
+    (recs, rev, wal_len)
+};
+```
 
-    // Phase C: Swap files under write lock
+**Write lock duration:** ~1-5ms (HashMap iteration + Arc clones).
+No writes are blocked long enough to matter for k3s workloads.
+
+### Phase B: Write Snapshot (No Lock)
+
+Write all snapshot records to a new temp file `wal.compact`:
+
+```rust
+let target = format!("{}.compact", wal_path);
+let mut compact = wal::WalFile::open(&target)?;
+for rec in &records {
+    compact.append_kv(rec)?;
+}
+compact.sync_all()?;
+```
+
+During Phase B, the active WAL continues to accept writes (no lock held).
+These writes append to the active WAL at offsets ≥ `snapshot_wal_size`.
+The temp file `wal.compact` contains only the snapshot records.
+
+**Duration:** ~1-10ms (serialize + write ~2MB of snapshot data).
+**Memory:** `records` Vec holds ~2,251 entries (~1.6MB of kv_bytes as Bytes).
+
+### Phase C: Append Tail + Swap (Write Lock)
+
+Re-acquire the write lock. Read the bytes that were appended to the
+active WAL during Phase B (the "tail"), append them verbatim to
+`wal.compact`, then atomically rename:
+
+```rust
+{
+    let mut state = self.state.write().await;
+
+    // Read tail bytes from the active WAL (writes that happened during Phase B)
+    let mut tail = Vec::new();
     {
-        let mut state = self.state.write().await;
-        std::fs::rename(&target, &wal_path)?;
-        // Re-open the WAL file at the new path
-        state.wal = wal::WalFile::open(&wal_path)?;
-        // Set dirty flag since we just wrote the compacted WAL
-        state.wal.dirty.store(true, Ordering::Release);
+        let mut f = state.wal.file.lock().unwrap();
+        f.seek(std::io::SeekFrom::Start(snapshot_wal_size))?;
+        f.read_to_end(&mut tail)?;
     }
 
-    Ok(())
+    // Append tail bytes to the compacted file
+    {
+        let mut f = compact.file.lock().unwrap();
+        f.write_all(&tail)?;
+        f.sync_all()?;
+    }
+    drop(compact);
+
+    // Atomically replace the active WAL
+    std::fs::rename(&target, &wal_path)?;
+
+    // Re-open the new WAL for appending
+    state.wal = wal::WalFile::open(&wal_path)?;
+    state.wal.dirty.store(true, Ordering::Release);
 }
 ```
 
-### Phase 3: Scheduled Compaction
+**Why this is safe:** The tail bytes are raw `KvWalRecord` serializations
+that were written by normal mutation operations. They are valid WAL
+records. By appending them verbatim to the compacted snapshot, the new
+WAL contains:
 
-Add to `Store::open()`:
-```rust
-Self::start_compaction_task(state.clone(), wal_path.to_string());
+```
+[snapshot: key1, key2, ..., keyN]
+[tail:    writes that happened during Phase B (e.g., rev 1001, 1002, ...)]
 ```
 
-The compaction task:
+On the next restart, `scan_kv` reads all records (snapshot + tail) and
+`apply_record` processes each one. The snapshot records establish the
+initial BTreeMap state (all keys at snapshot revision). The tail records
+update/delete keys as needed. End result: **identical to replaying the
+full original WAL.**
+
+**Write lock duration:** ~1-10ms (read tail bytes + append + rename + reopen).
+
+### Phase 3: Scheduled Compaction
+
+Trigger compaction when the WAL exceeds a threshold (default 64 MB).
+The simplest trigger: check in the existing 60s periodic status task:
+
+```rust
+// In the 60s status task, after logging:
+let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+if wal_size > COMPACTION_THRESHOLD { // 64 MB
+    let store = store.clone();
+    tokio::spawn(async move { store.compact_wal().await; });
+}
+```
+
+Alternatively, a dedicated background task:
+
 ```rust
 fn start_compaction_task(state: Arc<RwLock<StoreState>>, wal_path: String) {
     tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 min
         loop {
-            tokio::time::sleep(Duration::from_secs(3600)).await; // every hour
-
-            let size = {
-                let s = state.read().await;
-                s.wal.file.lock().unwrap().metadata().map(|m| m.len()).unwrap_or(0)
-            };
-
-            if size < COMPACTION_THRESHOLD { // e.g., 64 MB
-                continue;
+            interval.tick().await;
+            let size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+            if size > COMPACTION_THRESHOLD {
+                // ... call compact_wal() ...
             }
-
-            // Signal that compaction is starting
-            // ... call compact_wal() ...
         }
     });
 }
 ```
 
-Alternatively, trigger compaction from the 60s status task when the WAL
-exceeds the threshold.
+### Phase 4: WAL Replay (No Changes Needed)
 
-### Phase 4: WAL Replay with Snapshot Footer
+The compacted WAL is a valid sequence of `KvWalRecord` entries followed
+by raw tail bytes (which are also valid `KvWalRecord` serializations).
+`scan_kv` reads them all via `KvWalRecord::deserialize`, and
+`apply_record` processes each one. **No changes to the replay path are
+required.**
 
-Update `WalFile::open` and `scan_kv` to detect and skip records before
-the snapshot revision:
-
-```rust
-impl WalFile {
-    pub fn snapshot_revision(&self) -> Option<u64> {
-        self.snapshot_rev
-    }
-}
-```
-
-In `Store::open`:
-```rust
-if let Some(snap_rev) = wal.snapshot_revision() {
-    for rec in &records {
-        let rev = rec.mod_revision().unwrap_or(0) as u64;
-        if rev <= snap_rev { continue; }
-        if rev <= COMPACT_REV { continue; }
-        apply_record(&mut state, rec);
-        if rev > max_rev { max_rev = rev; }
-    }
-} else {
-    // Full replay — no snapshot
-    for rec in &records { ... }
-}
-```
+The only adjustment: after replay, `max_rev` is correctly computed from
+the tail records (which have the highest revisions). The snapshot records
+have lower revisions (≤ `snapshot_rev`), so they don't affect `max_rev`.
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Crash during file rename | Data loss | Target file is fully synced before rename. Old WAL still exists until unlinked. |
-| Compaction writes stale data | Stale reads after GC | Verify snapshot_rev matches current_revision before swap. If a write advanced rev during compaction, the swap still produces a state valid at the snapshot revision — the writer that updated rev after the snapshot has a record in the old WAL, but the old WAL is gone. |
-| Write lock held too long during snapshot | Write throughput spike | Snapshot copies kv_bytes (Arc::clone, nanosecond-scale). Serialize to disk outside the write lock (Phase B). |
+| Crash during Phase B (writing snapshot) | Aborted compaction | `wal.compact` is incomplete, old `wal` is untouched — next restart uses full WAL. |
+| Crash during Phase C rename | Split-brain WALs | On Linux, `rename(2)` is atomic on the same filesystem. The target path always points to either the old WAL (rename didn't happen) or the new WAL (rename completed). The in-flight rename itself is atomic — no partial state. |
+| Crash after rename, before reopen | WAL file descriptor stale | If the process crashes after rename but before `state.wal` is updated, the on-disk `wal` is the new compacted file. On restart, it loads the compacted WAL (snapshot + tail) and replays correctly. |
+| Write lock held too long during Phase A | Write throughput spike | Snapshot copies kv_bytes (Bytes::clone = refcount inc, ns-scale). Iteration of 2,251 keys is <100µs. |
+| Write lock held too long during Phase C | Write throughput spike | Reading tail + appending to compact + rename + reopen: ~5ms worst case. k3s writes (~72/sec, one every 14ms) may queue briefly. |
 | Memory: snapshot Vec of 2,251 records | ~1.6 MB | Negligible. |
-| Disk: double space during compaction | ~266 MB temporary | Mitigated by checking available disk space before starting compaction. |
+| Disk: double space during compaction | ~266 MB temporary | The compact file exists alongside the active WAL for the duration of compaction. Mitigated by checking available disk space before starting. After rename, the old inode is freed (or kept alive briefly by lingering file handles). |
 
-The most important risk is #2: **compaction writes stale data.** Consider
-a write (rev 100, key "foo") that completes AFTER the snapshot was taken
-(which included the previous value of "foo" at rev 99). After swap, the
-new WAL contains the rev 99 value but NOT the rev 100 value. The write
-that produced rev 100 completed successfully (WAL fsync at rev 100 was
-acknowledged) but its record is lost.
-
-To prevent this, the swap must be atomic with the last write that the
-snapshot covers. Since we hold the write lock during Phase A (snapshot),
-no writes can occur concurrently. The snapshot covers all writes up to
-`snapshot_rev`. Any write with `rev > snapshot_rev` must be in the old
-WAL after the lock is released. If a write has `rev > snapshot_rev` and
-we swap, that write's record is in the old WAL which is deleted.
-
-**Fix:** Phase A captures `current_revision()` AND `wal.file.metadata().len()`
-(file offset at end-of-file). Phase C renames the old WAL to a backup
-path (e.g., `wal.old`) instead of deleting it, and the new WAL starts
-from its SnapshotFooter. On next restart, if `wal.old` exists, replay
-its records after the snapshot revision before replaying `wal`.
-
-Or simpler: **never delete the old WAL immediately.** Rename it to
-`wal.0`, and track a generation counter. Keep the last 2 WAL generations.
-After the next compaction, delete the oldest generation. This bounds
-disk usage to 2× the active data size.
+**The stale data risk is eliminated by the tail-copy approach.** Any write
+that commits during Phase B is captured in the tail bytes and appended
+to the compacted WAL in Phase C. No records are lost — they're just
+relocated from the old WAL to the new one.
 
 ## Success Criteria
 
