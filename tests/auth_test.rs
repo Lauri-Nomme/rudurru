@@ -35,14 +35,16 @@ async fn test_auth_full_lifecycle() {
     assert!(uinfo.roles().contains(&role_b));
 
     // ---- Phase 3: Enable/disable auth ----
-    client.user_add("root", "root_password", None).await.unwrap();
+    client
+        .user_add("root", "root_password", None)
+        .await
+        .unwrap();
     client.role_add("root").await.unwrap();
     client.user_grant_role("root", "root").await.unwrap();
 
     client.auth_enable().await.unwrap();
 
-    let ep = std::env::var("ETCD_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:2379".to_string());
+    let ep = std::env::var("ETCD_ENDPOINT").unwrap_or_else(|_| "http://localhost:2379".to_string());
     let mut auth_client = etcd_client::Client::connect(
         [ep],
         Some(ConnectOptions::new().with_user("root", "root_password")),

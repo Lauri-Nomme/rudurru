@@ -83,8 +83,7 @@ async fn test_concurrent_watches() {
                 .expect("stream ended")
                 .expect("watch error");
             c.put(format!("{key}_ready"), "1", None).await.unwrap();
-            let resp = tokio::time::timeout(Duration::from_secs(10), watch.next())
-                .await;
+            let resp = tokio::time::timeout(Duration::from_secs(10), watch.next()).await;
             let events = resp
                 .expect("timeout waiting for trigger")
                 .expect("stream ended")

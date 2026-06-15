@@ -5,10 +5,7 @@ use std::time::Duration;
 mod common;
 
 /// Consume the initial watch-created response (0 events) if present.
-async fn next_event(
-    watch: &mut WatchStream,
-    timeout_secs: u64,
-) -> WatchResponse {
+async fn next_event(watch: &mut WatchStream, timeout_secs: u64) -> WatchResponse {
     loop {
         let resp = tokio::time::timeout(Duration::from_secs(timeout_secs), watch.next())
             .await
@@ -42,10 +39,7 @@ async fn test_watch_prefix() {
     let mut client = common::connect().await;
     let prefix = format!("watch/prefix/{}", rand::random::<u16>());
     let opts = Some(WatchOptions::new().with_prefix());
-    let mut watch = client
-        .watch(format!("{prefix}/"), opts)
-        .await
-        .unwrap();
+    let mut watch = client.watch(format!("{prefix}/"), opts).await.unwrap();
 
     client.put(format!("{prefix}/a"), "aa", None).await.unwrap();
     client.put(format!("{prefix}/b"), "bb", None).await.unwrap();

@@ -16,7 +16,10 @@ async fn main() {
     }
 
     let db_path = &args[1];
-    let endpoint = args.get(2).map(|s| s.as_str()).unwrap_or("http://127.0.0.1:2379");
+    let endpoint = args
+        .get(2)
+        .map(|s| s.as_str())
+        .unwrap_or("http://127.0.0.1:2379");
 
     println!("Rudurru K3s Migration Tool");
     println!("  Source: {db_path}");
@@ -90,7 +93,11 @@ async fn main() {
 
     let rows: Vec<(String, Vec<u8>, i64)> = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })
         .expect("query rows")
         .filter_map(|r| r.ok())
@@ -115,17 +122,23 @@ async fn main() {
         // Use a Txn with create (version=0) to avoid overwriting existing data
         // If the key already exists (e.g. partial migration), skip it
         let cmp = Compare::version(name.as_str(), CompareOp::Equal, 0);
-        let txn = Txn::new()
-            .when(vec![cmp])
-            .and_then(vec![TxnOp::put(name.as_str(), value.as_slice(), None)]);
+        let txn = Txn::new().when(vec![cmp]).and_then(vec![TxnOp::put(
+            name.as_str(),
+            value.as_slice(),
+            None,
+        )]);
 
         match client.txn(txn).await {
             Ok(resp) => {
                 if resp.succeeded() {
                     count += 1;
-                    if count % 500 == 0 {
+                    if count.is_multiple_of(500) {
                         let elapsed = start.elapsed().as_secs_f64();
-                        println!("  {count}/{} ({:.0} keys/s)", rows.len(), count as f64 / elapsed);
+                        println!(
+                            "  {count}/{} ({:.0} keys/s)",
+                            rows.len(),
+                            count as f64 / elapsed
+                        );
                     }
                 }
                 // else: key already exists, skip
@@ -142,5 +155,8 @@ async fn main() {
     println!("  Keys migrated:     {count}/{}", rows.len());
     println!("  Skipped (exists):  {}", rows.len() - count);
     println!("  Time:              {elapsed:.1}s");
-    println!("  Throughput:        {:.0} keys/s", count as f64 / elapsed.max(0.001));
+    println!(
+        "  Throughput:        {:.0} keys/s",
+        count as f64 / elapsed.max(0.001)
+    );
 }

@@ -1,9 +1,9 @@
 use crate::proto::etcdserverpb;
 use crate::proto::etcdserverpb::watch_request;
 use crate::proto::mvccpb;
-use crate::storage::{self, Store, WatchEvent, WatchRegistration, current_revision, wal};
-use std::sync::Arc;
+use crate::storage::{self, current_revision, wal, Store, WatchEvent, WatchRegistration};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_stream::wrappers::ReceiverStream;
@@ -32,27 +32,26 @@ fn make_header(revision: i64) -> etcdserverpb::ResponseHeader {
 fn event_to_proto(event: &WatchEvent) -> mvccpb::Event {
     mvccpb::Event {
         r#type: event.event_type as i32,
-        kv: Some(event.kv.clone()),
-        prev_kv: event.prev_kv.clone(),
+        kv: event.kv_bytes.clone(),
+        prev_kv: event.prev_kv_bytes.clone(),
     }
 }
 
-fn rec_to_event(rec: &wal::WalRecord) -> WatchEvent {
+fn kvrec_to_event(rec: &wal::KvWalRecord) -> Option<WatchEvent> {
     let deleted = (rec.flags & wal::DELETED) != 0;
-    let has_lease = (rec.flags & wal::HAS_LEASE) != 0;
-    WatchEvent {
-        revision: rec.revision,
-        event_type: if deleted { mvccpb::event::EventType::Delete } else { mvccpb::event::EventType::Put },
-        kv: mvccpb::KeyValue {
-            key: rec.key.clone(),
-            create_revision: rec.revision as i64,
-            mod_revision: rec.revision as i64,
-            version: 1,
-            value: rec.value.clone(),
-            lease: if has_lease { rec.lease_id.unwrap_or(0) } else { 0 },
+    let rev = rec.mod_revision().unwrap_or(0) as u64;
+    let key = rec.key()?.to_vec();
+    Some(WatchEvent {
+        revision: rev,
+        event_type: if deleted {
+            mvccpb::event::EventType::Delete
+        } else {
+            mvccpb::event::EventType::Put
         },
-        prev_kv: None,
-    }
+        key,
+        kv_bytes: rec.kv_bytes.clone(),
+        prev_kv_bytes: Vec::new(),
+    })
 }
 
 struct PendingCreate {
@@ -126,7 +125,9 @@ impl etcdserverpb::watch_server::Watch for Watch {
                 let msg = in_stream.message().await;
                 match msg {
                     Ok(Some(req)) => {
-                        let Some(union) = req.request_union else { continue };
+                        let Some(union) = req.request_union else {
+                            continue;
+                        };
                         match union {
                             watch_request::RequestUnion::CreateRequest(create) => {
                                 let watch_id = if create.watch_id != 0 {
@@ -196,47 +197,45 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     }
                                 });
                             }
-                            other => {
-                                match other {
-                                    watch_request::RequestUnion::CancelRequest(cancel) => {
-                                        let watch_id = cancel.watch_id;
-                                        {
-                                            let mut state = store.state.write().await;
-                                            state.cancel_watcher(watch_id);
-                                        }
-                                        tracing::info!(watch_id, "watch_canceled");
-                                        let resp = etcdserverpb::WatchResponse {
-                                            header: Some(make_header(current_revision() as i64)),
-                                            watch_id,
-                                            created: false,
-                                            canceled: true,
-                                            compact_revision: 0,
-                                            cancel_reason: String::new(),
-                                            events: vec![],
-                                            fragment: false,
-                                        };
-                                        if tx.send(Ok(resp)).await.is_err() {
-                                            return;
-                                        }
+                            other => match other {
+                                watch_request::RequestUnion::CancelRequest(cancel) => {
+                                    let watch_id = cancel.watch_id;
+                                    {
+                                        let mut state = store.state.write().await;
+                                        state.cancel_watcher(watch_id);
                                     }
-                                    watch_request::RequestUnion::ProgressRequest(_) => {
-                                        let resp = etcdserverpb::WatchResponse {
-                                            header: Some(make_header(current_revision() as i64)),
-                                            watch_id: 0,
-                                            created: false,
-                                            canceled: false,
-                                            compact_revision: 0,
-                                            cancel_reason: String::new(),
-                                            events: vec![],
-                                            fragment: false,
-                                        };
-                                        if tx.send(Ok(resp)).await.is_err() {
-                                            return;
-                                        }
+                                    tracing::info!(watch_id, "watch_canceled");
+                                    let resp = etcdserverpb::WatchResponse {
+                                        header: Some(make_header(current_revision() as i64)),
+                                        watch_id,
+                                        created: false,
+                                        canceled: true,
+                                        compact_revision: 0,
+                                        cancel_reason: String::new(),
+                                        events: vec![],
+                                        fragment: false,
+                                    };
+                                    if tx.send(Ok(resp)).await.is_err() {
+                                        return;
                                     }
-                                    _ => {}
                                 }
-                            }
+                                watch_request::RequestUnion::ProgressRequest(_) => {
+                                    let resp = etcdserverpb::WatchResponse {
+                                        header: Some(make_header(current_revision() as i64)),
+                                        watch_id: 0,
+                                        created: false,
+                                        canceled: false,
+                                        compact_revision: 0,
+                                        cancel_reason: String::new(),
+                                        events: vec![],
+                                        fragment: false,
+                                    };
+                                    if tx.send(Ok(resp)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ => {}
+                            },
                         }
                     }
                     Ok(None) => break,
@@ -249,10 +248,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
     }
 }
 
-async fn global_watch_loop(
-    store: Arc<Store>,
-    mut rx: mpsc::UnboundedReceiver<GlobalCreate>,
-) {
+async fn global_watch_loop(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<GlobalCreate>) {
     loop {
         let first = match rx.recv().await {
             Some(c) => c,
@@ -284,10 +280,7 @@ async fn global_watch_loop(
     }
 }
 
-async fn flush_global_batch(
-    batch: &mut Vec<GlobalCreate>,
-    store: &Arc<Store>,
-) {
+async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
     if batch.is_empty() {
         return;
     }
@@ -356,15 +349,23 @@ async fn flush_global_batch(
         let t0 = Instant::now();
         let wal_path = store.wal_path().await;
         if let Ok(mut reader) = wal::WalFile::open(&wal_path) {
-            let _ = reader.scan(0, |rec| {
-                if rec.revision > checkpoint_rev {
+            let _ = reader.scan_kv(0, |rec| {
+                let rev = rec.mod_revision().unwrap_or(0) as u64;
+                if rev > checkpoint_rev {
                     return;
                 }
+                let key = match rec.key() {
+                    Some(k) => k,
+                    None => return,
+                };
+                let event = match kvrec_to_event(rec) {
+                    Some(e) => e,
+                    None => return,
+                };
                 for ctx in &active {
-                    if rec.revision >= ctx.start_revision
-                        && storage::matches_range(ctx.bound.to_ref(), &rec.key)
+                    if rev >= ctx.start_revision && storage::matches_range(ctx.bound.to_ref(), key)
                     {
-                        let _ = ctx.event_tx.send(rec_to_event(rec));
+                        let _ = ctx.event_tx.send(event.clone());
                     }
                 }
             });
@@ -379,13 +380,22 @@ async fn flush_global_batch(
 
     let t_work = Instant::now();
 
-    let _ = state.wal.scan(checkpoint_offset, |rec| {
-        if rec.revision <= checkpoint_rev {
+    let _ = state.wal.scan_kv(checkpoint_offset, |rec| {
+        let rev = rec.mod_revision().unwrap_or(0) as u64;
+        if rev <= checkpoint_rev {
             return;
         }
+        let key = match rec.key() {
+            Some(k) => k,
+            None => return,
+        };
+        let event = match kvrec_to_event(rec) {
+            Some(e) => e,
+            None => return,
+        };
         for ctx in &active {
-            if storage::matches_range(ctx.bound.to_ref(), &rec.key) {
-                let _ = ctx.event_tx.send(rec_to_event(rec));
+            if storage::matches_range(ctx.bound.to_ref(), key) {
+                let _ = ctx.event_tx.send(event.clone());
             }
         }
     });
