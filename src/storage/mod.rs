@@ -307,7 +307,18 @@ impl Store {
 
         let (range_start, range_end): (Option<Vec<u8>>, Option<Vec<u8>>) = match bound.to_ref() {
             RangeBoundRef::All => (None, None),
-            RangeBoundRef::Point(k) => (Some(k.to_vec()), None),
+            RangeBoundRef::Point(k) => {
+                // Point: produce a range that matches exactly one key.
+                // Use (start..end) where 'end' is the successor of k.
+                let mut end = k.to_vec();
+                if let Some(last) = end.last_mut() {
+                    *last = last.wrapping_add(1);
+                    if *last == 0 {
+                        end.push(0);
+                    }
+                }
+                (Some(k.to_vec()), Some(end))
+            }
             RangeBoundRef::From(k) => (Some(k.to_vec()), None),
             RangeBoundRef::Prefix(p) => (Some(p.to_vec()), None),
             RangeBoundRef::Range(start, end) => (Some(start.to_vec()), Some(end.to_vec())),
