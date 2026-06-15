@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::process;
 
-use rudurru::storage::wal::{KvWalRecord, WalFile, IS_CREATE, DELETED};
+use rudurru::storage::wal::{KvWalRecord, WalFile, DELETED, IS_CREATE};
 
 fn category(key: &str) -> String {
     if key.starts_with("/bootstrap/") {
@@ -156,9 +156,17 @@ fn main() {
         *cats.entry(category(&key_str)).or_insert(0) += 1;
     }
 
-    println!("WAL: records={} keys={} max_revision={}", total, keys.len(), max_rev);
+    println!(
+        "WAL: records={} keys={} max_revision={}",
+        total,
+        keys.len(),
+        max_rev
+    );
     if crc_errors > 0 || kv_errors > 0 {
-        println!("  ERRORS: crc_mismatch={} kv_access_errors={}", crc_errors, kv_errors);
+        println!(
+            "  ERRORS: crc_mismatch={} kv_access_errors={}",
+            crc_errors, kv_errors
+        );
     } else {
         println!("  INTEGRITY: all CRCs valid, all key/mod_revision accessors OK");
     }

@@ -308,7 +308,14 @@ async fn test_put_update_keeps_create_revision() {
     client.put(key.as_str(), "b", None).await.unwrap();
     let get = client.get(key.as_str(), None).await.unwrap();
     let kv = &get.kvs()[0];
-    assert_eq!(kv.create_revision(), create_rev, "create_revision unchanged on update");
-    assert!(kv.mod_revision() > create_rev, "mod_revision increases on update");
+    assert_eq!(
+        kv.create_revision(),
+        create_rev,
+        "create_revision unchanged on update"
+    );
+    assert!(
+        kv.mod_revision() > create_rev,
+        "mod_revision increases on update"
+    );
     assert_eq!(kv.version(), 2, "version increments on update");
 }

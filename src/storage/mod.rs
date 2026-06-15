@@ -351,13 +351,11 @@ impl Store {
             if req.max_mod_revision > 0 && (ks.mod_revision as i64) > req.max_mod_revision {
                 continue;
             }
-            if req.min_create_revision > 0
-                && (ks.create_revision as i64) < req.min_create_revision
+            if req.min_create_revision > 0 && (ks.create_revision as i64) < req.min_create_revision
             {
                 continue;
             }
-            if req.max_create_revision > 0
-                && (ks.create_revision as i64) > req.max_create_revision
+            if req.max_create_revision > 0 && (ks.create_revision as i64) > req.max_create_revision
             {
                 continue;
             }
@@ -464,15 +462,13 @@ impl Store {
         let bound = resolve_range(&req.key, &req.range_end);
 
         let keys_to_delete: Vec<Vec<u8>> = match bound.to_ref() {
-            RangeBoundRef::Point(k) => {
-                state
-                    .keys
-                    .get(k)
-                    .filter(|ks| !ks.deleted)
-                    .map(|_| k.to_vec())
-                    .into_iter()
-                    .collect()
-            }
+            RangeBoundRef::Point(k) => state
+                .keys
+                .get(k)
+                .filter(|ks| !ks.deleted)
+                .map(|_| k.to_vec())
+                .into_iter()
+                .collect(),
             RangeBoundRef::From(k) => {
                 let start = k.to_vec();
                 state
