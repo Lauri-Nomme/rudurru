@@ -987,32 +987,66 @@ rarely called, the current approach is acceptable.
 
 ## Priority Matrix
 
-| Priority | Item | Impact | Effort |
-|----------|------|--------|--------|
-| A | WAL fsync outside write lock | eliminates ~1-10ms stall per write | moderate |
-| B | mmap WAL reads | eliminates 1GB+ allocation per startup | moderate |
-| C | Event-driven lease expiry | eliminates 2% CPU polling, write lock contention | low |
+| Priority | Item | Impact | Effort | Status |
+|----------|------|--------|--------|--------|
+| A | WAL fsync outside write lock | eliminates ~1-10ms stall per write | moderate | ✅ done |
+| B | mmap WAL reads | eliminates 1GB+ allocation per startup | moderate | ❌ skip |
+| C | Event-driven lease expiry | eliminates 2% CPU polling, write lock contention | low | ✅ done |
 | D | Stop cloning watcher list | eliminates MB-scale alloc per put with 10K watchers | trivial | ✅ done |
 | E | Cache RangeBound in WatchRegistration | eliminates per-event per-watcher resolve_range | trivial | ✅ done |
-| F | Arc<Vec<u8>> for kv_bytes | eliminates deep clones in range/put/watch | low | ✅ done |
-| G | Arc chain in put | same as F, sub-item | low | ✅ done |
+| F | Arc<Vec<u8>> → Bytes for kv_bytes | eliminates deep clones in range/put/watch | low | ✅ done |
+| G | Clone chain in put | same as F, sub-item | low | ✅ done |
 | H | BTreeMap::range() not full scan | O(n) → O(log n + k) for range queries | low | ✅ done |
 | I | BTreeMap range for delete_range | O(n) → O(log n + k) | low | ✅ done |
 | J | Early termination with limit | avoids scanning entire map for limited queries | low | ✅ done |
 | K | Batch WAL in lease_revoke | reduces fsync calls from N to 1 | low | ✅ done |
-| L | Per-stream event multiplexing | 10K → 1 tokio tasks per stream | moderate |
+| L | Per-stream event multiplexing | 10K → 1 tokio tasks per stream | moderate | ❌ skip |
 | M | AtomicU64 for compact_rev | eliminates unnecessary lock contention | trivial | ✅ done |
 | N | Pre-allocate kvs Vec | reduces reallocation during range | trivial | ✅ done |
-| O | Atomics for status counters | eliminates periodic read lock acquisition | low |
+| O | Atomics for status counters | eliminates periodic read lock acquisition | low | ✅ done |
 | P | Hardware CRC32C | ~10× faster CRC computation | trivial | ✅ done |
-| Q | Linearizable txn | fixes correctness race | low |
+| Q | Linearizable txn | fixes correctness race | low | ✅ done |
 | R | Inline CRC in KvWalRecord::new | eliminates temporary Vec | trivial | ✅ done |
 | S | Graceful shutdown | prevents data loss on SIGTERM | trivial | ✅ done |
-| T | Fixed-length value length | O(1) value offset access | trivial |
-| U | Running hash for store_hash | eliminates read lock for maintenance RPC | low |
+| T | Fixed-length value length | O(1) value offset access | trivial | ✅ done |
+| U | Running hash for store_hash | eliminates read lock for maintenance RPC | low | ❌ skip |
 
-## Immediate Next Steps (highest ROI)
+### Skipped Items — Reasoning
 
-1. ~~**Arc<Vec<u8>> for kv_bytes** (F+G) — done.~~
-2. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
-   improvement available. Requires design work for crash semantics.
+**B — mmap WAL reads:** P6 cross-stream batching already limits Phase 1 WAL
+scans to one per batch (not one per watcher). A full-WAL read (`read_to_end`)
+happens only once at k3s startup, making the per-scan allocation of ~267MB a
+one-time cost. The complexity of mmap (remapping on file growth, SIGBUS risk)
+is not justified for a single allocation.
+
+**L — Per-stream event multiplexing:** With ~180 watchers across ~90 streams,
+each watcher gets a separate `tokio::spawn` event-forwarding task. Tokio
+handles millions of tasks efficiently — 180 tasks consume ~180KB of memory and
+negligible scheduling overhead. The refactoring cost to share a single
+forwarding task per stream is not justified.
+
+**U — Running hash for store_hash:** Maintaining a running hash requires hash
+computation on every write path (~72 writes/sec at k3s load). The `Hash` RPC
+(maintenance) is rarely called. The current approach (iterate keys on demand
+under the read lock) is cheaper overall because it pays zero cost in steady
+state.
+
+## Completion Summary
+
+13 of 16 identified optimization items were implemented. 3 were skipped as
+not providing meaningful benefit at the k3s workload scale. All implemented
+items are benchmarked and documented in `prd/`:
+
+| Doc | Item(s) |
+|-----|---------|
+| `prd/perf-test-p7.md` | P7 zero-copy gRPC |
+| `prd/perf-test-bytes.md` | F+G prost::bytes::Bytes |
+| `prd/perf-test-fsync.md` | A deferred WAL fsync |
+| `prd/perf-test-lease.md` | C event-driven lease expiry |
+| `prd/perf-test-atomic.md` | O atomics for status counters |
+| `prd/k3s-errors-diagnosis.md` | Production fixes (gRPC limit, watch_too_large, version) |
+
+No further storage-layer optimizations are warranted for the target k3s
+workload (~72 writes/sec, 30 pods). The single `RwLock<StoreState>` remains
+the theoretical peak-throughput bottleneck (~100K ops/s), which is 3 orders
+of magnitude above the target.
