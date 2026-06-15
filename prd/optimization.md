@@ -740,6 +740,13 @@ per-watcher — uses `watcher.bound.to_ref()` directly. Eliminates one
 Option 1 (Arc) is the clear winner. Changes `KeyState.kv_bytes` from
 `Vec<u8>` to `Arc<Vec<u8>>`, and all response construction clones the Arc.
 
+**Result:** `KeyState.kv_bytes` and `WatchEvent.kv_bytes`/`prev_kv_bytes`
+changed from `Vec<u8>` to `Arc<Vec<u8>>`. Under write lock, all clone sites
+(notify_watchers event creation, put prev_kv, delete_range prev_kv) use
+cheap Arc increment instead of deep Vec memcpy. The Vec clone is deferred
+to response-building sites (event_to_proto, range kv extraction) which run
+outside the write lock. `make_kv_bytes` returns `Arc<Vec<u8>>`.
+
 ### G. HIGH: Clone Chain in Put
 
 A single `put` with `prev_kv=true` can clone kv_bytes 3+ times:
@@ -752,6 +759,11 @@ A single `put` with `prev_kv=true` can clone kv_bytes 3+ times:
 
 **Fix:** Arc<Vec<u8>> for kv_bytes eliminates all deep copies — all clones
 become Arc clones (atomic increment).
+
+**Result:** All 4 clone sites in the put chain now clone the Arc (atomic
+increment) instead of the Vec (memcpy). The `prev_kv` response still needs
+`Vec<u8>` (converted via `.to_vec()`), but this happens outside the write
+lock. Same benefit for delete_range and watch event creation.
 
 ### H. HIGH: range Scans All Keys Including Deleted Tombstones
 
@@ -982,8 +994,8 @@ rarely called, the current approach is acceptable.
 | C | Event-driven lease expiry | eliminates 2% CPU polling, write lock contention | low |
 | D | Stop cloning watcher list | eliminates MB-scale alloc per put with 10K watchers | trivial | ✅ done |
 | E | Cache RangeBound in WatchRegistration | eliminates per-event per-watcher resolve_range | trivial | ✅ done |
-| F | Arc<Vec<u8>> for kv_bytes | eliminates deep clones in range/put/watch | low |
-| G | Arc chain in put | same as F, sub-item | low |
+| F | Arc<Vec<u8>> for kv_bytes | eliminates deep clones in range/put/watch | low | ✅ done |
+| G | Arc chain in put | same as F, sub-item | low | ✅ done |
 | H | BTreeMap::range() not full scan | O(n) → O(log n + k) for range queries | low | ✅ done |
 | I | BTreeMap range for delete_range | O(n) → O(log n + k) | low | ✅ done |
 | J | Early termination with limit | avoids scanning entire map for limited queries | low | ✅ done |
@@ -1001,17 +1013,6 @@ rarely called, the current approach is acceptable.
 
 ## Immediate Next Steps (highest ROI)
 
-1. **Arc<Vec<u8>> for kv_bytes** (F+G) — one change eliminates clone chains
-   across range, put, watch, and replay. ~30 minutes work. *(next)*
-
-2. ~~**Cache RangeBound in WatchRegistration** (E) — done.~~
-3. ~~**Stop cloning watcher list** (D) — done.~~
-4. ~~**AtomicU64 for compact_rev** (M) — done.~~
-5. ~~**Pre-allocate kvs Vec** (N) — done.~~
-6. ~~**Hardware CRC32C** (P) — done.~~
-7. ~~**Inline CRC** (R) — done.~~
-8. ~~**Graceful shutdown** (S) — done.~~
-9. ~~**BTreeMap::range() for bounded iteration** (H+J+I) — done.~~
-10. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
-    improvement available. Requires design work for crash semantics.
-11. ~~**Batch WAL in lease_revoke** (K) — done.~~
+1. ~~**Arc<Vec<u8>> for kv_bytes** (F+G) — done.~~
+2. **Batch WAL writes + deferred fsync** (A) — the single biggest throughput
+   improvement available. Requires design work for crash semantics.

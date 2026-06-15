@@ -36,7 +36,7 @@ pub struct KeyState {
     pub version: i64,
     pub lease: i64,
     pub deleted: bool,
-    pub kv_bytes: Vec<u8>,
+    pub kv_bytes: Arc<Vec<u8>>,
 }
 
 impl KeyState {
@@ -61,7 +61,7 @@ impl KeyState {
 }
 
 /// Pre-encode a KeyValue protobuf with overlong varints for use as kv_bytes.
-fn make_kv_bytes(key: &[u8], ks: &KeyState) -> Vec<u8> {
+fn make_kv_bytes(key: &[u8], ks: &KeyState) -> Arc<Vec<u8>> {
     let (kv_bytes, _, _) = wal::encode_kv(
         key,
         &ks.value,
@@ -70,7 +70,7 @@ fn make_kv_bytes(key: &[u8], ks: &KeyState) -> Vec<u8> {
         ks.version,
         ks.lease,
     );
-    kv_bytes
+    Arc::new(kv_bytes)
 }
 
 #[derive(Debug)]
@@ -99,8 +99,8 @@ pub struct WatchEvent {
     pub revision: u64,
     pub event_type: mvccpb::event::EventType,
     pub key: Vec<u8>,
-    pub kv_bytes: Vec<u8>,
-    pub prev_kv_bytes: Vec<u8>,
+    pub kv_bytes: Arc<Vec<u8>>,
+    pub prev_kv_bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -142,7 +142,7 @@ impl StoreState {
             version: prev.as_ref().map(|k| k.version + 1).unwrap_or(1),
             lease,
             deleted: false,
-            kv_bytes: Vec::new(),
+            kv_bytes: Arc::new(Vec::new()),
         };
         entry.kv_bytes = make_kv_bytes(&key, &entry);
         self.keys.insert(key.clone(), entry.clone());
@@ -226,7 +226,7 @@ impl StoreState {
 
             let mut event = event.clone();
             if !watcher.prev_kv {
-                event.prev_kv_bytes = Vec::new();
+                event.prev_kv_bytes = Arc::new(Vec::new());
             }
             let _ = watcher.sender.send(event);
         }
@@ -364,7 +364,7 @@ impl Store {
                 let (kv_bytes, _, _) = wal::encode_kv(k, b"", 0, 0, 0, 0);
                 kv_bytes
             } else {
-                ks.kv_bytes.clone()
+                ks.kv_bytes.to_vec()
             };
             kvs.push(kv);
         }
@@ -443,7 +443,7 @@ impl Store {
         let header = Some(state.header());
         let prev_kv = if req.prev_kv {
             prev.as_ref()
-                .map(|p| p.kv_bytes.clone())
+                .map(|p| p.kv_bytes.to_vec())
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -532,7 +532,7 @@ impl Store {
 
             if req.prev_kv {
                 if let Some(p) = prev {
-                    prev_kvs.push(p.kv_bytes.clone());
+                    prev_kvs.push(p.kv_bytes.to_vec());
                 }
             }
         }
@@ -859,8 +859,8 @@ fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
             revision: rec.mod_revision().unwrap_or(0) as u64,
             event_type: mvccpb::event::EventType::Delete,
             key: key.clone(),
-            kv_bytes: rec.kv_bytes.clone(),
-            prev_kv_bytes: rec.kv_bytes.clone(),
+            kv_bytes: Arc::new(rec.kv_bytes.clone()),
+            prev_kv_bytes: Arc::new(rec.kv_bytes.clone()),
         };
         state.keys.remove(&key);
         state.notify_watchers(event);
@@ -874,7 +874,7 @@ fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
             version: kv.version,
             lease: kv.lease,
             deleted: false,
-            kv_bytes: rec.kv_bytes.clone(),
+            kv_bytes: Arc::new(rec.kv_bytes.clone()),
         };
         state.keys.insert(key.clone(), entry);
 
@@ -882,8 +882,8 @@ fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
             revision: rec.mod_revision().unwrap_or(0) as u64,
             event_type: mvccpb::event::EventType::Put,
             key,
-            kv_bytes: rec.kv_bytes.clone(),
-            prev_kv_bytes: Vec::new(),
+            kv_bytes: Arc::new(rec.kv_bytes.clone()),
+            prev_kv_bytes: Arc::new(Vec::new()),
         };
         state.notify_watchers(event);
     }

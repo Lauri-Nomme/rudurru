@@ -32,8 +32,8 @@ fn make_header(revision: i64) -> etcdserverpb::ResponseHeader {
 fn event_to_proto(event: &WatchEvent) -> mvccpb::Event {
     mvccpb::Event {
         r#type: event.event_type as i32,
-        kv: event.kv_bytes.clone(),
-        prev_kv: event.prev_kv_bytes.clone(),
+        kv: event.kv_bytes.to_vec(),
+        prev_kv: event.prev_kv_bytes.to_vec(),
     }
 }
 
@@ -49,8 +49,8 @@ fn kvrec_to_event(rec: &wal::KvWalRecord) -> Option<WatchEvent> {
             mvccpb::event::EventType::Put
         },
         key,
-        kv_bytes: rec.kv_bytes.clone(),
-        prev_kv_bytes: Vec::new(),
+        kv_bytes: Arc::new(rec.kv_bytes.clone()),
+        prev_kv_bytes: Arc::new(Vec::new()),
     })
 }
 
