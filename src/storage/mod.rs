@@ -587,11 +587,11 @@ impl Store {
     }
 
     pub async fn txn(&self, req: etcdserverpb::TxnRequest) -> etcdserverpb::TxnResponse {
-        let state_read = self.state.read().await;
+        let state = self.state.write().await;
 
-        let success = req.compare.iter().all(|c| eval_compare(&state_read, c));
+        let success = req.compare.iter().all(|c| eval_compare(&state, c));
 
-        drop(state_read);
+        drop(state);
 
         let ops = if success { req.success } else { req.failure };
         self.execute_txn_ops(ops, success).await
