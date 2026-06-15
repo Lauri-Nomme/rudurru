@@ -25,15 +25,26 @@ k3s server --datastore-endpoint=http://localhost:2379
 
 | Metric | Value |
 |--------|-------|
-| Put latency (p50) | ~90μs |
-| Get latency (p50) | ~90μs |
-| Txn latency (p50) | ~210μs |
-| Peak throughput (16 workers) | ~87K writes/sec |
+| Put latency (p50) | ~38μs |
+| Get latency (p50) | ~37μs |
+| Txn latency (p50) | ~76μs |
+| Scan latency (1K keys) | ~0.6ms |
+| Peak throughput (8-32 workers) | ~105K writes/sec |
 | Memory (idle) | ~37MB RSS |
-| Memory (22K keys) | ~63MB RSS |
-| Binary size | 2.8MB (stripped, LTO) |
+| Binary size | 2.9MB (stripped, LTO) |
 
-See [prd/perf-test.md](prd/perf-test.md) for full benchmarks including remote (1Gb LAN) and scaling up to 128 workers.
+See [prd/perf-test-p7.md](prd/perf-test-p7.md) (zero-copy gRPC),
+[prd/perf-test-bytes.md](prd/perf-test-bytes.md) (prost::bytes),
+and [prd/perf-test-fsync.md](prd/perf-test-fsync.md) (deferred fsync)
+for full benchmark history.
+
+## Storage
+
+Single WAL file with **periodic compaction** (snapshot + tail-copy).
+WAL is replayed into a `BTreeMap` on startup.
+Background task compacts when WAL exceeds 64 MB.
+Production result: **284 MB → 5.1 MB (98% reduction) in 52ms**.
+See [prd/wal-gc.md](prd/wal-gc.md) for design.
 
 ## k3s Integration
 
@@ -41,11 +52,9 @@ k3s supports external etcd via `--datastore-endpoint`. Rudurru implements the et
 
 Tested with k3s v1.36.1:
 - All control plane components start and operate normally
-- 27 Kubernetes resource types stored (deployments, pods, RBAC, CRDs, etc.)
+- 2-node cluster (control-plane + worker), 35+ pods
 - Full list-watch, CAS transactions, revision management
-- `kubectl create deployment`, `kubectl get pods`, `kubectl get nodes` all work
-
-See [prd/k3s.compat.md](prd/k3s.compat.md) for integration details and risks.
+- Rancher, Fleet, cert-manager, home-assistant, Immich, Mastodon
 
 ## Status
 
@@ -53,17 +62,36 @@ See [prd/k3s.compat.md](prd/k3s.compat.md) for integration details and risks.
 |---------|--------|
 | KV (Range, Put, Delete) | Done |
 | Txn (CAS with resourceVersion) | Done |
-| Watch (key, prefix, from-revision) | Done |
-| Lease (grant, revoke, keepalive, expiry) | Done |
+| Watch (key, prefix, from-revision, cross-stream batching) | Done |
+| Lease (grant, revoke, keepalive, event-driven expiry) | Done |
 | Cluster (member_list) | Done (single-node) |
 | Maintenance (status, hash, snapshot) | Done |
 | Auth | Not implemented (k3s doesn't use it) |
 
-41 integration tests pass against Rudurru. 46/47 pass against real etcd docker (1 pre-existing state pollution).
+31 unit tests + 5 compaction tests pass.
 
-## Storage
+## Optimizations Implemented
 
-Single WAL file (append-only binary format with CRC32C). No SQLite, no B-tree on disk, no checkpoint. The WAL is replayed into a `BTreeMap` on startup. No lease persistence (leases are ephemeral — lost on restart).
+| # | Optimization | Technique |
+|---|-------------|-----------|
+| A | Deferred WAL fsync | 50ms background fsync task, write lock held 10µs not 10ms |
+| C | Event-driven lease expiry | `sleep_until(earliest)` + Notify, no polling |
+| F+G | Zero-copy responses | `prost::bytes::Bytes` across store → gRPC boundary |
+| H+I+J | BTreeMap range iteration | O(log n + k) for range/delete/limit queries |
+| K | Batch WAL writes | Single fsync per lease_revoke batch |
+| M | Atomic compact_rev | No read lock for compaction queries |
+| N | Pre-allocated kvs Vec | No reallocation during range iteration |
+| O | Atomics for status counters | No read lock for periodic status |
+| P | Hardware CRC32C | SSE4.2 `crc32q` via `crc32c` crate |
+| Q | Linearizable txn | Write lock for comparison + execution |
+| R | Inline CRC | No temporary Vec in KvWalRecord::new |
+| S | Graceful shutdown | `serve_with_shutdown` + `ctrl_c` |
+| T | Fixed-length value length | Overlong u32 for value length in protobuf |
+| — | Unlimited gRPC message size | `max_decoding_message_size(usize::MAX)` |
+| — | WAL compaction | Periodic snapshot + tail-copy, 284→5 MB |
+| — | Cross-stream watch batching | 140 watchers → 1 Phase 1 scan + 1 lock acquisition |
+
+See [prd/optimization.md](prd/optimization.md) for full bottleneck analysis.
 
 ## Build
 
@@ -71,30 +99,31 @@ Single WAL file (append-only binary format with CRC32C). No SQLite, no B-tree on
 cargo build --release
 ```
 
-The release profile uses LTO, single codegen unit, and strip — producing a 2.8MB binary.
+The release profile uses LTO, single codegen unit, and strip — producing a 2.9MB binary.
 
 ## Architecture
 
 ```
-                     ┌────────────────────┐
-k3s ── gRPC etcd v3 ─▶  Tonic Server      │
-(kube-apiserver)      │  (6 services)      │
-                      │                    │
-                      │  Store             │
-                      │  ┌──────────────┐  │
-                      │  │ RwLock       │  │
-                      │  │ ┌──────────┐ │  │
-                      │  │ │ BTreeMap │ │  │
-                      │  │ │ keys     │ │  │
-                      │  │ ├──────────┤ │  │
-                      │  │ │ leases   │ │  │
-                      │  │ ├──────────┤ │  │
-                      │  │ │ watchers │ │  │
-                      │  │ ├──────────┤ │  │
-                      │  │ │ WalFile  │ │  │
-                      │  │ └──────────┘ │  │
-                      │  └──────────────┘  │
-                      └────────────────────┘
+                     ┌──────────────────────────────────┐
+k3s ── gRPC etcd v3 ─▶  Tonic Server                    │
+(kube-apiserver)      │  (KV, Watch, Lease, Cluster,     │
+                      │   Maintenance, Auth — 6 services)│
+                      │                                  │
+                      │  Store (Arc<RwLock<StoreState>>) │
+                      │  ┌────────────────────────────┐  │
+                      │  │ keys: BTreeMap<Vec<u8>,    │  │
+                      │  │        KeyState>           │  │
+                      │  │ leases: BTreeMap<i64,      │  │
+                      │  │         LeaseState>        │  │
+                      │  │ watchers: Vec<WatchReg>    │  │
+                      │  │ wal: WalFile               │  │
+                      │  └────────────────────────────┘  │
+                      │                                  │
+                      │  Background tasks:                │
+                      │  ├─ fsync (every 50ms when dirty) │
+                      │  ├─ lease expiry (event-driven)   │
+                      │  └─ WAL compaction (>64 MB)       │
+                      └──────────────────────────────────┘
 ```
 
 ## Configuration
