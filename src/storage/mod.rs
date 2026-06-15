@@ -24,6 +24,11 @@ pub fn current_revision() -> u64 {
 static NEXT_LEASE_ID: AtomicI64 = AtomicI64::new(1);
 static COMPACT_REV: AtomicU64 = AtomicU64::new(0);
 
+/// Approximate counters for the periodic status log (no read lock needed).
+pub static KEY_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static WATCHER_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static LEASE_COUNT: AtomicU64 = AtomicU64::new(0);
+
 fn next_lease_id() -> i64 {
     NEXT_LEASE_ID.fetch_add(1, Ordering::SeqCst)
 }
@@ -148,7 +153,10 @@ impl StoreState {
             kv_bytes: Bytes::new(),
         };
         entry.kv_bytes = make_kv_bytes(&key, &entry);
-        self.keys.insert(key.clone(), entry.clone());
+        let old = self.keys.insert(key.clone(), entry.clone());
+        if old.is_none() {
+            KEY_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
 
         let event = WatchEvent {
             revision: rev,
@@ -167,6 +175,7 @@ impl StoreState {
 
     fn apply_delete(&mut self, key: Vec<u8>, rev: u64) -> Option<KeyState> {
         let prev = self.keys.remove(&key)?;
+        KEY_COUNT.fetch_sub(1, Ordering::Relaxed);
         if prev.deleted {
             return None;
         }
@@ -188,13 +197,18 @@ impl StoreState {
     pub(crate) fn register_watcher(&mut self, reg: WatchRegistration) -> i64 {
         let watch_id = reg.watch_id;
         self.watchers.push(reg);
+        WATCHER_COUNT.fetch_add(1, Ordering::Relaxed);
         watch_id
     }
 
     pub(crate) fn cancel_watcher(&mut self, watch_id: i64) -> bool {
         let len_before = self.watchers.len();
         self.watchers.retain(|w| w.watch_id != watch_id);
-        len_before != self.watchers.len()
+        let changed = len_before != self.watchers.len();
+        if changed {
+            WATCHER_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+        changed
     }
 
     fn notify_watchers(&mut self, event: WatchEvent) {
@@ -265,6 +279,9 @@ impl Store {
 
         state.next_rev = max_rev + 1;
         NEXT_REV.store(state.next_rev, Ordering::SeqCst);
+        KEY_COUNT.store(state.keys.len() as u64, Ordering::Relaxed);
+        WATCHER_COUNT.store(0, Ordering::Relaxed);
+        LEASE_COUNT.store(0, Ordering::Relaxed);
 
         tracing::info!(
             "rudurru ready: revision={}, keys={}, compact_rev={}",
@@ -672,6 +689,7 @@ impl Store {
                 key_count: 0,
             },
         );
+        LEASE_COUNT.fetch_add(1, Ordering::Relaxed);
         state.expiry_notify.notify_one();
         tracing::info!(id, ttl, "lease_granted");
         etcdserverpb::LeaseGrantResponse {
@@ -689,6 +707,7 @@ impl Store {
         let mut state = self.state.write().await;
         let id = req.id;
         state.leases.remove(&id);
+        LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
         state.expiry_notify.notify_one();
         tracing::info!(id, "lease_revoked");
         let keys_to_delete: Vec<Vec<u8>> = state
@@ -869,6 +888,7 @@ impl Store {
                 }
                 for id in expired {
                     s.leases.remove(&id);
+                    LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
                     let keys_to_delete: Vec<Vec<u8>> = s
                         .keys
                         .iter()

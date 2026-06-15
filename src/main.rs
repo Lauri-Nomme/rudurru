@@ -28,16 +28,15 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Periodic status logging (every 60s)
-    let status_store = store.clone();
     let status_wal = wal_path.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let (keys, watchers, leases) = {
-                let s = status_store.state.read().await;
-                (s.keys.len(), s.watchers.len(), s.leases.len())
-            };
+            let keys = rudurru::storage::KEY_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let watchers =
+                rudurru::storage::WATCHER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let leases = rudurru::storage::LEASE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
             let wal_size = std::fs::metadata(&status_wal).map(|m| m.len()).unwrap_or(0);
             let rev = rudurru::storage::current_revision();
             tracing::info!(rev, keys, watchers, leases, wal_size, "rudurru status");
