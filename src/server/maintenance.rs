@@ -46,7 +46,7 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
         let db_size = self.store.db_size().await;
         Ok(Response::new(etcdserverpb::StatusResponse {
             header: Some(header()),
-            version: "rudurru-0.1.0".into(),
+            version: "3.5.0".into(),
             db_size,
             leader: 1,
             raft_index: storage::current_revision(),

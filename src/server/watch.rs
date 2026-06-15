@@ -314,8 +314,10 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
             continue;
         }
 
+        // Reject only if the gap is egregious (bookmark races of 1-2 revs
+        // are normal — etcd accepts them and the watcher catches up immediately).
         let cur_rev = current_revision();
-        if c.pending.start_revision > cur_rev {
+        if c.pending.start_revision > cur_rev && c.pending.start_revision - cur_rev > 10_000 {
             tracing::info!(
                 start_revision = c.pending.start_revision,
                 current_revision = cur_rev,
