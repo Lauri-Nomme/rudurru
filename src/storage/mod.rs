@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 /// Global revision counter. Monotonically increasing, starts at 1.
 static NEXT_REV: AtomicU64 = AtomicU64::new(1);
@@ -111,6 +111,7 @@ pub struct StoreState {
     pub watchers: Vec<WatchRegistration>,
     pub next_rev: u64,
     pub wal: wal::WalFile,
+    pub expiry_notify: Arc<Notify>,
 }
 
 impl StoreState {
@@ -121,6 +122,7 @@ impl StoreState {
             watchers: Vec::new(),
             next_rev: 1,
             wal,
+            expiry_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -670,6 +672,7 @@ impl Store {
                 key_count: 0,
             },
         );
+        state.expiry_notify.notify_one();
         tracing::info!(id, ttl, "lease_granted");
         etcdserverpb::LeaseGrantResponse {
             header: Some(state.header()),
@@ -686,6 +689,7 @@ impl Store {
         let mut state = self.state.write().await;
         let id = req.id;
         state.leases.remove(&id);
+        state.expiry_notify.notify_one();
         tracing::info!(id, "lease_revoked");
         let keys_to_delete: Vec<Vec<u8>> = state
             .keys
@@ -730,6 +734,7 @@ impl Store {
             let ttl = ls.ttl;
             ls.expires_at =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
+            state.expiry_notify.notify_one();
             etcdserverpb::LeaseKeepAliveResponse {
                 header: Some(state.header()),
                 id,
@@ -819,8 +824,38 @@ impl Store {
 
     fn start_expiry_task(state: Arc<RwLock<StoreState>>) {
         tokio::spawn(async move {
+            let notify = {
+                let s = state.read().await;
+                s.expiry_notify.clone()
+            };
             loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Compute sleep duration from the earliest lease expiry.
+                // When no leases exist, sleep indefinitely (woken by notify).
+                let sleep_dur = {
+                    let s = state.read().await;
+                    s.leases
+                        .values()
+                        .map(|ls| ls.expires_at)
+                        .min()
+                        .map(|earliest| {
+                            let now = tokio::time::Instant::now();
+                            if earliest <= now {
+                                Duration::ZERO
+                            } else {
+                                earliest - now
+                            }
+                        })
+                        .unwrap_or(Duration::MAX)
+                };
+
+                // Wait until the earliest expiry OR a notification
+                // (lease granted / refreshed / revoked).
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_dur) => {}
+                    _ = notify.notified() => {}
+                }
+
+                // Collect and process expired leases under the write lock.
                 let mut s = state.write().await;
                 let now = tokio::time::Instant::now();
                 let expired: Vec<i64> = s
@@ -829,6 +864,9 @@ impl Store {
                     .filter(|(_, ls)| ls.expires_at <= now)
                     .map(|(id, _)| *id)
                     .collect();
+                if expired.is_empty() {
+                    continue;
+                }
                 for id in expired {
                     s.leases.remove(&id);
                     let keys_to_delete: Vec<Vec<u8>> = s
