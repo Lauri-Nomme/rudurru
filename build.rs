@@ -42,6 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_prost_build::configure()
         .build_server(true)
+        // Response fields carrying pre-encoded mvccpb.KeyValue: use Bytes
+        // (zero-copy sharing from store through gRPC serialization)
+        .bytes("mvccpb.Event.kv")
+        .bytes("mvccpb.Event.prev_kv")
+        .bytes("etcdserverpb.RangeResponse.kvs")
+        .bytes("etcdserverpb.PutResponse.prev_kv")
+        .bytes("etcdserverpb.DeleteRangeResponse.prev_kvs")
         .compile_protos(&["proto/patched/rpc.proto"], &[proto_root])?;
 
     std::fs::remove_dir_all("proto/patched")?;

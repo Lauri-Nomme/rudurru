@@ -2,6 +2,7 @@ use crate::proto::etcdserverpb;
 use crate::proto::etcdserverpb::watch_request;
 use crate::proto::mvccpb;
 use crate::storage::{self, current_revision, wal, Store, WatchEvent, WatchRegistration};
+use prost::bytes::Bytes;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,8 +33,8 @@ fn make_header(revision: i64) -> etcdserverpb::ResponseHeader {
 fn event_to_proto(event: &WatchEvent) -> mvccpb::Event {
     mvccpb::Event {
         r#type: event.event_type as i32,
-        kv: event.kv_bytes.to_vec(),
-        prev_kv: event.prev_kv_bytes.to_vec(),
+        kv: event.kv_bytes.clone(),
+        prev_kv: event.prev_kv_bytes.clone(),
     }
 }
 
@@ -49,8 +50,8 @@ fn kvrec_to_event(rec: &wal::KvWalRecord) -> Option<WatchEvent> {
             mvccpb::event::EventType::Put
         },
         key,
-        kv_bytes: Arc::new(rec.kv_bytes.clone()),
-        prev_kv_bytes: Arc::new(Vec::new()),
+        kv_bytes: Bytes::from(rec.kv_bytes.clone()),
+        prev_kv_bytes: Bytes::new(),
     })
 }
 
