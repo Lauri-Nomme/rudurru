@@ -369,6 +369,58 @@ The only adjustment: after replay, `max_rev` is correctly computed from
 the tail records (which have the highest revisions). The snapshot records
 have lower revisions (≤ `snapshot_rev`), so they don't affect `max_rev`.
 
+## Production Validation
+
+Deployed to production at commit `794e7d3` on a cluster with 2 nodes,
+~2,300 keys, ~180 watchers. WAL was 284 MB before first compaction.
+
+### First Compaction Result (2026-06-15 23:58)
+
+```
+wal_compaction_triggered wal_size=284896402
+wal_compacted snapshot_keys=2263 snapshot_rev=400011
+  snapshot_bytes=5137228  phase_a_us=10987  phase_b_us=39430
+  phase_c_us=1666  total_us=52091
+  tail_bytes=0  tail_count=0
+  old_wal_size=284896402 → new_wal_size=5137228
+```
+
+| Metric | Value |
+|--------|-------|
+| WAL before | 284 MB |
+| WAL after | 5.1 MB |
+| Reduction | **98%** |
+| Total time | 52 ms |
+| Phase A (snapshot) | 11 ms |
+| Phase B (write) | 39 ms |
+| Phase C (tail + swap) | 1.7 ms |
+| Tail records | 0 (no writes during compaction) |
+| Active keys | 2,263 |
+
+### Steady-State Growth After Compaction
+
+After compaction, the WAL grows at ~6 MB/hour (k3s workload with ~72 writes/sec,
+mostly lease heartbeats and pod status updates). The background compaction task
+(64 MB threshold, 5 min check interval) will trigger every ~10 hours.
+
+### Log Format
+
+```json
+{
+  "snapshot_keys": 2263,      // active keys in snapshot
+  "snapshot_rev": 400011,     // revision at snapshot time
+  "snapshot_bytes": 5137228,  // serialized snapshot size
+  "phase_a_us": 10987,        // write lock held (snapshot)
+  "phase_b_us": 39430,        // no lock (write to disk)
+  "phase_c_us": 1666,         // write lock held (tail + swap)
+  "total_us": 52091,          // total wall clock
+  "tail_bytes": 0,            // writes during Phase B
+  "tail_count": 0,            // records in tail
+  "old_wal_size": 284896402,  // before compaction
+  "new_wal_size": 5137228     // after compaction
+}
+```
+
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
