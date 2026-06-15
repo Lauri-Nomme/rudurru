@@ -878,6 +878,10 @@ processors since 2010.
 **Fix:** Replace with `crc32c` crate (uses hardware acceleration when
 available). On modern CPUs, hardware CRC32C is ~10× faster than software.
 
+**Result:** Replaced custom bit-loop CRC32C with `crc32c` crate (v0.6.8).
+Uses SSE4.2 `crc32q` on x86-64 and ARMv8 CRC instructions on aarch64.
+All 26 WAL tests pass with identical CRC output.
+
 ### Q. MODERATE: Txn Comparison + Execute Has TOCTOU Race
 
 `txn` evaluates comparisons under the read lock, drops it, then re-acquires
@@ -953,7 +957,7 @@ rarely called, the current approach is acceptable.
 | M | AtomicU64 for compact_rev | eliminates unnecessary lock contention | trivial | ✅ done |
 | N | Pre-allocate kvs Vec | reduces reallocation during range | trivial | ✅ done |
 | O | Atomics for status counters | eliminates periodic read lock acquisition | low |
-| P | Hardware CRC32C | ~10× faster CRC computation | trivial |
+| P | Hardware CRC32C | ~10× faster CRC computation | trivial | ✅ done |
 | Q | Linearizable txn | fixes correctness race | low |
 | R | Inline CRC in KvWalRecord::new | eliminates temporary Vec | trivial |
 | S | Graceful shutdown | prevents data loss on SIGTERM | trivial |
