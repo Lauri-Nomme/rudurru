@@ -5,6 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tonic::transport::Server;
 
+extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -27,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
         "Rudurru listening on {addr}, WAL: {wal_path}"
     );
 
-    // Periodic status logging (every 60s)
+    // Periodic status logging + malloc_trim (every 60s)
     let status_wal = wal_path.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -40,6 +44,10 @@ async fn main() -> anyhow::Result<()> {
             let wal_size = std::fs::metadata(&status_wal).map(|m| m.len()).unwrap_or(0);
             let rev = rudurru::storage::current_revision();
             tracing::info!(rev, keys, watchers, leases, wal_size, "rudurru status");
+            // Release free memory cached by glibc back to the OS.
+            // Without this, glibc holds freed mmap'd regions indefinitely,
+            // causing RSS to remain high after bulk key deletion.
+            unsafe { malloc_trim(0); }
         }
     });
 
