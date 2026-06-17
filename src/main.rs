@@ -9,6 +9,26 @@ extern "C" {
     fn malloc_trim(pad: usize) -> i32;
 }
 
+fn read_proc_mem() -> (u64, u64, u64) {
+    // Returns (rss_kb, vsize_kb, peak_kb) from /proc/self/status
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (0, 0, 0);
+    };
+    let mut rss = 0u64;
+    let mut vsize = 0u64;
+    let mut peak = 0u64;
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            rss = v.trim().trim_end_matches(" kB").parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("VmSize:") {
+            vsize = v.trim().trim_end_matches(" kB").parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("VmPeak:") {
+            peak = v.trim().trim_end_matches(" kB").parse().unwrap_or(0);
+        }
+    }
+    (rss, vsize, peak)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -43,7 +63,8 @@ async fn main() -> anyhow::Result<()> {
             let leases = rudurru::storage::LEASE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
             let wal_size = std::fs::metadata(&status_wal).map(|m| m.len()).unwrap_or(0);
             let rev = rudurru::storage::current_revision();
-            tracing::info!(rev, keys, watchers, leases, wal_size, "rudurru status");
+            let (rss_kb, vsize_kb, peak_kb) = read_proc_mem();
+            tracing::info!(rev, keys, watchers, leases, wal_size, rss_kb, vsize_kb, peak_kb, "rudurru status");
             // Release free memory cached by glibc back to the OS.
             // Without this, glibc holds freed mmap'd regions indefinitely,
             // causing RSS to remain high after bulk key deletion.
