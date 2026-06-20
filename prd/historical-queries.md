@@ -111,7 +111,38 @@ pub struct KeyState {
 - Server handler in `kv.rs` uses `?` to propagate errors to the etcd API
 - Txn ranges use `.unwrap()` (internal, no user-supplied revision)
 
-## 6. Test Plan
+## 6. Production Validation
+
+Measured from 460 consecutive historical queries on the live k3s cluster (10 min window after deploy):
+
+| Metric | Value |
+|--------|-------|
+| **WAL scans triggered** | **0** — all 460 queries hit Phase 1 early return |
+| BTreeMap scan time | 2–61 µs (median 8 µs) |
+| Total query time (Phase 1 only) | 9–109 µs (median 45 µs) |
+| Queries returning count=0 | 226 (no data at target RV for that key prefix) |
+| Queries returning count≥1 | 234 |
+| k3s consistency check failures | **0** (was 14k/day before fix) |
+
+The `stale=0` across all queries confirms: keeping deleted keys in the BTreeMap eliminates WAL I/O entirely for this workload. Every query completed with zero disk reads beyond the BTreeMap walk.
+
+### Debug Log Fields
+
+Each `historical_range` log line includes:
+
+| Field | Example | Description |
+|-------|---------|-------------|
+| `target_rev` | `3172445` | Revision being queried |
+| `key` | `/registry/pods/` | Requested key prefix |
+| `range_end` | `/registry/pods0` | Range end (prefix queries use `\0` suffix) |
+| `direct` | `8` | Keys served from BTreeMap (mod_rev ≤ target) |
+| `stale` | `0` | Keys needing WAL reconstruction (mod_rev > target) |
+| `count` / `total_keys` | `8` | Total keys in result set |
+| `from_phase1` | `8` | Keys sourced from Phase 1 (no WAL) |
+| `from_wal` | `0` | Keys sourced from WAL |
+| `elapsed_us` | `45` | Wall-clock microseconds |
+
+## 7. Test Plan
 
 | # | Test | What it covers |
 |---|------|----------------|
@@ -136,7 +167,7 @@ pub struct KeyState {
 | 19 | delete_recreate_after_rebirth | After rebirth, query at pre-rebirth rev needs WAL |
 | 20 | multiple_stale_keys_limit | Many stale keys with limit |
 
-## 7. Files
+## 8. Files
 
 | File | Contents |
 |------|----------|
