@@ -3009,4 +3009,238 @@ mod historical_tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[tokio::test]
+    async fn test_historical_min_mod_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        let rev = current_revision();
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await;
+
+        // Current-state: min_mod_revision filters current mod_revision
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            min_mod_revision: (rev + 1) as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "min_mod_revision filters to 1 key (a updated)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_max_mod_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        let rev1 = current_revision();
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            max_mod_revision: rev1 as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "max_mod_revision=rev1 gives 1 key (a)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_min_create_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        let rev_b = current_revision();
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            min_create_revision: rev_b as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "min_create_revision gives 1 key (b)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_max_create_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        let rev_a = current_revision();
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            max_create_revision: rev_a as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "max_create_revision gives 1 key (a)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_kv_metadata() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        let create_rev = current_revision();
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+
+        // Historical: metadata should reflect state at create_rev
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"k1".to_vec(), revision: create_rev as i64,
+            ..Default::default()
+        }).await.unwrap();
+        let kv = mvccpb::KeyValue::decode(&resp.kvs[0][..]).unwrap();
+        assert_eq!(kv.value, b"v1");
+        assert_eq!(kv.create_revision, create_rev as i64);
+        assert_eq!(kv.mod_revision, create_rev as i64);
+        assert_eq!(kv.version, 1);
+
+        // Current: metadata reflects latest state
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"k1".to_vec(), ..Default::default()
+        }).await.unwrap();
+        let kv = mvccpb::KeyValue::decode(&resp.kvs[0][..]).unwrap();
+        assert_eq!(kv.value, b"v2");
+        assert_eq!(kv.create_revision, create_rev as i64);
+        assert_eq!(kv.mod_revision, create_rev as i64 + 1);
+        assert_eq!(kv.version, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_from_key_query() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"va".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"vb".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"c".to_vec(),value:b"vc".to_vec(),..Default::default()}).await;
+        let rev = current_revision();
+
+        // From-key: all keys >= "b"
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"b".to_vec(), range_end: vec![0], revision: rev as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 2, "from-key gives 2 keys (b, c)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_non_existent_key() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"existing".to_vec(),value:b"v".to_vec(),..Default::default()}).await;
+        let rev = current_revision();
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"nonexistent".to_vec(), revision: rev as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 0);
+        assert!(resp.kvs.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_non_existent_prefix() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"/real/k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        let rev = current_revision();
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"/fake/".to_vec(), range_end: b"/fake0".to_vec(), revision: rev as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 0, "non-existent prefix returns 0");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_exact_create_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        let create_rev = current_revision();
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"k1".to_vec(), revision: create_rev as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "key exists at create revision");
+        let kv = mvccpb::KeyValue::decode(&resp.kvs[0][..]).unwrap();
+        assert_eq!(kv.value, b"v1");
+        assert_eq!(kv.create_revision, create_rev as i64);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_more_flag_limit_zero() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            revision: current_revision() as i64, limit: 0,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 2);
+        assert!(!resp.more, "more=false when limit=0");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_current_state_min_max_mod_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        let rev = current_revision();
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await;
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            min_mod_revision: (rev + 1) as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "min_mod_revision: only k1");
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            max_mod_revision: rev as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "max_mod_revision: only k2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_current_state_min_max_create_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        let rev_k2 = current_revision();
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            min_create_revision: rev_k2 as i64,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "min_create_revision: only k2");
+
+        let resp = store.range(etcdserverpb::RangeRequest{
+            key: b"".to_vec(), range_end: vec![0],
+            max_create_revision: rev_k2 as i64 - 1,
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resp.count, 1, "max_create_revision: only k1");
+        let _ = std::fs::remove_file(&path);
+    }
 }
