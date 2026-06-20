@@ -35,7 +35,7 @@ fn next_lease_id() -> i64 {
     NEXT_LEASE_ID.fetch_add(1, Ordering::SeqCst)
 }
 
-/// In-memory representation of a key's current state.
+/// In-memory representation of a key's state (alive or tombstoned).
 /// Deleted keys remain in the BTreeMap so that historical range queries
 /// can conclusively determine whether a key existed at a target revision
 /// without scanning the WAL.
@@ -46,15 +46,19 @@ pub struct KeyState {
     pub create_revision: u64,
     pub version: i64,
     pub lease: i64,
-    pub deleted: bool,
-    /// Revision at which this key was deleted. 0 = not deleted.
-    /// Only meaningful when `deleted` is true.
+    /// 0 = alive (not deleted). Non-zero = revision at which this key was deleted.
     pub delete_revision: u64,
-    /// True if this key was ever deleted and recreated. When both `has_been_deleted`
-    /// and `create_revision > target_rev`, the key may have existed in a previous
-    /// lifetime at that target_rev, so the WAL is needed to confirm.
-    pub has_been_deleted: bool,
+    /// True if this key ever went through a delete→recreate cycle.
+    /// When `rebirth && create_revision > target_rev`, a prior lifetime may
+    /// have existed at target_rev, so the WAL is needed to confirm.
+    pub rebirth: bool,
     pub kv_bytes: Bytes,
+}
+
+impl KeyState {
+    pub fn is_alive(&self) -> bool {
+        self.delete_revision == 0
+    }
 }
 
 impl KeyState {
@@ -153,10 +157,10 @@ impl StoreState {
     }
 
     fn apply(&mut self, key: Vec<u8>, value: Vec<u8>, lease: i64, rev: u64) -> Option<KeyState> {
-        let prev = self.keys.get(&key).filter(|k| !k.deleted).cloned();
+        let prev = self.keys.get(&key).filter(|k| k.is_alive()).cloned();
         let is_new = prev.is_none();
         // Detect whether this key was previously deleted (lost a lifetime)
-        let had_deleted = self.keys.get(&key).map_or(false, |k| k.deleted);
+        let rebirth = self.keys.get(&key).map_or(false, |k| k.delete_revision != 0);
 
         let mut entry = KeyState {
             value: Arc::from(value.into_boxed_slice()),
@@ -164,9 +168,9 @@ impl StoreState {
             create_revision: prev.as_ref().map(|k| k.create_revision).unwrap_or(rev),
             version: prev.as_ref().map(|k| k.version + 1).unwrap_or(1),
             lease,
-            deleted: false,
+            
             delete_revision: 0,
-            has_been_deleted: had_deleted,
+            rebirth,
             kv_bytes: Bytes::new(),
         };
         entry.kv_bytes = make_kv_bytes(&key, &entry);
@@ -192,11 +196,11 @@ impl StoreState {
 
     fn apply_delete(&mut self, key: Vec<u8>, rev: u64) -> Option<KeyState> {
         let entry = self.keys.get_mut(&key)?;
-        if entry.deleted {
+        if entry.delete_revision != 0 {
             return None;
         }
         let prev = entry.clone();
-        entry.deleted = true;
+        
         entry.delete_revision = rev;
         // Keep mod_revision as the value's revision (for historical query filtering).
         // kv_bytes also stays as the value before deletion.
@@ -301,7 +305,7 @@ impl Store {
 
         state.next_rev = max_rev + 1;
         NEXT_REV.store(state.next_rev, Ordering::SeqCst);
-        let active_keys = state.keys.values().filter(|ks| !ks.deleted).count() as u64;
+        let active_keys = state.keys.values().filter(|ks| ks.is_alive()).count() as u64;
         KEY_COUNT.store(active_keys, Ordering::Relaxed);
         WATCHER_COUNT.store(0, Ordering::Relaxed);
         LEASE_COUNT.store(0, Ordering::Relaxed);
@@ -431,7 +435,7 @@ impl Store {
                     break;
                 }
             }
-            if ks.deleted {
+            if ks.delete_revision != 0 {
                 continue;
             }
             if req.min_mod_revision > 0 && (ks.mod_revision as i64) < req.min_mod_revision {
@@ -508,6 +512,7 @@ impl Store {
         } else {
             usize::MAX
         };
+        let t0 = std::time::Instant::now();
 
         // ── Phase 1: BTreeMap scan (under read lock) ───────────────
         let (range_start, range_end) = btree_bounds(bound.to_ref());
@@ -537,7 +542,7 @@ impl Store {
                     }
                 }
 
-                if ks.deleted {
+                if ks.delete_revision != 0 {
                     // Deleted keys are kept in the BTreeMap with their
                     // delete_revision, so we can conclusively determine
                     // whether they existed at target_rev.
@@ -588,7 +593,7 @@ impl Store {
                     // Key didn't exist at target_rev in its current lifetime.
                     // If it was ever deleted and recreated, it may have existed
                     // in a previous lifetime — force WAL scan.
-                    if ks.has_been_deleted {
+                    if ks.rebirth {
                         phase1_stale_keys.push(k.clone());
                     }
                     continue;
@@ -610,6 +615,14 @@ impl Store {
                 // Limit is applied when building the response below.
             }
 
+            tracing::debug!(
+                target_rev,
+                direct = phase1_direct.len(),
+                stale = phase1_stale_keys.len(),
+                elapsed_us = t0.elapsed().as_micros(),
+                "historical_range phase1 done"
+            );
+
             // ── Phase 1 early return: no stale keys → WAL not needed ──
             // Since deleted keys are kept in the BTreeMap with their
             // delete_revision, we can conclusively determine the full
@@ -617,6 +630,12 @@ impl Store {
             // historical value reconstruction.
             if phase1_stale_keys.is_empty() {
                 let count = phase1_direct.len() as i64;
+                tracing::debug!(
+                    target_rev,
+                    count,
+                    elapsed_us = t0.elapsed().as_micros(),
+                    "historical_range phase1_only"
+                );
                 if req.count_only {
                     return Ok(etcdserverpb::RangeResponse {
                         header: Some(etcdserverpb::ResponseHeader {
@@ -654,9 +673,22 @@ impl Store {
         // ── Phase 2: WAL scan (no store lock) ──────────────────────
         // Only reaches here when at least one key in range has been modified
         // after target_rev and needs historical value reconstruction.
+        tracing::debug!(
+            target_rev,
+            stale_keys = phase1_stale_keys.len(),
+            elapsed_us = t0.elapsed().as_micros(),
+            "historical_range phase2 starting wal scan"
+        );
         let wal_path = self.state.read().await.wal.path.clone();
         let wal_state = scan_wal_range(&wal_path, &req.key, &req.range_end, target_rev)
             .map_err(|e| Status::new(tonic::Code::Internal, format!("wal scan failed: {e}")))?;
+
+        tracing::debug!(
+            target_rev,
+            wal_records = wal_state.len(),
+            elapsed_us = t0.elapsed().as_micros(),
+            "historical_range phase2 done"
+        );
 
         // ── Phase 3: Merge ─────────────────────────────────────────
         // Collect all results in a BTreeMap for deterministic lexicographic ordering.
@@ -694,7 +726,7 @@ impl Store {
                 // is a gap — accept the current value as best-effort.
                 let state = self.state.read().await;
                 if let Some(ks) = state.keys.get(key) {
-                    if !ks.deleted {
+                    if ks.is_alive() {
                         let kv = if req.keys_only {
                             let (b, _, _) = wal::encode_kv(key, b"", 0, 0, 0, 0);
                             Bytes::from(b)
@@ -727,6 +759,15 @@ impl Store {
         }
 
         let count = merged.len() as i64;
+
+        tracing::debug!(
+            target_rev,
+            total_keys = count,
+            from_phase1 = phase1_direct.len(),
+            from_wal = count.saturating_sub(phase1_direct.len() as i64),
+            elapsed_us = t0.elapsed().as_micros(),
+            "historical_range complete"
+        );
 
         if req.count_only {
             return Ok(etcdserverpb::RangeResponse {
@@ -777,7 +818,7 @@ impl Store {
             req.lease
         };
 
-        let prev = state.keys.get(&key).filter(|k| !k.deleted).cloned();
+        let prev = state.keys.get(&key).filter(|k| k.is_alive()).cloned();
         let mut flags = 0u8;
         if prev.is_none() {
             flags |= wal::IS_CREATE;
@@ -828,7 +869,7 @@ impl Store {
             RangeBoundRef::Point(k) => state
                 .keys
                 .get(k)
-                .filter(|ks| !ks.deleted)
+                .filter(|ks| ks.is_alive())
                 .map(|_| k.to_vec())
                 .into_iter()
                 .collect(),
@@ -837,7 +878,7 @@ impl Store {
                 state
                     .keys
                     .range(start..)
-                    .filter(|(_, ks)| !ks.deleted)
+                    .filter(|(_, ks)| ks.is_alive())
                     .map(|(k, _)| k.clone())
                     .collect()
             }
@@ -847,7 +888,7 @@ impl Store {
                     .keys
                     .range(start..)
                     .take_while(|(k, _)| k.starts_with(p))
-                    .filter(|(_, ks)| !ks.deleted)
+                    .filter(|(_, ks)| ks.is_alive())
                     .map(|(k, _)| k.clone())
                     .collect()
             }
@@ -857,21 +898,21 @@ impl Store {
                 state
                     .keys
                     .range(start..end)
-                    .filter(|(_, ks)| !ks.deleted)
+                    .filter(|(_, ks)| ks.is_alive())
                     .map(|(k, _)| k.clone())
                     .collect()
             }
             RangeBoundRef::All => state
                 .keys
                 .iter()
-                .filter(|(_, ks)| !ks.deleted)
+                .filter(|(_, ks)| ks.is_alive())
                 .map(|(k, _)| k.clone())
                 .collect(),
         };
 
         let mut prev_kvs = Vec::new();
         for key in &keys_to_delete {
-            let prev = state.keys.get(key).filter(|k| !k.deleted).cloned();
+            let prev = state.keys.get(key).filter(|k| k.is_alive()).cloned();
             state.apply_delete(key.clone(), rev);
 
             if let Some(p) = &prev {
@@ -1034,13 +1075,13 @@ impl Store {
         let keys_to_delete: Vec<Vec<u8>> = state
             .keys
             .iter()
-            .filter(|(_, ks)| ks.lease == id && !ks.deleted)
+            .filter(|(_, ks)| ks.lease == id && ks.is_alive())
             .map(|(k, _)| k.clone())
             .collect();
         let mut records = Vec::with_capacity(keys_to_delete.len());
         for key in &keys_to_delete {
             let rev = next_revision();
-            let prev = state.keys.get(key).filter(|k| !k.deleted).cloned();
+            let prev = state.keys.get(key).filter(|k| k.is_alive()).cloned();
             state.apply_delete(key.clone(), rev);
 
             if let Some(p) = &prev {
@@ -1103,7 +1144,7 @@ impl Store {
                 state
                     .keys
                     .iter()
-                    .filter(|(_, ks)| ks.lease == req.id && !ks.deleted)
+                    .filter(|(_, ks)| ks.lease == req.id && ks.is_alive())
                     .map(|(k, _)| k.clone())
                     .collect()
             } else {
@@ -1153,7 +1194,7 @@ impl Store {
         let state = self.state.read().await;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for (k, ks) in state.keys.iter() {
-            if ks.deleted {
+            if ks.delete_revision != 0 {
                 continue;
             }
             k.hash(&mut hasher);
@@ -1213,12 +1254,12 @@ impl Store {
                     let keys_to_delete: Vec<Vec<u8>> = s
                         .keys
                         .iter()
-                        .filter(|(_, ks)| ks.lease == id && !ks.deleted)
+                        .filter(|(_, ks)| ks.lease == id && ks.is_alive())
                         .map(|(k, _)| k.clone())
                         .collect();
                     for key in &keys_to_delete {
                         let rev = next_revision();
-                        let prev = s.keys.get(key).filter(|k| !k.deleted).cloned();
+                        let prev = s.keys.get(key).filter(|k| k.is_alive()).cloned();
                         s.apply_delete(key.clone(), rev);
 
                         if let Some(p) = &prev {
@@ -1264,7 +1305,7 @@ impl Store {
             snapshot_wal_size = state.wal.file.lock().unwrap().metadata()?.len();
             let mut recs = Vec::with_capacity(state.keys.len());
             for (key, ks) in state.keys.iter() {
-                if ks.deleted {
+                if ks.delete_revision != 0 {
                     continue;
                 }
                 let flags = if ks.lease != 0 { wal::HAS_LEASE } else { 0 };
@@ -1411,7 +1452,7 @@ fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
         // Keep the key in the map with deleted=true so that historical queries
         // can see it. Preserve the last known value in kv_bytes.
         if let Some(entry) = state.keys.get_mut(&key) {
-            entry.deleted = true;
+            
             entry.delete_revision = del_rev;
         }
         // If the key was never seen (WAL has delete-only records), insert it.
@@ -1421,9 +1462,9 @@ fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
             create_revision: del_rev,
             version: 0,
             lease: 0,
-            deleted: true,
+            
             delete_revision: del_rev,
-            has_been_deleted: false,
+            rebirth: false,
             kv_bytes: Bytes::from(rec.kv_bytes.clone()),
         });
         let event = WatchEvent {
@@ -1443,9 +1484,9 @@ fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
             create_revision: kv.create_revision as u64,
             version: kv.version,
             lease: kv.lease,
-            deleted: false,
+            
             delete_revision: 0,
-            has_been_deleted: false,
+            rebirth: false,
             kv_bytes: Bytes::from(rec.kv_bytes.clone()),
         };
         state.keys.insert(key.clone(), entry);
@@ -2728,7 +2769,233 @@ mod historical_tests {
             })
             .await
             .unwrap();
-        assert_eq!(resp.count, 2, "range [b, c\\x00) gives 2 keys (b, c) at rev — bb created later");
+        assert_eq!(resp.count, 2, "range [b, d) gives 2 keys (b, c) at rev — bb created later");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_delete_recreate() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        // First lifetime: create k1
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"first_life".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let first_rev = current_revision();
+
+        // Delete k1
+        store
+            .delete_range(etcdserverpb::DeleteRangeRequest {
+                key: b"k1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Second lifetime: recreate k1
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"second_life".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Query at first_rev: should see "first_life" from the first lifetime
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: first_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "k1 exists at first_rev (first lifetime)");
+        if let Some(kv_bytes) = resp.kvs.first() {
+            let kv = mvccpb::KeyValue::decode(&kv_bytes[..]).unwrap();
+            assert_eq!(
+                kv.value, b"first_life",
+                "value at first_rev should be from first lifetime"
+            );
+        }
+
+        // Query at current revision: should see "second_life"
+        let current = current_revision();
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: current as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "k1 exists at current (second lifetime)");
+        if let Some(kv_bytes) = resp.kvs.first() {
+            let kv = mvccpb::KeyValue::decode(&kv_bytes[..]).unwrap();
+            assert_eq!(
+                kv.value, b"second_life",
+                "current value should be from second lifetime"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_delete_at_exact_delete_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        store
+            .delete_range(etcdserverpb::DeleteRangeRequest {
+                key: b"k1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let del_rev = current_revision();
+
+        // Query exactly at delete revision: key should NOT be included
+        // (deleted at this rev, not before it)
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: del_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 0, "k1 deleted at del_rev should not appear");
+
+        // Query one before delete revision: key should exist
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: del_rev as i64 - 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "k1 exists one rev before delete");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_many_stale_keys_with_limit() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        // Create 5 keys
+        for i in 0u64..5 {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: format!("k{i}").into_bytes(),
+                    value: b"original".to_vec(),
+                    ..Default::default()
+                })
+                .await;
+        }
+        let target_rev = current_revision();
+
+        // Update all 5 keys after target_rev — all become stale
+        for i in 0u64..5 {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: format!("k{i}").into_bytes(),
+                    value: format!("updated_{i}").into_bytes(),
+                    ..Default::default()
+                })
+                .await;
+        }
+
+        // Query with limit=2 at target_rev: all keys stale, should return 2
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: target_rev as i64,
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 5, "count is total (5)");
+        assert_eq!(resp.kvs.len(), 2, "only 2 kvs returned");
+        assert!(resp.more, "more flag should be true");
+        if let Some(kv_bytes) = resp.kvs.first() {
+            let kv = mvccpb::KeyValue::decode(&kv_bytes[..]).unwrap();
+            assert_eq!(
+                kv.value, b"original",
+                "stale key should have original value"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_rebirth_forces_wal() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        // First lifetime
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"first".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let first_rev = current_revision();
+
+        // Delete
+        store
+            .delete_range(etcdserverpb::DeleteRangeRequest {
+                key: b"k1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Recreate (second lifetime, new create_revision)
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"second".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Query at first_rev: BTreeMap has rebirth=true, create_rev > first_rev
+        // → forces WAL scan to find "first" value from prior lifetime
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: first_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "k1 exists at first_rev (rebirth path)");
+        if let Some(kv_bytes) = resp.kvs.first() {
+            let kv = mvccpb::KeyValue::decode(&kv_bytes[..]).unwrap();
+            assert_eq!(
+                kv.value, b"first",
+                "rebirth WAL path should return first lifetime value"
+            );
+        }
 
         let _ = std::fs::remove_file(&path);
     }

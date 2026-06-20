@@ -108,7 +108,7 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
             buf.extend_from_slice(&rev.to_le_bytes());
             buf.extend_from_slice(&(state.keys.len() as u32).to_le_bytes());
             for (k, ks) in state.keys.iter() {
-                if ks.deleted {
+                if ks.delete_revision != 0 {
                     continue;
                 }
                 let key_len = (k.len() as u32).to_le_bytes();
