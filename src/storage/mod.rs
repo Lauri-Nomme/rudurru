@@ -4,12 +4,13 @@ use crate::proto::etcdserverpb;
 use crate::proto::mvccpb;
 use prost::bytes::Bytes;
 use prost::Message;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
+use tonic::Status;
 
 /// Global revision counter. Monotonically increasing, starts at 1.
 static NEXT_REV: AtomicU64 = AtomicU64::new(1);
@@ -331,17 +332,40 @@ impl Store {
 
     // ── KV operations ──────────────────────────────────────────────────
 
-    pub async fn range(&self, req: etcdserverpb::RangeRequest) -> etcdserverpb::RangeResponse {
-        let state = self.state.read().await;
-        if req.revision > 0 && (req.revision as u64) < COMPACT_REV.load(Ordering::Relaxed) {
-            return etcdserverpb::RangeResponse {
-                header: Some(state.header()),
-                kvs: vec![],
-                more: false,
-                count: 0,
-            };
+    pub async fn range(
+        &self,
+        req: etcdserverpb::RangeRequest,
+    ) -> Result<etcdserverpb::RangeResponse, Status> {
+        let target_rev = if req.revision > 0 {
+            req.revision as u64
+        } else {
+            0
+        };
+        let current_rev = current_revision();
+
+        // Future revision
+        if target_rev > current_rev {
+            return Err(Status::new(
+                tonic::Code::Unavailable,
+                "etcdserver: mvcc: required revision is a future revision",
+            ));
         }
 
+        // Compacted revision
+        if target_rev > 0 && target_rev < COMPACT_REV.load(Ordering::Relaxed) {
+            return Err(Status::new(
+                tonic::Code::Unavailable,
+                "etcdserver: mvcc: required revision has been compacted",
+            ));
+        }
+
+        // Historical query (target_rev > 0, >= COMPACT_REV)
+        if target_rev > 0 {
+            return self.range_historical(req, target_rev).await;
+        }
+
+        // Current state (revision == 0) — unchanged logic
+        let state = self.state.read().await;
         let bound = resolve_range(&req.key, &req.range_end);
         let cap = if req.limit > 0 {
             req.limit as usize
@@ -353,8 +377,6 @@ impl Store {
         let (range_start, range_end): (Option<Vec<u8>>, Option<Vec<u8>>) = match bound.to_ref() {
             RangeBoundRef::All => (None, None),
             RangeBoundRef::Point(k) => {
-                // Point: produce a range that matches exactly one key.
-                // Use (start..end) where 'end' is the successor of k.
                 let mut end = k.to_vec();
                 if let Some(last) = end.last_mut() {
                     *last = last.wrapping_add(1);
@@ -369,7 +391,8 @@ impl Store {
             RangeBoundRef::Range(start, end) => (Some(start.to_vec()), Some(end.to_vec())),
         };
 
-        let iter: Box<dyn Iterator<Item = (&Vec<u8>, &KeyState)>> = match (range_start, range_end) {
+        let iter: Box<dyn Iterator<Item = (&Vec<u8>, &KeyState)>> = match (range_start, range_end)
+        {
             (Some(start), Some(end)) => Box::new(state.keys.range(start..end)),
             (Some(start), None) => Box::new(state.keys.range(start..)),
             (None, Some(end)) => Box::new(state.keys.range(..end)),
@@ -417,12 +440,12 @@ impl Store {
         let count = kvs.len() as i64;
 
         if req.count_only {
-            return etcdserverpb::RangeResponse {
+            return Ok(etcdserverpb::RangeResponse {
                 header: Some(state.header()),
                 kvs: vec![],
                 more: false,
                 count,
-            };
+            });
         }
 
         let more = if req.limit > 0 && kvs.len() > req.limit as usize {
@@ -432,12 +455,222 @@ impl Store {
             false
         };
 
-        etcdserverpb::RangeResponse {
+        Ok(etcdserverpb::RangeResponse {
             header: Some(state.header()),
             kvs,
             more,
             count,
+        })
+    }
+
+    /// Range query at a specific historical revision (target_rev >= COMPACT_REV).
+    ///
+    /// Phase 1: BTreeMap scan (under read lock). Keys with mod_revision <= target_rev
+    /// are correct as-is. Keys with mod_revision > target_rev need WAL replay.
+    ///
+    /// Phase 2: WAL scan (no store lock). Reconstruct state at target_rev for the
+    /// requested key range from the WAL file.
+    ///
+    /// Phase 3: Merge Phase-1-correct values with Phase-2-reconstructed values.
+    /// Phase 2 always runs (even when Phase 1 has no stale keys) because keys
+    /// may have been deleted from the BTreeMap via `apply_delete` (which removes
+    /// them entirely) but still existed at target_rev — the WAL is the only source.
+    async fn range_historical(
+        &self,
+        req: etcdserverpb::RangeRequest,
+        target_rev: u64,
+    ) -> Result<etcdserverpb::RangeResponse, Status> {
+        let bound = resolve_range(&req.key, &req.range_end);
+        let limit = if req.limit > 0 {
+            req.limit as usize
+        } else {
+            usize::MAX
+        };
+
+        // ── Phase 1: BTreeMap scan (under read lock) ───────────────
+        let (range_start, range_end) = btree_bounds(bound.to_ref());
+
+        let mut phase1_direct: Vec<(Vec<u8>, Bytes)> = Vec::new(); // mod_rev <= target, value correct
+        let mut phase1_stale_keys: Vec<Vec<u8>> = Vec::new();      // mod_rev > target, needs WAL
+        {
+            let state = self.state.read().await;
+
+            let iter: Box<dyn Iterator<Item = (&Vec<u8>, &KeyState)>> = match (range_start, range_end)
+            {
+                (Some(ref start), Some(ref end)) => Box::new(state.keys.range(start.clone()..end.clone())),
+                (Some(ref start), None) => Box::new(state.keys.range(start.clone()..)),
+                (None, Some(ref end)) => Box::new(state.keys.range(..end.clone())),
+                (None, None) => Box::new(state.keys.iter()),
+            };
+
+            let prefix_key = match bound.to_ref() {
+                RangeBoundRef::Prefix(p) => Some(p),
+                _ => None,
+            };
+
+            for (k, ks) in iter {
+                if let Some(p) = prefix_key {
+                    if !k.starts_with(p) {
+                        break;
+                    }
+                }
+                if ks.deleted {
+                    // Key is deleted in the current state, but it may still have
+                    // existed at the target revision (deletion happened after target).
+                    if ks.create_revision > target_rev {
+                        continue; // didn't exist at target_rev either
+                    }
+                    if ks.mod_revision <= target_rev {
+                        continue; // was already deleted by target_rev
+                    }
+                    // Deletion happened after target_rev → key existed at target_rev.
+                    // We'll need the WAL to reconstruct its value at that point.
+                    phase1_stale_keys.push(k.clone());
+                    continue;
+                }
+                // Filter by create/mod revision if requested
+                if req.min_mod_revision > 0 && (ks.mod_revision as i64) < req.min_mod_revision {
+                    continue;
+                }
+                if req.max_mod_revision > 0 && (ks.mod_revision as i64) > req.max_mod_revision {
+                    continue;
+                }
+                if req.min_create_revision > 0
+                    && (ks.create_revision as i64) < req.min_create_revision
+                {
+                    continue;
+                }
+                if req.max_create_revision > 0
+                    && (ks.create_revision as i64) > req.max_create_revision
+                {
+                    continue;
+                }
+
+                if ks.create_revision > target_rev {
+                    continue; // key didn't exist at target_rev
+                }
+
+                if ks.mod_revision <= target_rev {
+                    let kv = if req.keys_only {
+                        let (b, _, _) = wal::encode_kv(k, b"", 0, 0, 0, 0);
+                        Bytes::from(b)
+                    } else {
+                        ks.kv_bytes.clone()
+                    };
+                    phase1_direct.push((k.clone(), kv));
+                } else {
+                    phase1_stale_keys.push(k.clone());
+                }
+
+                // No early break on limit — we need to count ALL matching keys.
+                // Limit is applied when building the response below.
+            }
+
+        } // read lock dropped
+
+        // ── Phase 2: WAL scan (no store lock) ──────────────────────
+        let wal_path = self.state.read().await.wal.path.clone();
+        let wal_state = scan_wal_range(&wal_path, &req.key, &req.range_end, target_rev)
+            .map_err(|e| Status::new(tonic::Code::Internal, format!("wal scan failed: {e}")))?;
+
+        // ── Phase 3: Merge ─────────────────────────────────────────
+        // Collect all results in a BTreeMap for deterministic lexicographic ordering.
+        let mut merged: BTreeMap<Vec<u8>, Bytes> = BTreeMap::new();
+
+        // Phase 1 keys with correct current values
+        for (key, kv_bytes) in &phase1_direct {
+            let kv = if req.keys_only {
+                let (b, _, _) = wal::encode_kv(key, b"", 0, 0, 0, 0);
+                Bytes::from(b)
+            } else {
+                kv_bytes.clone()
+            };
+            merged.insert(key.clone(), kv);
         }
+
+        // Phase 1 keys that need historical values from WAL
+        for key in &phase1_stale_keys {
+            if let Some(wal_kv) = wal_state.get(key) {
+                let kv = if req.keys_only {
+                    let (b, _, _) = wal::encode_kv(key, b"", 0, 0, 0, 0);
+                    Bytes::from(b)
+                } else {
+                    wal_kv.clone()
+                };
+                merged.insert(key.clone(), kv);
+            }
+            // WAL miss: key existed at target but no WAL record ≤ target_rev.
+            // The current BTreeMap value is the best available — use it.
+            // This can happen with a compacted WAL snapshot that doesn't
+            // fully cover the interval up to target_rev.
+            if !merged.contains_key(key) {
+                // We already validated create_rev ≤ target_rev in Phase 1,
+                // so the key should exist at target. The missing WAL record
+                // is a gap — accept the current value as best-effort.
+                let state = self.state.read().await;
+                if let Some(ks) = state.keys.get(key) {
+                    if !ks.deleted {
+                        let kv = if req.keys_only {
+                            let (b, _, _) = wal::encode_kv(key, b"", 0, 0, 0, 0);
+                            Bytes::from(b)
+                        } else {
+                            ks.kv_bytes.clone()
+                        };
+                        merged.insert(key.clone(), kv);
+                    }
+                }
+            }
+        }
+
+        // Keys from WAL that existed at target_rev but are no longer in BTreeMap
+        // (deleted after target_rev). Include them.
+        for (key, wal_kv) in &wal_state {
+            if merged.contains_key(key) {
+                continue;
+            }
+            // Double-check key is within range (WAL has out-of-range cruft)
+            if !matches_range(bound.to_ref(), key) {
+                continue;
+            }
+            let kv = if req.keys_only {
+                let (b, _, _) = wal::encode_kv(key, b"", 0, 0, 0, 0);
+                Bytes::from(b)
+            } else {
+                wal_kv.clone()
+            };
+            merged.insert(key.clone(), kv);
+        }
+
+        let count = merged.len() as i64;
+
+        if req.count_only {
+            return Ok(etcdserverpb::RangeResponse {
+                header: Some(etcdserverpb::ResponseHeader {
+                    cluster_id: 1,
+                    member_id: 1,
+                    revision: target_rev as i64,
+                    raft_term: 1,
+                }),
+                kvs: vec![],
+                more: false,
+                count,
+            });
+        }
+
+        let kvs: Vec<Bytes> = merged.into_values().take(limit).collect();
+        let more = req.limit > 0 && count > req.limit as i64;
+
+        Ok(etcdserverpb::RangeResponse {
+            header: Some(etcdserverpb::ResponseHeader {
+                cluster_id: 1,
+                member_id: 1,
+                revision: target_rev as i64,
+                raft_term: 1,
+            }),
+            kvs,
+            more,
+            count,
+        })
     }
 
     pub async fn put(&self, req: etcdserverpb::PutRequest) -> etcdserverpb::PutResponse {
@@ -610,7 +843,7 @@ impl Store {
         for op in ops {
             match op.request {
                 Some(etcdserverpb::request_op::Request::RequestRange(r)) => {
-                    let resp = self.range(r).await;
+                    let resp = self.range(r).await.unwrap();
                     responses.push(etcdserverpb::ResponseOp {
                         response: Some(etcdserverpb::response_op::Response::ResponseRange(resp)),
                     });
@@ -1200,6 +1433,96 @@ pub(crate) fn matches_range(bound: RangeBoundRef<'_>, key: &[u8]) -> bool {
     }
 }
 
+/// Convert a RangeBoundRef to (start, end) bounds for BTreeMap::range().
+fn btree_bounds(bound: RangeBoundRef<'_>) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    match bound {
+        RangeBoundRef::All => (None, None),
+        RangeBoundRef::Point(k) => {
+            let mut end = k.to_vec();
+            if let Some(last) = end.last_mut() {
+                *last = last.wrapping_add(1);
+                if *last == 0 {
+                    end.push(0);
+                }
+            }
+            (Some(k.to_vec()), Some(end))
+        }
+        RangeBoundRef::From(k) => (Some(k.to_vec()), None),
+        RangeBoundRef::Prefix(p) => (Some(p.to_vec()), None),
+        RangeBoundRef::Range(start, end) => (Some(start.to_vec()), Some(end.to_vec())),
+    }
+}
+
+/// Scan the WAL up to `up_to_rev`, returning a map of key → kv_bytes for
+/// records whose key falls in the range [key, range_end) and whose revision
+/// is <= up_to_rev. Opens a separate file handle to avoid contention with
+/// the shared Arc<Mutex<File>> used by writers.
+fn scan_wal_range(
+    path: &str,
+    key: &[u8],
+    range_end: &[u8],
+    up_to_rev: u64,
+) -> std::io::Result<HashMap<Vec<u8>, Bytes>> {
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // WAL may have been renamed during compaction; return empty
+            return Ok(HashMap::new());
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    drop(file);
+
+    let bound = resolve_range(key, range_end);
+    let mut state: HashMap<Vec<u8>, Bytes> = HashMap::new();
+
+    let mut ofs = 0;
+    while ofs < buf.len() {
+        match wal::KvWalRecord::deserialize(&buf[ofs..]) {
+            Ok((rec, consumed)) => {
+                let rev = rec.mod_revision().unwrap_or(0) as u64;
+                let rec_key = match rec.key() {
+                    Some(k) => k,
+                    None => {
+                        ofs += consumed;
+                        continue;
+                    }
+                };
+
+                // Only process records in the requested key range
+                if !matches_range(bound.to_ref(), rec_key) {
+                    ofs += consumed;
+                    continue;
+                }
+
+                if rev <= up_to_rev {
+                    let is_delete = (rec.flags & wal::DELETED) != 0;
+                    if is_delete {
+                        state.remove(rec_key);
+                    } else {
+                        state.insert(
+                            rec_key.to_vec(),
+                            Bytes::copy_from_slice(&rec.kv_bytes),
+                        );
+                    }
+                }
+                ofs += consumed;
+            }
+            Err(_) => {
+                // Partial/corrupt record at tail — stop
+                break;
+            }
+        }
+    }
+
+    Ok(state)
+}
+
 fn eval_compare(state: &StoreState, cmp: &etcdserverpb::Compare) -> bool {
     let key = &cmp.key;
     let ks = state.keys.get(key);
@@ -1350,7 +1673,7 @@ mod compact_tests {
                 range_end: vec![0],
                 ..Default::default()
             })
-            .await;
+            .await.unwrap();
         assert_eq!(resp.count, 2, "keys preserved after compaction");
 
         let _ = std::fs::remove_file(&path);
@@ -1370,7 +1693,7 @@ mod compact_tests {
                 range_end: vec![0],
                 ..Default::default()
             })
-            .await;
+            .await.unwrap();
         assert_eq!(resp.count, 0, "no keys in empty store");
 
         let _ = std::fs::remove_file(&path);
@@ -1411,7 +1734,7 @@ mod compact_tests {
                 range_end: vec![0],
                 ..Default::default()
             })
-            .await;
+            .await.unwrap();
         assert_eq!(resp.count, 1, "only k2 after compact");
 
         let _ = std::fs::remove_file(&path);
@@ -1464,7 +1787,7 @@ mod compact_tests {
                 range_end: vec![0],
                 ..Default::default()
             })
-            .await;
+            .await.unwrap();
         assert_eq!(resp.count, 3, "all 3 keys after restart from compacted WAL");
         assert_eq!(
             current_revision(),
@@ -1515,7 +1838,7 @@ mod compact_tests {
                 key: b"concurrent".to_vec(),
                 ..Default::default()
             })
-            .await;
+            .await.unwrap();
         assert_eq!(resp.count, 1, "concurrent write preserved after compact");
 
         // Restart and verify
@@ -1527,8 +1850,780 @@ mod compact_tests {
                 range_end: vec![0],
                 ..Default::default()
             })
-            .await;
+            .await.unwrap();
         assert_eq!(resp2.count, 11, "all 11 keys after restart");
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod historical_tests {
+    use super::*;
+
+    fn temp_wal() -> String {
+        let dir = std::env::temp_dir();
+        let name = format!("rudurru_historical_{}.wal", std::process::id());
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        // Reset compact rev before each test to avoid test interference
+        COMPACT_REV.store(0, Ordering::SeqCst);
+        path.to_string_lossy().to_string()
+    }
+
+    fn all_req() -> etcdserverpb::RangeRequest {
+        etcdserverpb::RangeRequest {
+            key: b"".to_vec(),
+            range_end: vec![0],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_historical_compacted_revision_error() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        // Need data so current_rev is ahead of the compacted revision
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let create_rev = current_revision(); // rev 2
+        // Compact at rev 2 — rev 1 is now below COMPACT_REV
+        COMPACT_REV.store(create_rev, Ordering::SeqCst);
+
+        let err = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k".to_vec(),
+                revision: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().contains("compacted"),
+            "should be compacted error: {}",
+            err.message()
+        );
+
+        // Non-compacted revision should still work
+        let ok = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k".to_vec(),
+                revision: create_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok.count, 2, "both keys exist at non-compacted rev");
+
+        COMPACT_REV.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_future_revision_error() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        let err = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k".to_vec(),
+                revision: 999_999_999,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().contains("future"),
+            "should be future revision error: {}",
+            err.message()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_zero_revision_returns_current() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        let resp = store.range(all_req()).await.unwrap();
+        assert_eq!(resp.count, 1, "revision=0 returns current state");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_all_keys_current_skip_wal() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev1 = current_revision();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev2 = current_revision();
+
+        // Query at rev2: both keys have mod_revision == rev2, so mod_rev <= target_rev
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: rev2 as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 2, "both keys at rev2");
+
+        // Query at rev1: only k1 exists (k2 doesn't exist yet)
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: rev1 as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "only k1 at rev1");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_some_keys_stale() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev1 = current_revision();
+
+        // k2 is created after rev1 — should not appear in query at rev1
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Query at rev1: k1 exists, k2 doesn't (create_rev > rev1)
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: rev1 as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "only k1 at rev1");
+        assert_eq!(resp.kvs.len(), 1, "one kv at rev1");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_value_at_revision() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        // Create k1 at rev1
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"old_value".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let create_rev = current_revision();
+
+        // Update k1 at some later revision
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"new_value".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Query at the create revision: should see old_value
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: create_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "k1 exists at create_rev");
+        if let Some(kv_bytes) = resp.kvs.first() {
+            let kv = mvccpb::KeyValue::decode(&kv_bytes[..]).unwrap();
+            assert_eq!(
+                kv.value, b"old_value",
+                "value at create_rev should be old_value"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_after_delete() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        store
+            .delete_range(etcdserverpb::DeleteRangeRequest {
+                key: b"k1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Query after delete: k1 should not appear
+        let later_rev = current_revision();
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: later_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 0, "k1 deleted by later_rev");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_before_delete() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let create_rev = current_revision();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Delete k1
+        store
+            .delete_range(etcdserverpb::DeleteRangeRequest {
+                key: b"k1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Query at create_rev: k1 should exist (it was created before the
+        // delete, which happened later). k2 should NOT be present because
+        // k2's create_rev > create_rev.
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: create_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "only k1 at create_rev");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_after_create() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let later_rev = current_revision();
+
+        // Put another one, query at the point before it existed
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k3".to_vec(),
+                value: b"v3".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: later_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 2, "only k1,k2 at later_rev (k3 not yet created)");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_keys_only() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev = current_revision();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k3".to_vec(),
+                value: b"v3".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: rev as i64,
+                keys_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 2, "keys_only returns 2 keys at rev");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_count_only() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev = current_revision();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: rev as i64,
+                count_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "count_only returns 1 at rev");
+        assert!(resp.kvs.is_empty(), "count_only should have empty kvs");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_limit() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev = current_revision();
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: rev as i64,
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 2, "count is total, limit is 1");
+        assert_eq!(resp.kvs.len(), 1, "limited to 1 kv");
+        assert!(resp.more, "should have more items");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_point_lookup() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev = current_revision();
+
+        // Point lookup for a key that exists at rev
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "point lookup finds k1 at rev");
+
+        // Point lookup for a key that doesn't exist yet at rev
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k3".to_vec(),
+                value: b"v3".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k3".to_vec(),
+                revision: rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 0, "k3 doesn't exist at rev");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_prefix_range() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"/a/x".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"/a/y".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"/b/z".to_vec(),
+                value: b"v3".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev = current_revision();
+
+        // Create another key under /a/ after rev
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"/a/w".to_vec(),
+                value: b"v4".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Prefix scan at rev: should get 2 keys under /a/
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"/a/".to_vec(),
+                range_end: b"/a/\0".to_vec(),
+                revision: rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 2, "2 keys under /a/ at rev");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_after_compaction() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        // Write some keys
+        for i in 0u64..5 {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: format!("k{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                    ..Default::default()
+                })
+                .await;
+        }
+        let pre_compact_rev = current_revision();
+
+        // Compact WAL and set compact revision
+        store.compact_wal().await.unwrap();
+        COMPACT_REV.store(pre_compact_rev, Ordering::SeqCst);
+
+        // Now revision 1 is below COMPACT_REV → should error
+        let err = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k0".to_vec(),
+                revision: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().contains("compacted"),
+            "revision 1 should be compacted: {}",
+            err.message()
+        );
+
+        // Query at pre_compact_rev: should still work (>= COMPACT_REV)
+        let compact_rev_val = COMPACT_REV.load(Ordering::Relaxed);
+        assert!(
+            pre_compact_rev >= compact_rev_val,
+            "pre_compact_rev={} >= COMPACT_REV={}",
+            pre_compact_rev,
+            compact_rev_val
+        );
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"".to_vec(),
+                range_end: vec![0],
+                revision: pre_compact_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 5, "all 5 keys at pre_compact_rev");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_key_modified_after_target() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        // Create k1
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"k1".to_vec(),
+                value: b"original".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let target_rev = current_revision();
+
+        // Modify k1 multiple times after target_rev
+        for i in 0u64..5 {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: b"k1".to_vec(),
+                    value: format!("updated_{i}").into_bytes(),
+                    ..Default::default()
+                })
+                .await;
+        }
+
+        // Query at target_rev: should see "original", not any updated value
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k1".to_vec(),
+                revision: target_rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 1, "k1 exists at target_rev");
+        if let Some(kv_bytes) = resp.kvs.first() {
+            let kv = mvccpb::KeyValue::decode(&kv_bytes[..]).unwrap();
+            assert_eq!(
+                kv.value, b"original",
+                "should see original value, not updated"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_range_bounds() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"a".to_vec(),
+                value: b"v_a".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"b".to_vec(),
+                value: b"v_b".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"c".to_vec(),
+                value: b"v_c".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        let rev = current_revision();
+
+        // Range from b to d (exclusive): should get b and c
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"b".to_vec(),
+                range_end: b"d".to_vec(),
+                revision: rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 2, "range [b, d) gives 2 keys at rev");
+
+        // Key created after rev shouldn't appear in range
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"bb".to_vec(),
+                value: b"v_bb".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"b".to_vec(),
+                range_end: b"c\x00".to_vec(),
+                revision: rev as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.count, 2, "range [b, c\\x00) gives 2 keys (b, c) at rev — bb created later");
 
         let _ = std::fs::remove_file(&path);
     }

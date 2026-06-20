@@ -20,7 +20,7 @@ impl etcdserverpb::kv_server::Kv for Kv {
         &self,
         req: Request<etcdserverpb::RangeRequest>,
     ) -> Result<Response<etcdserverpb::RangeResponse>, Status> {
-        let resp = self.store.range(req.into_inner()).await;
+        let resp = self.store.range(req.into_inner()).await?;
         Ok(Response::new(resp))
     }
 
