@@ -262,7 +262,6 @@ impl StoreState {
                     _ => {}
                 }
             }
-
             if !should_send {
                 continue;
             }
@@ -3242,5 +3241,198 @@ mod historical_tests {
         }).await.unwrap();
         assert_eq!(resp.count, 1, "max_create_revision: only k1");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+#[allow(unused)]
+mod unsupported_features_tests {
+    use super::*;
+
+    /// etcd RangeRequest.sort_order / sort_target are not implemented.
+    /// The server ignores these fields and always returns keys in
+    /// lexicographic (BTreeMap) order regardless of sort_order or sort_target.
+    #[test]
+    #[ignore]
+    fn test_sort_order_is_not_supported() {
+        // Expected: RangeRequest with sort_order=ASCEND, sort_target=VERSION
+        // should return keys sorted by version, not by key.
+        // Currently ignored because sorting is not implemented.
+    }
+
+    /// etcd RangeRequest.serializable flag is not implemented.
+    /// All reads use the same code path regardless of this flag.
+    #[test]
+    #[ignore]
+    fn test_serializable_flag_is_not_supported() {
+        // Expected: serializable=true would allow stale reads without
+        // consensus. Currently ignored because the flag has no effect.
+    }
+
+    /// etcd Compare.range_end field is not implemented.
+    /// Txn compare operations only support point key comparisons,
+    /// not range comparisons like "all keys with prefix X have value Y".
+    #[test]
+    #[ignore]
+    fn test_compare_range_end_is_not_supported() {
+        // Expected: Compare with range_end set would compare against
+        // all keys in the range. Currently only point key compares work.
+    }
+
+    /// etcd WatchCreateRequest.fragment is not implemented.
+    /// Large watch responses are never split into multiple chunks.
+    #[test]
+    #[ignore]
+    fn test_watch_fragment_is_not_supported() {
+        // Expected: when fragment=true and a response exceeds the message
+        // size, the server splits it across multiple WatchResponse messages.
+        // Currently all events are sent in a single response.
+    }
+
+    /// etcd WatchCreateRequest.progress_notify automatic notifications
+    /// are not implemented. The flag is stored but no background task
+    /// sends periodic progress notifications to watchers with this flag.
+    #[test]
+    #[ignore]
+    fn test_watch_progress_notify_auto_is_not_supported() {
+        // Expected: watchers with progress_notify=true receive periodic
+        // empty WatchResponses when there are no events. Currently the
+        // flag is stored but no background task triggers notifications.
+    }
+
+    /// etcd WatchProgressRequest is implemented (manual progress request),
+    /// but NOT automatic progress notifications. See test above.
+    #[test]
+    #[ignore]
+    fn test_watch_progress_notify_periodic_is_not_supported() {
+        // Expected: server sends progress notifications at regular
+        // intervals for watchers with progress_notify=true.
+        // Currently only manual WatchProgressRequest works.
+    }
+
+    /// etcd CompactionRequest.physical flag is not implemented.
+    /// The compact operation always updates COMPACT_REV but does not
+    /// wait for physical removal of compacted entries from storage.
+    /// Since Rudurru uses WAL+in-memory BTreeMap (no backend DB),
+    /// physical compaction is a no-op.
+    #[test]
+    #[ignore]
+    fn test_compact_physical_flag_is_not_supported() {
+        // Expected: when physical=true, the RPC waits until compacted
+        // entries are physically removed from the backend database.
+        // Currently the flag is ignored.
+    }
+
+    /// etcd Auth service is not implemented.
+    /// All authentication and authorization RPCs return
+    /// Status::unimplemented("not implemented").
+    #[test]
+    #[ignore]
+    fn test_auth_enable_is_not_supported() {
+        // Expected: AuthEnable would enable RBAC. Currently unimplemented.
+    }
+
+    #[test]
+    #[ignore]
+    fn test_auth_disable_is_not_supported() {
+        // Expected: AuthDisable would disable RBAC. Currently unimplemented.
+    }
+
+    #[test]
+    #[ignore]
+    fn test_auth_authenticate_is_not_supported() {
+        // Expected: Authenticate returns a token. Currently unimplemented.
+    }
+
+    #[test]
+    #[ignore]
+    fn test_auth_user_management_is_not_supported() {
+        // Expected: UserAdd/Get/List/Delete/ChangePassword, GrantRole,
+        // RevokeRole. Currently all unimplemented.
+    }
+
+    #[test]
+    #[ignore]
+    fn test_auth_role_management_is_not_supported() {
+        // Expected: RoleAdd/Get/List/Delete, GrantPermission,
+        // RevokePermission. Currently all unimplemented.
+    }
+
+    /// etcd Cluster service: MemberAdd, MemberRemove, MemberUpdate,
+    /// and MemberPromote return unimplemented (single-node cluster).
+    /// Only MemberList is implemented (returns self).
+    #[test]
+    #[ignore]
+    fn test_cluster_member_add_is_not_supported() {
+        // Expected: adds a member to the raft cluster.
+        // Currently unimplemented — rudurru is single-node.
+    }
+
+    #[test]
+    #[ignore]
+    fn test_cluster_member_remove_is_not_supported() {
+        // Expected: removes a member. Currently unimplemented.
+    }
+
+    #[test]
+    #[ignore]
+    fn test_cluster_member_update_is_not_supported() {
+        // Expected: updates member peer URLs. Currently unimplemented.
+    }
+
+    #[test]
+    #[ignore]
+    fn test_cluster_member_promote_is_not_supported() {
+        // Expected: promotes a learner to voting member. Currently unimplemented.
+    }
+
+    /// etcd Maintenance.MoveLeader is not implemented.
+    /// Since rudurru is single-node with no Raft, there is no leader
+    /// to transfer.
+    #[test]
+    #[ignore]
+    fn test_maintenance_move_leader_is_not_supported() {
+        // Expected: transfers leadership to another member.
+        // Currently unimplemented — single-node cluster.
+    }
+
+    /// etcd RangeStream is not implemented.
+    /// This is a newer (etcd 3.7) streaming variant of Range.
+    #[test]
+    #[ignore]
+    fn test_range_stream_is_not_supported() {
+        // Expected: streaming range response in chunks.
+        // Currently unimplemented.
+    }
+
+    /// Txn snapshot isolation: txn-internal range calls do NOT see
+    /// their own uncommitted writes (no dirty reads). The write lock
+    /// is dropped before executing txn ops, so concurrent reads may
+    /// interleave.
+    #[test]
+    #[ignore]
+    fn test_txn_snapshot_isolation_is_not_supported() {
+        // Expected: within a transaction, all reads see a consistent
+        // snapshot including the transaction's own pending writes.
+        // Currently the write lock is released before executing ops,
+        // so the txn does not see its own modifications.
+    }
+
+    /// Put ignore_value / ignore_lease on non-existent key:
+    /// etcd returns an error when ignore_value or ignore_lease is set
+    /// and the key does not exist. Our implementation currently uses
+    /// unwrap_or_default/fallback instead of returning an error.
+    #[test]
+    #[ignore]
+    fn test_put_ignore_value_on_missing_key_should_error() {
+        // Expected: Err with "key not found" when ignore_value is set
+        // on a non-existent key. Currently no error is returned.
+    }
+
+    #[test]
+    #[ignore]
+    fn test_put_ignore_lease_on_missing_key_should_error() {
+        // Expected: Err with "key not found" when ignore_lease is set
+        // on a non-existent key. Currently no error is returned.
     }
 }

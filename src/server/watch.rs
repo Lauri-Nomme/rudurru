@@ -38,6 +38,17 @@ fn event_to_proto(event: &WatchEvent) -> mvccpb::Event {
     }
 }
 
+fn should_send_event(filters: &[i32], event_type: i32) -> bool {
+    for &f in filters {
+        match f {
+            0 if event_type == 0 => return false,
+            1 if event_type == 1 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 fn kvrec_to_event(rec: &wal::KvWalRecord) -> Option<WatchEvent> {
     let deleted = (rec.flags & wal::DELETED) != 0;
     let rev = rec.mod_revision().unwrap_or(0) as u64;
@@ -393,7 +404,9 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
                     None => return,
                 };
                 for ctx in &active {
-                    if rev >= ctx.start_revision && storage::matches_range(ctx.bound.to_ref(), key)
+                    if rev >= ctx.start_revision
+                        && storage::matches_range(ctx.bound.to_ref(), key)
+                        && should_send_event(&ctx.filters, event.event_type as i32)
                     {
                         let _ = ctx.event_tx.send(event.clone());
                     }
@@ -424,7 +437,9 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
             None => return,
         };
         for ctx in &active {
-            if storage::matches_range(ctx.bound.to_ref(), key) {
+            if storage::matches_range(ctx.bound.to_ref(), key)
+                && should_send_event(&ctx.filters, event.event_type as i32)
+            {
                 let _ = ctx.event_tx.send(event.clone());
             }
         }

@@ -3,6 +3,55 @@ use etcd_client::*;
 mod common;
 
 #[tokio::test]
+async fn test_put_prev_kv() {
+    let mut client = common::connect().await;
+    let key = key!("kv/put_prev");
+    client.put(key.as_str(), "first", None).await.unwrap();
+
+    let opts = Some(PutOptions::new().with_prev_key());
+    let resp = client.put(key.as_str(), "second", opts).await.unwrap();
+    let prev = resp.prev_key().expect("prev_key should be present");
+    assert_eq!(prev.value(), b"first");
+
+    // First put on a key should return no prev_key
+    let key2 = key!("kv/put_prev2");
+    let opts2 = Some(PutOptions::new().with_prev_key());
+    let resp2 = client.put(key2.as_str(), "sole", opts2).await.unwrap();
+    assert!(resp2.prev_key().is_none(), "no prev_key on first put");
+}
+
+#[tokio::test]
+async fn test_delete_prev_kv() {
+    let mut client = common::connect().await;
+    let prefix = format!("del_prev/{}", rand::random::<u16>());
+    client.put(format!("{prefix}/a"), "A", None).await.unwrap();
+    client.put(format!("{prefix}/b"), "B", None).await.unwrap();
+
+    let opts = Some(DeleteOptions::new().with_prefix().with_prev_key());
+    let resp = client.delete(format!("{prefix}/"), opts).await.unwrap();
+    assert_eq!(resp.deleted(), 2);
+    let prevs = resp.prev_kvs();
+    assert_eq!(prevs.len(), 2);
+    assert_eq!(prevs[0].value(), b"A");
+    assert_eq!(prevs[1].value(), b"B");
+}
+
+#[tokio::test]
+async fn test_range_count_only() {
+    let mut client = common::connect().await;
+    let prefix = format!("count_only/{}", rand::random::<u16>());
+
+    for i in 0..5 {
+        client.put(format!("{prefix}/k{i}"), "val", None).await.unwrap();
+    }
+
+    let opts = Some(GetOptions::new().with_prefix().with_count_only());
+    let resp = client.get(format!("{prefix}/"), opts).await.unwrap();
+    assert_eq!(resp.count(), 5);
+    assert!(resp.kvs().is_empty(), "count_only should return no kvs");
+}
+
+#[tokio::test]
 async fn test_put_and_get() {
     let mut client = common::connect().await;
     let key = key!("kv/put_get");

@@ -1,3 +1,5 @@
+use etcd_client::*;
+
 mod common;
 
 #[tokio::test]
@@ -7,6 +9,47 @@ async fn test_status() {
     let status = client.status().await.unwrap();
     assert!(!status.version().is_empty());
     assert!(status.db_size() > 0);
+}
+
+#[tokio::test]
+async fn test_status_full() {
+    let mut client = common::connect().await;
+
+    let status = client.status().await.unwrap();
+    assert!(!status.version().is_empty(), "version should not be empty");
+    assert!(status.db_size() > 0, "db_size should be > 0");
+    assert!(status.leader() > 0, "leader should be set");
+    assert!(status.raft_index() > 0, "raft_index should be > 0");
+}
+
+#[tokio::test]
+async fn test_alarm_get() {
+    let mut client = common::connect().await;
+
+    let resp = client.alarm(AlarmAction::Get, AlarmType::None, None).await.unwrap();
+    assert!(resp.header().is_some(), "alarm response should have header");
+    assert!(resp.alarms().is_empty(), "no alarms should be active");
+}
+
+#[tokio::test]
+async fn test_hash_kv() {
+    let mut client = common::connect().await;
+
+    client.put("hashkv_a", "data_a", None).await.unwrap();
+    client.put("hashkv_b", "data_b", None).await.unwrap();
+    let get = client.get("hashkv_b", None).await.unwrap();
+    let rev = get.header().unwrap().revision();
+
+    let resp = client.hash_kv(rev).await.unwrap();
+    assert!(resp.hash() != 0, "hash_kv should return a non-zero hash");
+    assert!(resp.header().is_some(), "hash_kv should have a header");
+    assert!(resp.compact_version() >= 0, "compact_version should be >= 0");
+
+    client.put("hashkv_c", "data_c", None).await.unwrap();
+    let get2 = client.get("hashkv_c", None).await.unwrap();
+    let rev2 = get2.header().unwrap().revision();
+    let resp2 = client.hash_kv(rev2).await.unwrap();
+    assert_ne!(resp.hash(), resp2.hash(), "hash should differ with more keys");
 }
 
 #[tokio::test]
