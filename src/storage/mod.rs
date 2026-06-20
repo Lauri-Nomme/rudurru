@@ -617,6 +617,8 @@ impl Store {
 
             tracing::debug!(
                 target_rev,
+                key = %String::from_utf8_lossy(&req.key),
+                range_end = %String::from_utf8_lossy(&req.range_end),
                 direct = phase1_direct.len(),
                 stale = phase1_stale_keys.len(),
                 elapsed_us = t0.elapsed().as_micros(),
@@ -632,6 +634,8 @@ impl Store {
                 let count = phase1_direct.len() as i64;
                 tracing::debug!(
                     target_rev,
+                    key = %String::from_utf8_lossy(&req.key),
+                    range_end = %String::from_utf8_lossy(&req.range_end),
                     count,
                     elapsed_us = t0.elapsed().as_micros(),
                     "historical_range phase1_only"
@@ -675,6 +679,8 @@ impl Store {
         // after target_rev and needs historical value reconstruction.
         tracing::debug!(
             target_rev,
+            key = %String::from_utf8_lossy(&req.key),
+            range_end = %String::from_utf8_lossy(&req.range_end),
             stale_keys = phase1_stale_keys.len(),
             elapsed_us = t0.elapsed().as_micros(),
             "historical_range phase2 starting wal scan"
@@ -685,6 +691,8 @@ impl Store {
 
         tracing::debug!(
             target_rev,
+            key = %String::from_utf8_lossy(&req.key),
+            range_end = %String::from_utf8_lossy(&req.range_end),
             wal_records = wal_state.len(),
             elapsed_us = t0.elapsed().as_micros(),
             "historical_range phase2 done"
@@ -762,6 +770,8 @@ impl Store {
 
         tracing::debug!(
             target_rev,
+            key = %String::from_utf8_lossy(&req.key),
+            range_end = %String::from_utf8_lossy(&req.range_end),
             total_keys = count,
             from_phase1 = phase1_direct.len(),
             from_wal = count.saturating_sub(phase1_direct.len() as i64),
