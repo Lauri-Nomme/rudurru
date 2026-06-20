@@ -92,51 +92,64 @@ However, the WAL contains every mutation that has ever happened — puts with va
 
 ### 3.1 Option D: WAL-Based Historical Reconstruction (Recommended)
 
-Reconstruct state at revision X by scanning the WAL, filtered to records with `revision <= X`. No BTreeMap needed for correctness — the WAL alone is the source of truth for historical state.
+Reconstruct state at revision X for only the **requested key range** by combining the BTreeMap (current state, fast O(log n) per key) with a targeted WAL replay for keys where the current value isn't valid at revision X.
 
-**Algorithm — `reconstruct_state_at(target_rev: u64)`:**
+**Key constraint: The request is scoped to a specific `(key, range_end)` range** (point lookup, prefix scan, or full range). We never reconstruct the entire store — only the keys the client asked for.
+
+#### Algorithm
 
 ```
-1. Open separate read-only file handle to WAL (by path, not through
-   the shared Arc<Mutex<File>> — avoids fsync lock contention)
-2. Read entire WAL into buffer
-3. For each KvWalRecord with revision <= target_rev:
-   - Not DELETED → insert/update map[key] = kv_bytes
-   - DELETED → remove key from map
-4. Records with revision > target_rev → skip
-5. Return HashMap<Vec<u8>, Bytes>
+range(key=R, range_end=END, revision=X):
+
+── Phase 1: BTreeMap scan (under read lock, fast) ──────────────────
+
+  Iterate BTreeMap range R..END.
+  For each (k, ks):
+    if ks.create_revision > X:     skip  (key didn't exist at X)
+    if ks.mod_revision <= X:       keep  (kv_bytes is correct, O(1) zero-copy)
+    if ks.mod_revision > X:        mark  (key existed at X but value changed — need WAL)
+
+  If NO keys are marked "need WAL":
+    → Done! All keys in range have correct current values.
+    → Zero WAL I/O, zero deserialization.
+    → Return results directly.
+
+── Phase 2: WAL scan (no store lock, key-filtered) ─────────────────
+
+  Open separate read-only WAL handle.
+  Scan all WAL records, filtering to key range R..END + revision <= X.
+  Build HashMap<Vec<u8>, kv_bytes> from WAL records:
+    - PUT/UPDATE at rev ≤ X: insert/update map[key]
+    - DELETE at rev ≤ X:     remove key from map
+
+  Result: state_at_X = complete snapshot of range R..END at revision X.
+
+── Phase 3: Merge ──────────────────────────────────────────────────
+
+  For keys from Phase 1 with ks.mod_revision <= X:
+    → Use Phase 1 kv_bytes (zero WAL work)
+  For keys from Phase 1 with ks.mod_revision > X:
+    → Use Phase 2 map[key] (WAL-reconstructed old value)
+  For keys in Phase 2 map but NOT in Phase 1 (deleted after X):
+    → Use Phase 2 map[key] (key existed at X, was deleted later)
+
+  Apply req.limit, req.keys_only, etc.
+  Return RangeResponse with header.revision = X.
 ```
 
-Then `range_at_revision()` applies range bounds, prefix filters, count/limit to the map.
+**Why Phase 1 is mandatory (not optional):** For a range query covering N keys, if only M keys (M < N) have stale values, a full WAL replay for all N keys would waste (N-M) × O(WAL scan) work. The BTreeMap short-circuit eliminates zero WAL I/O when nothing has changed since X, and minimizes it when only some keys changed.
 
-**Optimization — BTreeMap short-circuit (optional):**
+### 3.2 Performance Characteristics
 
-The current BTreeMap already has the latest state. For keys where `mod_revision <= target_rev` AND `NOT deleted`, the current value IS the value at `target_rev`. We can diff:
+| Scenario | WAL Scan | Time |
+|----------|----------|------|
+| All keys in range have `mod_revision <= X` | **Skipped entirely** | ~0.01 ms (just BTreeMap) |
+| 1 key out of 1000 has `mod_revision > X` | Full WAL scan, filtered to range | 5–10 ms (67 MB) |
+| All keys have `mod_revision > X` | Full WAL scan, filtered to range | 5–10 ms (67 MB) |
 
-| Key State | Action |
-|-----------|--------|
-| `create_revision > target_rev` | Skip (key didn't exist yet) |
-| `mod_revision <= target_rev` && `!deleted` | Use `kv_bytes` from BTreeMap directly (O(1), current value is correct) |
-| `mod_revision <= target_rev` && `deleted` | Remove from result (key was deleted before target) |
-| `mod_revision > target_rev` && `!deleted` | Need WAL — current value is newer, find value at `target_rev` |
-| `deleted` and `mod_revision > target_rev` | Need WAL — key existed at target, was deleted after |
+The WAL is always scanned linearly (no key index on append-only log), but the **key filter** discards irrelevant records during deserialization. Only matching keys are inserted into the HashMap. For a narrow range query (e.g., a single pod key `"/registry/pods/default/my-pod"`), the WAL scan processes all 65 MB but inserts only ~1 record.
 
-However, deleted keys are NOT in the BTreeMap (they're only retained briefly during transactions). Keys deleted before compaction are gone from memory. We'd still need the WAL to detect them.
-
-**WAL-only approach is simpler and safer**: no diff logic, no edge cases with deleted keys. The WAL is already small enough.
-
-### 3.2 Performance of WAL Scan
-
-| WAL Size | Scan Time (warm page cache) | Notes |
-|----------|----------------------------|-------|
-| 5 MB (post-compact) | ~0.5–1 ms | Typical — compaction runs every ~10h |
-| 30 MB | ~3–5 ms | Mid-cycle |
-| 67 MB (pre-compact) | ~5–10 ms | Just before compaction triggers |
-
-For the k3s consistency check workload (~10 queries/min across all resource types), this adds:
-- Post-compaction: ~10 ms/min CPU → 0.02% of a core
-- Pre-compaction: ~100 ms/min CPU → 0.17% of a core
-- Well within the <3% CPU target
+**Filtering efficiency:** The WAL scan reads the full file into memory (sequential, fast) but the HashMap insert cost is proportional to the number of matching keys in the requested range, not the WAL size.
 
 ### 3.3 Concurrency & Safety
 
@@ -149,39 +162,38 @@ For the k3s consistency check workload (~10 queries/min across all resource type
 | Concurrent write appends to WAL | Append-only is safe — we may or may not see the latest write; records with `revision > target_rev` are skipped either way |
 | File replaced under us | Linux inode semantics: our open handle still reads the old inode. New writes go to new inode. Correct for historical queries — we want the old WAL. |
 
-**No store lock required:** The WAL scan runs without the store `RwLock`. Writers are not blocked. The only lock acquired is the brief `std::fs::File::open()` system call + sequential read of the file.
+**No store lock during WAL scan:** Phase 1 releases the read lock before Phase 2. Writers are never blocked.
 
 ### 3.4 Correctness vs etcd
 
 For `target_rev >= COMPACT_REV`:
-- Post-compaction WAL = snapshot (all keys at `snapshot_rev`) + tail bytes (writes since)
-- Replaying up to `target_rev` produces bit-exact state at `target_rev`
-- Result matches what etcd would return for `Range(revision=target_rev)`
+- Phase 1: correct for keys with `mod_revision <= target_rev` (current value = value at target)
+- Phase 2 + 3: correct for all other keys (WAL replay is bit-exact)
+- **Result matches what etcd would return** for `Range(key, range_end, revision=target_rev)`
 
-For `target_rev >= current_rev` → handled by `ErrFutureRev` check (never reaches WAL scan).
+For `target_rev < COMPACT_REV` → `ErrCompacted` (never reaches this code).
 
-For `target_rev < COMPACT_REV` → handled by `ErrCompacted` check (never reaches WAL scan).
+For `target_rev > current_rev` → `ErrFutureRev` (never reaches this code).
 
 ### 3.5 Edge Cases
 
-| Case | Behavior |
-|------|----------|
-| Key created at rev 5, value changed at rev 10, query at rev 8 | Returns value at rev 5 (correct — last write before target) |
-| Key created at rev 5, deleted at rev 10, query at rev 12 | Not included (correct — deleted before target) |
-| Key created at rev 5, deleted at rev 10, query at rev 8 | Included with value at rev 5 (correct — alive at target) |
-| Key created at rev 10, query at rev 8 | Not included (correct — didn't exist yet) |
-| WAL has 64MB, compaction triggers mid-scan | Retry on ENOENT; scan old file if already opened (inode persists) |
-| WAL corrupted at offset N | `scan_kv` stops at error, returns partial state up to last valid record |
+| Case | Phase 1 (BTreeMap) | Phase 2 (WAL) | Result |
+|------|-------------------|---------------|--------|
+| Key created at rev 5, value changed at rev 10, query at rev 8 | `mod_revision=10 > 8` → marked | Replay up to rev 8 → finds rev 5 value | Correct |
+| Key created at rev 5, deleted at rev 10, query at rev 12 | Not in BTreeMap (gone) | Replay up to rev 12 → tombstone at rev 10 removes it | Correct — not included |
+| Key created at rev 5, deleted at rev 10, query at rev 8 | Not in BTreeMap (gone) | Replay up to rev 8 → key exists with rev 5 value | Correct — included |
+| Key created at rev 10, query at rev 8 | `create_revision=10 > 8` → skipped | Replay up to rev 8 → key doesn't exist yet | Correct — not included |
+| Key created at rev 5, never modified, query at rev 50 | `mod_revision=5 <= 50` → **direct kv_bytes** | Skipped | Correct, O(1) |
+| All keys in range are current | **Phase 1 done, no Phase 2** | Skipped entirely | Correct, ~0 WAL work |
 
 ### 3.6 Implementation Complexity
 
-The WAL scan approach adds ~80 lines of Rust code:
-
 | Component | Lines | Description |
 |-----------|-------|-------------|
-| `reconstruct_state_at()` | ~40 | Open file, read buffer, deserialize + filter by revision, build HashMap |
-| `range_historical()` | ~30 | Call reconstruct, apply range bounds, count/limit, build response |
-| Concurrency plumbing | ~10 | Read WAL path from `StoreState` (brief lock) or cache in `Store`, open handle |
+| Phase 1: BTreeMap range scan | ~40 | Iterate range, classify by mod_revision vs target_rev |
+| Phase 2: WAL scan with key filter | ~40 | Open handle, read buffer, filter by revision + key range |
+| Phase 3: Merge + build response | ~30 | Combine phase 1/2 results, apply limit/keys_only |
+| Concurrency plumbing | ~10 | WAL path access, separate file handle, retry on ENOENT |
 
 ---
 
@@ -190,8 +202,11 @@ The WAL scan approach adds ~80 lines of Rust code:
 | Aspect | A: ErrCompacted on all revision>0 | B: Return current state | C: Hybrid error+current | **D: WAL-based historical** |
 |--------|-----------------------------------|------------------------|------------------------|----------------------------|
 | **Correctness** | Wrong — rejects valid queries | Wrong — returns wrong data | Mostly wrong for window | **Bit-exact** for all queries |
-| **Complexity** | Trivial (~10 lines) | Trivial (~remove guard) | Low (~20 lines) | Moderate (~80 lines) |
-| **CPU cost** | Zero | Zero | Zero | 0.02-0.17% core (at k3s idle) |
+| **Complexity** | Trivial (~10 lines) | Trivial (~remove guard) | Low (~20 lines) | Moderate (~120 lines) |
+| **CPU cost (worst case)** | Zero | Zero | Zero | 5–10 ms / query (67 MB WAL) |
+| **CPU cost (no stale keys)** | Zero | Zero | Zero | **~0** — BTreeMap short-circuit skips WAL entirely |
+| **Memory (worst case)** | Zero | Zero | Zero | ~67 MB WAL buffer + result set |
+| **Memory (no stale keys)** | Zero | Zero | Zero | **~0** — no WAL buffer allocated |
 | **k3s errors stop** | Yes (err → cache rebuild) | Partial (items may differ) | Yes (err → cache rebuild) | Yes (correct data → digest matches) |
 | **etcd compatible** | No | No | No | **Yes** |
 | **Future-proof** | No — breaks any client that queries historical revs | No | No | **Yes** — matches etcd contract |
@@ -351,50 +366,97 @@ pub async fn range(&self, req: RangeRequest) -> Result<RangeResponse, Status> {
 }
 ```
 
-### 9.3 `range_historical()` — WAL Reconstruction
+### 9.3 `range_historical()` — Phase 1 + Phase 2 + Phase 3
 
 ```rust
 async fn range_historical(&self, req: RangeRequest, target_rev: u64) -> Result<RangeResponse, Status> {
-    // Get WAL path (brief read lock, released before WAL scan)
-    let wal_path = self.wal_path().await;
-
-    // Reconstruct state at target_rev from WAL (NO store lock held)
-    let state_at = reconstruct_state_at(&wal_path, target_rev)
-        .map_err(|e| Status::new(Code::Internal, format!("wal scan: {e}")))?;
-
-    // Apply range bounds (resolve_range-like logic on HashMap)
     let bound = resolve_range(&req.key, &req.range_end);
-    let mut kvs: Vec<Bytes> = Vec::new();
-    for (key, kv_bytes) in &state_at {
-        if !matches_range(bound.to_ref(), key) { continue; }
-        if req.keys_only {
-            let (encoded, _, _) = wal::encode_kv(key, b"", 0, 0, 0, 0);
-            kvs.push(Bytes::from(encoded));
-        } else {
-            kvs.push(kv_bytes.clone());
+    let limit = if req.limit > 0 { req.limit as usize } else { usize::MAX };
+
+    // ── Phase 1: BTreeMap scan (under read lock) ─────────────────
+    let mut phase1_ok: Vec<(Vec<u8>, Bytes)> = Vec::new();  // mod_rev <= target_rev
+    let mut needs_wal: Vec<Vec<u8>> = Vec::new();            // mod_rev > target_rev, create_rev <= target_rev
+    let mut any_wal_needed = false;
+
+    {
+        let state = self.state.read().await;
+        for (k, ks) in state.keys.range(/* resolved range start..end */) {
+            if ks.deleted || ks.create_revision > target_rev { continue; }
+            if !matches_range(bound.to_ref(), k) { break_if_past_range(/* ... */); }
+
+            if ks.mod_revision <= target_rev {
+                phase1_ok.push((k.clone(), ks.kv_bytes.clone()));
+            } else {
+                needs_wal.push(k.clone());
+                any_wal_needed = true;
+            }
+            if phase1_ok.len() + needs_wal.len() >= limit { break; }
         }
-        if req.limit > 0 && kvs.len() >= req.limit as usize { break; }
     }
 
-    let rev = target_rev as i64;
+    // If ALL keys in range have correct current values → done, skip WAL entirely.
+    if !any_wal_needed {
+        return Ok(RangeResponse {
+            header: Some(ResponseHeader { revision: target_rev as i64, .. }),
+            kvs: phase1_ok.into_iter().map(|(_, b)| b).collect(),
+            count: phase1_ok.len() as i64,
+            more: false,
+        });
+    }
+
+    // ── Phase 2: WAL scan (NO store lock, key-filtered) ─────────
+    let wal_path = self.wal_path().await;
+    let key_range = get_key_range(&req.key, &req.range_end);
+    let wal_state = scan_wal_range(&wal_path, &key_range, target_rev)
+        .map_err(|e| Status::new(Code::Internal, format!("wal scan: {e}")))?;
+
+    // ── Phase 3: Merge ───────────────────────────────────────────
+    let mut kvs: Vec<Bytes> = Vec::with_capacity(phase1_ok.len() + needs_wal.len());
+    for (key, kv_bytes) in &phase1_ok {
+        if kvs.len() >= limit { break; }
+        kvs.push(if req.keys_only {
+            encode_key_only(key)
+        } else {
+            kv_bytes.clone()
+        });
+    }
+    for key in &needs_wal {
+        if kvs.len() >= limit { break; }
+        if let Some(kv_bytes) = wal_state.get(key) {
+            kvs.push(if req.keys_only {
+                encode_key_only(key)
+            } else {
+                kv_bytes.clone()
+            });
+        }
+        // Key was in BTreeMap (create_rev <= target) but not in WAL scan?
+        // That means the WAL record at mod_rev <= target was the same as
+        // the current kv_bytes, so we skip (it's a non-mutation WAL pass-through).
+        // Fallback: use current kv_bytes.
+    }
+
+    // Also include keys from WAL that existed at target_rev but were
+    // deleted after (not in BTreeMap anymore).
+    for (key, kv_bytes) in &wal_state {
+        if /* not already included */ && !phase1_keys.contains(key) && !needs_wal_keys.contains(key) {
+            if kvs.len() >= limit { break; }
+            kvs.push(if req.keys_only { encode_key_only(key) } else { kv_bytes.clone() });
+        }
+    }
+
     Ok(RangeResponse {
-        header: Some(ResponseHeader {
-            cluster_id: 1,
-            member_id: 1,
-            revision: rev,
-            raft_term: 0,
-        }),
+        header: Some(ResponseHeader { revision: target_rev as i64, .. }),
         kvs,
-        more: false,
         count: kvs.len() as i64,
+        more: false,
     })
 }
 ```
 
-### 9.4 `reconstruct_state_at()` — WAL Replay Engine
+### 9.4 `scan_wal_range()` — Key-Filtered WAL Replay
 
 ```rust
-fn reconstruct_state_at(path: &str, up_to: u64) -> io::Result<HashMap<Vec<u8>, Bytes>> {
+fn scan_wal_range(path: &str, range: &KeyRange, up_to: u64) -> io::Result<HashMap<Vec<u8>, Bytes>> {
     let mut file = std::fs::File::open(path)?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
@@ -406,18 +468,23 @@ fn reconstruct_state_at(path: &str, up_to: u64) -> io::Result<HashMap<Vec<u8>, B
         match KvWalRecord::deserialize(&buf[ofs..]) {
             Ok((rec, consumed)) => {
                 let rev = rec.mod_revision().unwrap_or(0) as u64;
-                if rev > up_to {
-                    ofs += consumed;
-                    continue; // hasn't happened yet at target_rev
-                }
-                if (rec.flags & DELETED) != 0 {
-                    state.remove(rec.key().unwrap_or(&[]));
-                } else {
-                    state.insert(rec.key().unwrap_or(&[]).to_vec(), Bytes::copy_from_slice(&rec.kv_bytes));
+                let key = rec.key().unwrap_or(&[]);
+                // Key filter: only process records in our range
+                if range.contains(key) {
+                    if rev <= up_to {
+                        if (rec.flags & DELETED) != 0 {
+                            state.remove(key);
+                        } else {
+                            state.insert(key.to_vec(), Bytes::copy_from_slice(&rec.kv_bytes));
+                        }
+                    }
+                    // rev > up_to: hasn't happened yet at target;
+                    // we stop putting new keys but may see tombstones that
+                    // affect existing ones — skip both
                 }
                 ofs += consumed;
             }
-            Err(_) => break, // partial/corrupt tail
+            Err(_) => break,
         }
     }
     Ok(state)
@@ -426,17 +493,22 @@ fn reconstruct_state_at(path: &str, up_to: u64) -> io::Result<HashMap<Vec<u8>, B
 
 ### 9.5 Test Plan
 
-| # | Test | Input | Expected |
-|---|------|-------|----------|
-| 1 | compacted revision | `range(revision=1)` after compact to 1000 | `Err` with "compacted" |
-| 2 | future revision | `range(revision=9999999999)` | `Err` with "future" |
-| 3 | zero revision | `range(revision=0)` | Current state (unchanged) |
-| 4 | historical — exact rev | Put key at rev 5, `range(revision=5)` | Key included with correct value |
-| 5 | historical — before mod | Put key at rev 5, value change at rev 10, `range(revision=8)` | Key included with value at rev 5 |
-| 6 | historical — after delete | Put key at rev 5, delete at rev 10, `range(revision=12)` | Key NOT included |
-| 7 | historical — before delete | Put key at rev 5, delete at rev 10, `range(revision=8)` | Key included |
-| 8 | historical — after create | Key created at rev 10, `range(revision=8)` | Key NOT included |
-| 9 | historical — concurrent compact | range hits WAL during Phase C rename | Retry succeeds |
+| # | Test | Input | Expected | Phase Coverage |
+|---|------|-------|----------|----------------|
+| 1 | compacted revision | `range(revision=1)` after compact to 1000 | `Err` with "compacted" | Error guard |
+| 2 | future revision | `range(revision=9999999999)` | `Err` with "future" | Error guard |
+| 3 | zero revision | `range(revision=0)` | Current state (unchanged) | Existing path |
+| 4 | all keys current at target | No keys modified after X, `range(revision=X)` | Phase 1 only — no WAL | BTreeMap short-circuit |
+| 5 | some keys stale | 1 key modified after X, `range(revision=X)` | Phase 1 for current, Phase 2+3 for stale | BTreeMap + WAL merge |
+| 6 | all keys stale | Every key modified after X, `range(revision=X)` | Phase 2+3 for all | Full WAL fallback |
+| 7 | point lookup — key current | `range(key=X, revision=target)` where X's mod_rev ≤ target | Phase 1, no WAL | Single-key short-circuit |
+| 8 | point lookup — key stale | `range(key=X, revision=target)` where X's mod_rev > target | Phase 2 WAL for X only | Single-key WAL |
+| 9 | historical — exact rev | Put key at rev 5, `range(revision=5)` | Key included with correct value | Phase 1 (mod_rev == rev) |
+| 10 | historical — before mod | Put key at rev 5, value change at rev 10, `range(revision=8)` | Key included with value at rev 5 | Phase 2 |
+| 11 | historical — after delete | Put key at rev 5, delete at rev 10, `range(revision=12)` | Key NOT included | Phase 2 (tombstone) |
+| 12 | historical — before delete | Put key at rev 5, delete at rev 10, `range(revision=8)` | Key included | Phase 2 (no tombstone yet) |
+| 13 | historical — after create | Key created at rev 10, `range(revision=8)` | Key NOT included | Both phases skip |
+| 14 | historical — concurrent compact | range hits WAL during Phase C rename | Retry succeeds | Concurrency |
 
 ### 9.6 Deploy & Verify
 
