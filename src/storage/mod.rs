@@ -472,7 +472,7 @@ impl Store {
     /// requested key range from the WAL file.
     ///
     /// Phase 3: Merge Phase-1-correct values with Phase-2-reconstructed values.
-    /// Phase 2 always runs (even when Phase 1 has no stale keys) because keys
+    /// Phase 2 always runs for range/prefix/from/all queries because keys
     /// may have been deleted from the BTreeMap via `apply_delete` (which removes
     /// them entirely) but still existed at target_rev — the WAL is the only source.
     async fn range_historical(
