@@ -36,6 +36,9 @@ fn next_lease_id() -> i64 {
 }
 
 /// In-memory representation of a key's current state.
+/// Deleted keys remain in the BTreeMap so that historical range queries
+/// can conclusively determine whether a key existed at a target revision
+/// without scanning the WAL.
 #[derive(Debug, Clone)]
 pub struct KeyState {
     pub value: Arc<[u8]>,
@@ -44,6 +47,13 @@ pub struct KeyState {
     pub version: i64,
     pub lease: i64,
     pub deleted: bool,
+    /// Revision at which this key was deleted. 0 = not deleted.
+    /// Only meaningful when `deleted` is true.
+    pub delete_revision: u64,
+    /// True if this key was ever deleted and recreated. When both `has_been_deleted`
+    /// and `create_revision > target_rev`, the key may have existed in a previous
+    /// lifetime at that target_rev, so the WAL is needed to confirm.
+    pub has_been_deleted: bool,
     pub kv_bytes: Bytes,
 }
 
@@ -144,6 +154,9 @@ impl StoreState {
 
     fn apply(&mut self, key: Vec<u8>, value: Vec<u8>, lease: i64, rev: u64) -> Option<KeyState> {
         let prev = self.keys.get(&key).filter(|k| !k.deleted).cloned();
+        let is_new = prev.is_none();
+        // Detect whether this key was previously deleted (lost a lifetime)
+        let had_deleted = self.keys.get(&key).map_or(false, |k| k.deleted);
 
         let mut entry = KeyState {
             value: Arc::from(value.into_boxed_slice()),
@@ -152,11 +165,13 @@ impl StoreState {
             version: prev.as_ref().map(|k| k.version + 1).unwrap_or(1),
             lease,
             deleted: false,
+            delete_revision: 0,
+            has_been_deleted: had_deleted,
             kv_bytes: Bytes::new(),
         };
         entry.kv_bytes = make_kv_bytes(&key, &entry);
-        let old = self.keys.insert(key.clone(), entry.clone());
-        if old.is_none() {
+        self.keys.insert(key.clone(), entry.clone());
+        if is_new {
             KEY_COUNT.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -176,11 +191,16 @@ impl StoreState {
     }
 
     fn apply_delete(&mut self, key: Vec<u8>, rev: u64) -> Option<KeyState> {
-        let prev = self.keys.remove(&key)?;
-        KEY_COUNT.fetch_sub(1, Ordering::Relaxed);
-        if prev.deleted {
+        let entry = self.keys.get_mut(&key)?;
+        if entry.deleted {
             return None;
         }
+        let prev = entry.clone();
+        entry.deleted = true;
+        entry.delete_revision = rev;
+        // Keep mod_revision as the value's revision (for historical query filtering).
+        // kv_bytes also stays as the value before deletion.
+        KEY_COUNT.fetch_sub(1, Ordering::Relaxed);
 
         // Create watch event for DELETE
         let event = WatchEvent {
@@ -281,14 +301,15 @@ impl Store {
 
         state.next_rev = max_rev + 1;
         NEXT_REV.store(state.next_rev, Ordering::SeqCst);
-        KEY_COUNT.store(state.keys.len() as u64, Ordering::Relaxed);
+        let active_keys = state.keys.values().filter(|ks| !ks.deleted).count() as u64;
+        KEY_COUNT.store(active_keys, Ordering::Relaxed);
         WATCHER_COUNT.store(0, Ordering::Relaxed);
         LEASE_COUNT.store(0, Ordering::Relaxed);
 
         tracing::info!(
             "rudurru ready: revision={}, keys={}, compact_rev={}",
             max_rev,
-            state.keys.len(),
+            active_keys,
             COMPACT_REV.load(Ordering::Relaxed),
         );
 
@@ -465,16 +486,17 @@ impl Store {
 
     /// Range query at a specific historical revision (target_rev >= COMPACT_REV).
     ///
-    /// Phase 1: BTreeMap scan (under read lock). Keys with mod_revision <= target_rev
-    /// are correct as-is. Keys with mod_revision > target_rev need WAL replay.
+    /// Phase 1: BTreeMap scan (under read lock). Deleted keys are kept in the
+    /// BTreeMap with their `delete_revision`, so we can conclusively determine
+    /// the full result set. Keys with `mod_revision <= target_rev` are correct
+    /// as-is. Keys with `mod_revision > target_rev` need WAL replay.
     ///
-    /// Phase 2: WAL scan (no store lock). Reconstruct state at target_rev for the
-    /// requested key range from the WAL file.
+    /// When Phase 1 finds no stale keys, we return early — zero WAL I/O.
+    ///
+    /// Phase 2: WAL scan (no store lock). Reconstruct state at target_rev for
+    /// stale keys in the requested range.
     ///
     /// Phase 3: Merge Phase-1-correct values with Phase-2-reconstructed values.
-    /// Phase 2 always runs for range/prefix/from/all queries because keys
-    /// may have been deleted from the BTreeMap via `apply_delete` (which removes
-    /// them entirely) but still existed at target_rev — the WAL is the only source.
     async fn range_historical(
         &self,
         req: etcdserverpb::RangeRequest,
@@ -514,20 +536,36 @@ impl Store {
                         break;
                     }
                 }
+
                 if ks.deleted {
-                    // Key is deleted in the current state, but it may still have
-                    // existed at the target revision (deletion happened after target).
+                    // Deleted keys are kept in the BTreeMap with their
+                    // delete_revision, so we can conclusively determine
+                    // whether they existed at target_rev.
                     if ks.create_revision > target_rev {
-                        continue; // didn't exist at target_rev either
+                        continue; // didn't exist at target_rev
                     }
-                    if ks.mod_revision <= target_rev {
+                    if ks.delete_revision <= target_rev {
                         continue; // was already deleted by target_rev
                     }
-                    // Deletion happened after target_rev → key existed at target_rev.
-                    // We'll need the WAL to reconstruct its value at that point.
-                    phase1_stale_keys.push(k.clone());
+                    // Key existed at target_rev (created before or at target,
+                    // deleted after). Value depends on mod_revision.
+                    if ks.mod_revision <= target_rev {
+                        // kv_bytes is the correct value at target_rev
+                        let kv = if req.keys_only {
+                            let (b, _, _) = wal::encode_kv(k, b"", 0, 0, 0, 0);
+                            Bytes::from(b)
+                        } else {
+                            ks.kv_bytes.clone()
+                        };
+                        phase1_direct.push((k.clone(), kv));
+                    } else {
+                        // kv_bytes is from a modification after target_rev.
+                        // Need WAL for the value at target_rev.
+                        phase1_stale_keys.push(k.clone());
+                    }
                     continue;
                 }
+
                 // Filter by create/mod revision if requested
                 if req.min_mod_revision > 0 && (ks.mod_revision as i64) < req.min_mod_revision {
                     continue;
@@ -547,7 +585,13 @@ impl Store {
                 }
 
                 if ks.create_revision > target_rev {
-                    continue; // key didn't exist at target_rev
+                    // Key didn't exist at target_rev in its current lifetime.
+                    // If it was ever deleted and recreated, it may have existed
+                    // in a previous lifetime — force WAL scan.
+                    if ks.has_been_deleted {
+                        phase1_stale_keys.push(k.clone());
+                    }
+                    continue;
                 }
 
                 if ks.mod_revision <= target_rev {
@@ -566,9 +610,50 @@ impl Store {
                 // Limit is applied when building the response below.
             }
 
+            // ── Phase 1 early return: no stale keys → WAL not needed ──
+            // Since deleted keys are kept in the BTreeMap with their
+            // delete_revision, we can conclusively determine the full
+            // result set without scanning the WAL when no keys need
+            // historical value reconstruction.
+            if phase1_stale_keys.is_empty() {
+                let count = phase1_direct.len() as i64;
+                if req.count_only {
+                    return Ok(etcdserverpb::RangeResponse {
+                        header: Some(etcdserverpb::ResponseHeader {
+                            cluster_id: 1,
+                            member_id: 1,
+                            revision: target_rev as i64,
+                            raft_term: 1,
+                        }),
+                        kvs: vec![],
+                        more: false,
+                        count,
+                    });
+                }
+                let more = if req.limit > 0 && count > req.limit as i64 {
+                    phase1_direct.truncate(req.limit as usize);
+                    true
+                } else {
+                    false
+                };
+                return Ok(etcdserverpb::RangeResponse {
+                    header: Some(etcdserverpb::ResponseHeader {
+                        cluster_id: 1,
+                        member_id: 1,
+                        revision: target_rev as i64,
+                        raft_term: 1,
+                    }),
+                    kvs: phase1_direct.into_iter().map(|(_, b)| b).collect(),
+                    more,
+                    count,
+                });
+            }
+
         } // read lock dropped
 
         // ── Phase 2: WAL scan (no store lock) ──────────────────────
+        // Only reaches here when at least one key in range has been modified
+        // after target_rev and needs historical value reconstruction.
         let wal_path = self.state.read().await.wal.path.clone();
         let wal_state = scan_wal_range(&wal_path, &req.key, &req.range_end, target_rev)
             .map_err(|e| Status::new(tonic::Code::Internal, format!("wal scan failed: {e}")))?;
@@ -622,8 +707,8 @@ impl Store {
             }
         }
 
-        // Keys from WAL that existed at target_rev but are no longer in BTreeMap
-        // (deleted after target_rev). Include them.
+        // Keys from WAL not yet covered (should be empty now that deleted keys
+        // live in the BTreeMap, but kept for defensive coverage).
         for (key, wal_kv) in &wal_state {
             if merged.contains_key(key) {
                 continue;
@@ -1322,14 +1407,32 @@ fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
 
     if deleted {
         let key = rec.key().unwrap_or_default().to_vec();
+        let del_rev = rec.mod_revision().unwrap_or(0) as u64;
+        // Keep the key in the map with deleted=true so that historical queries
+        // can see it. Preserve the last known value in kv_bytes.
+        if let Some(entry) = state.keys.get_mut(&key) {
+            entry.deleted = true;
+            entry.delete_revision = del_rev;
+        }
+        // If the key was never seen (WAL has delete-only records), insert it.
+        state.keys.entry(key.clone()).or_insert(KeyState {
+            value: Arc::from(&b""[..]),
+            mod_revision: del_rev,
+            create_revision: del_rev,
+            version: 0,
+            lease: 0,
+            deleted: true,
+            delete_revision: del_rev,
+            has_been_deleted: false,
+            kv_bytes: Bytes::from(rec.kv_bytes.clone()),
+        });
         let event = WatchEvent {
-            revision: rec.mod_revision().unwrap_or(0) as u64,
+            revision: del_rev,
             event_type: mvccpb::event::EventType::Delete,
             key: key.clone(),
             kv_bytes: Bytes::from(rec.kv_bytes.clone()),
             prev_kv_bytes: Bytes::from(rec.kv_bytes.clone()),
         };
-        state.keys.remove(&key);
         state.notify_watchers(event);
     } else if let Ok(kv) = mvccpb::KeyValue::decode(&rec.kv_bytes[..]) {
         let key = kv.key.clone();
@@ -1341,6 +1444,8 @@ fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
             version: kv.version,
             lease: kv.lease,
             deleted: false,
+            delete_revision: 0,
+            has_been_deleted: false,
             kv_bytes: Bytes::from(rec.kv_bytes.clone()),
         };
         state.keys.insert(key.clone(), entry);
