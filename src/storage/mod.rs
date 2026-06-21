@@ -851,22 +851,22 @@ impl Store {
         let rev = next_revision();
         let mut state = self.state.write();
         let key = req.key.clone();
+
+        let prev_entry = state.keys.get(&key);
         let value = if req.ignore_value {
-            state
-                .keys
-                .get(&key)
+            prev_entry
                 .map(|k| k.value.to_vec())
                 .unwrap_or_default()
         } else {
             req.value
         };
         let lease = if req.ignore_lease {
-            state.keys.get(&key).map(|k| k.lease).unwrap_or(req.lease)
+            prev_entry.map(|k| k.lease).unwrap_or(req.lease)
         } else {
             req.lease
         };
 
-        let prev = state.keys.get(&key).filter(|k| k.is_alive()).cloned();
+        let prev = prev_entry.filter(|k| k.is_alive()).cloned();
         let mut flags = 0u8;
         if prev.is_none() {
             flags |= wal::IS_CREATE;
