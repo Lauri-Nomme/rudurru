@@ -9,7 +9,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, RwLock};
+use parking_lot::RwLock;
+use tokio::sync::Notify;
 use tonic::Status;
 
 /// Global revision counter. Monotonically increasing, starts at 1.
@@ -318,8 +319,8 @@ impl Store {
 
         let state_arc = Arc::new(RwLock::new(state));
         Self::start_fsync_task(
-            state_arc.read().await.wal.file.clone(),
-            state_arc.read().await.wal.dirty.clone(),
+            state_arc.read().wal.file.clone(),
+            state_arc.read().wal.dirty.clone(),
         );
         Self::start_expiry_task(state_arc.clone());
         let store = Self { state: state_arc };
@@ -351,7 +352,7 @@ impl Store {
     }
 
     pub async fn wal_path(&self) -> String {
-        self.state.read().await.wal.path.clone()
+        self.state.read().wal.path.clone()
     }
 
     // ── KV operations ──────────────────────────────────────────────────
@@ -389,7 +390,7 @@ impl Store {
         }
 
         // Current state (revision == 0) — unchanged logic
-        let state = self.state.read().await;
+        let state = self.state.read();
         let bound = resolve_range(&req.key, &req.range_end);
         let cap = if req.limit > 0 {
             req.limit as usize
@@ -519,7 +520,7 @@ impl Store {
         let mut phase1_direct: Vec<(Vec<u8>, Bytes)> = Vec::new(); // mod_rev <= target, value correct
         let mut phase1_stale_keys: Vec<Vec<u8>> = Vec::new();      // mod_rev > target, needs WAL
         {
-            let state = self.state.read().await;
+            let state = self.state.read();
 
             let iter: Box<dyn Iterator<Item = (&Vec<u8>, &KeyState)>> = match (range_start, range_end)
             {
@@ -684,7 +685,7 @@ impl Store {
             elapsed_us = t0.elapsed().as_micros(),
             "historical_range phase2 starting wal scan"
         );
-        let wal_path = self.state.read().await.wal.path.clone();
+        let wal_path = self.state.read().wal.path.clone();
         let wal_state = scan_wal_range(&wal_path, &req.key, &req.range_end, target_rev)
             .map_err(|e| Status::new(tonic::Code::Internal, format!("wal scan failed: {e}")))?;
 
@@ -731,7 +732,7 @@ impl Store {
                 // We already validated create_rev ≤ target_rev in Phase 1,
                 // so the key should exist at target. The missing WAL record
                 // is a gap — accept the current value as best-effort.
-                let state = self.state.read().await;
+                let state = self.state.read();
                 if let Some(ks) = state.keys.get(key) {
                     if ks.is_alive() {
                         let kv = if req.keys_only {
@@ -810,7 +811,7 @@ impl Store {
 
     pub async fn put(&self, req: etcdserverpb::PutRequest) -> etcdserverpb::PutResponse {
         let rev = next_revision();
-        let mut state = self.state.write().await;
+        let mut state = self.state.write();
         let key = req.key.clone();
         let value = if req.ignore_value {
             state
@@ -870,7 +871,7 @@ impl Store {
         req: etcdserverpb::DeleteRangeRequest,
     ) -> etcdserverpb::DeleteRangeResponse {
         let rev = next_revision();
-        let mut state = self.state.write().await;
+        let mut state = self.state.write();
 
         let bound = resolve_range(&req.key, &req.range_end);
 
@@ -958,11 +959,10 @@ impl Store {
     }
 
     pub async fn txn(&self, req: etcdserverpb::TxnRequest) -> etcdserverpb::TxnResponse {
-        let state = self.state.write().await;
-
-        let success = req.compare.iter().all(|c| eval_compare(&state, c));
-
-        drop(state);
+        let success = {
+            let state = self.state.write();
+            req.compare.iter().all(|c| eval_compare(&state, c))
+        };
 
         let ops = if success { req.success } else { req.failure };
         self.execute_txn_ops(ops, success).await
@@ -1013,7 +1013,7 @@ impl Store {
         }
 
         let header = {
-            let state = self.state.read().await;
+            let state = self.state.read();
             state.header()
         };
 
@@ -1028,7 +1028,7 @@ impl Store {
         &self,
         req: etcdserverpb::CompactionRequest,
     ) -> etcdserverpb::CompactionResponse {
-        let state = self.state.write().await;
+        let state = self.state.write();
         COMPACT_REV.store(req.revision as u64, Ordering::SeqCst);
 
         // NOTE: etcd's Compact does NOT delete current key-values from the store.
@@ -1047,7 +1047,7 @@ impl Store {
         &self,
         req: etcdserverpb::LeaseGrantRequest,
     ) -> etcdserverpb::LeaseGrantResponse {
-        let mut state = self.state.write().await;
+        let mut state = self.state.write();
         let id = if req.id != 0 { req.id } else { next_lease_id() };
         let ttl = req.ttl;
         let expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
@@ -1075,7 +1075,7 @@ impl Store {
         &self,
         req: etcdserverpb::LeaseRevokeRequest,
     ) -> etcdserverpb::LeaseRevokeResponse {
-        let mut state = self.state.write().await;
+        let mut state = self.state.write();
         let id = req.id;
         state.leases.remove(&id);
         LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
@@ -1119,7 +1119,7 @@ impl Store {
     }
 
     pub async fn lease_keep_alive(&self, id: i64) -> etcdserverpb::LeaseKeepAliveResponse {
-        let mut state = self.state.write().await;
+        let mut state = self.state.write();
         if let Some(ls) = state.leases.get_mut(&id) {
             let ttl = ls.ttl;
             ls.expires_at =
@@ -1143,7 +1143,7 @@ impl Store {
         &self,
         req: etcdserverpb::LeaseTimeToLiveRequest,
     ) -> etcdserverpb::LeaseTimeToLiveResponse {
-        let state = self.state.read().await;
+        let state = self.state.read();
         if let Some(ls) = state.leases.get(&req.id) {
             let remaining = (ls
                 .expires_at
@@ -1178,7 +1178,7 @@ impl Store {
     }
 
     pub async fn lease_leases(&self) -> etcdserverpb::LeaseLeasesResponse {
-        let state = self.state.read().await;
+        let state = self.state.read();
         let leases = state
             .leases
             .keys()
@@ -1193,14 +1193,14 @@ impl Store {
     // ── Maintenance operations ──────────────────────────────────────────
 
     pub async fn db_size(&self) -> i64 {
-        let state = self.state.read().await;
+        let state = self.state.read();
         let md = state.wal.file.lock().unwrap().metadata();
         md.map(|m| m.len() as i64).unwrap_or(0)
     }
 
     pub async fn store_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        let state = self.state.read().await;
+        let state = self.state.read();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for (k, ks) in state.keys.iter() {
             if ks.delete_revision != 0 {
@@ -1215,14 +1215,14 @@ impl Store {
     fn start_expiry_task(state: Arc<RwLock<StoreState>>) {
         tokio::spawn(async move {
             let notify = {
-                let s = state.read().await;
+                let s = state.read();
                 s.expiry_notify.clone()
             };
             loop {
                 // Compute sleep duration from the earliest lease expiry.
                 // When no leases exist, sleep indefinitely (woken by notify).
                 let sleep_dur = {
-                    let s = state.read().await;
+                    let s = state.read();
                     s.leases
                         .values()
                         .map(|ls| ls.expires_at)
@@ -1246,7 +1246,7 @@ impl Store {
                 }
 
                 // Collect and process expired leases under the write lock.
-                let mut s = state.write().await;
+                let mut s = state.write();
                 let now = tokio::time::Instant::now();
                 let expired: Vec<i64> = s
                     .leases
@@ -1309,7 +1309,7 @@ impl Store {
         let snapshot_wal_size: u64;
 
         {
-            let state = self.state.read().await;
+            let state = self.state.read();
             snapshot_rev = current_revision();
             snapshot_wal_size = state.wal.file.lock().unwrap().metadata()?.len();
             let mut recs = Vec::with_capacity(state.keys.len());
@@ -1359,7 +1359,7 @@ impl Store {
         let new_wal_size: u64;
 
         {
-            let state = self.state.write().await;
+            let state = self.state.write();
 
             // Read tail bytes from the active WAL (writes during Phase B)
             let tail = {
@@ -1804,13 +1804,13 @@ mod compact_tests {
             .await;
 
         let size_before = {
-            let s = store.state.read().await;
+            let s = store.state.read();
             let f = s.wal.file.lock().unwrap();
             f.metadata().unwrap().len()
         };
         store.compact_wal().await.unwrap();
         let size_after = {
-            let s = store.state.read().await;
+            let s = store.state.read();
             let f = s.wal.file.lock().unwrap();
             f.metadata().unwrap().len()
         };

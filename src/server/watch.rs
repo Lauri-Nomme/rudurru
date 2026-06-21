@@ -202,7 +202,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                         };
                                         if tx_clone.send(Ok(resp)).await.is_err() {
                                             tracing::warn!(watch_id, "watch_dropped");
-                                            let mut s = store_clone.state.write().await;
+                                            let mut s = store_clone.state.write();
                                             s.cancel_watcher(watch_id);
                                             break;
                                         }
@@ -213,7 +213,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 watch_request::RequestUnion::CancelRequest(cancel) => {
                                     let watch_id = cancel.watch_id;
                                     {
-                                        let mut state = store.state.write().await;
+                                        let mut state = store.state.write();
                                         state.cancel_watcher(watch_id);
                                     }
                                     tracing::info!(watch_id, "watch_canceled");
@@ -377,7 +377,7 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
 
     // ── checkpoint rev + offset ────────────────────────────────────
     let (checkpoint_rev, checkpoint_offset) = {
-        let state = store.state.read().await;
+        let state = store.state.read();
         let rev = current_revision();
         let off = std::fs::metadata(&state.wal.path)
             .map(|m| m.len())
@@ -418,7 +418,7 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
 
     // ── Phase 2: under lock, catch up then register all ────────────
     let t_lock = Instant::now();
-    let mut state = store.state.write().await;
+    let mut state = store.state.write();
     let lock_us = t_lock.elapsed().as_micros();
 
     let t_work = Instant::now();

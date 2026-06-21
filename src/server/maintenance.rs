@@ -101,25 +101,27 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
         let (tx, rx) = mpsc::channel(4);
 
         tokio::spawn(async move {
-            let state = store.state.read().await;
-            let mut buf = Vec::new();
-            let rev = storage::current_revision();
-            // Header: revision(8) + key_count(4)
-            buf.extend_from_slice(&rev.to_le_bytes());
-            buf.extend_from_slice(&(state.keys.len() as u32).to_le_bytes());
-            for (k, ks) in state.keys.iter() {
-                if ks.delete_revision != 0 {
-                    continue;
+            let (buf, _rev) = {
+                let state = store.state.read();
+                let rev = storage::current_revision();
+                let mut buf = Vec::new();
+                // Header: revision(8) + key_count(4)
+                buf.extend_from_slice(&rev.to_le_bytes());
+                buf.extend_from_slice(&(state.keys.len() as u32).to_le_bytes());
+                for (k, ks) in state.keys.iter() {
+                    if ks.delete_revision != 0 {
+                        continue;
+                    }
+                    let key_len = (k.len() as u32).to_le_bytes();
+                    let val_len = (ks.value.len() as u32).to_le_bytes();
+                    buf.extend_from_slice(&key_len);
+                    buf.extend_from_slice(k);
+                    buf.extend_from_slice(&val_len);
+                    buf.extend_from_slice(&ks.value);
                 }
-                let key_len = (k.len() as u32).to_le_bytes();
-                let val_len = (ks.value.len() as u32).to_le_bytes();
-                buf.extend_from_slice(&key_len);
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(&val_len);
-                buf.extend_from_slice(&ks.value);
-            }
+                (buf, rev)
+            };
             let total = buf.len() as u64;
-            drop(state);
 
             let mut offset = 0usize;
             while offset < buf.len() {

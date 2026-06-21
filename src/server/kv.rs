@@ -53,7 +53,7 @@ impl etcdserverpb::kv_server::Kv for Kv {
         req: Request<etcdserverpb::CompactionRequest>,
     ) -> Result<Response<etcdserverpb::CompactionResponse>, Status> {
         let revision = req.get_ref().revision;
-        let keys_before = self.store.state.read().await.keys.len();
+        let keys_before = self.store.state.read().keys.len();
         let resp = self.store.compact(req.into_inner()).await;
         tracing::info!(revision, keys_before, "compact");
         Ok(Response::new(resp))
