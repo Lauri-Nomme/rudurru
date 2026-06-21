@@ -139,4 +139,4 @@ Use epoch-based reclamation (`crossbeam-epoch`) or `arc_swap` to allow lock-free
 | Shard by prefix | **Weeks** | Removes lock as bottleneck entirely | **No** — 1000x headroom already exists for target workload |
 | RCU / lock-free | **Months** | Removes read lock entirely | **No** — O(n) clone per write is unworkable |
 
-**The `parking_lot::RwLock` switch is worthwhile.** It's a mechanical change with no behavioral impact, reduces lock overhead by 3-5x, and eliminates async waker allocations. Apply at the next refactoring pass.
+**The `parking_lot::RwLock` switch is still worthwhile** (mechanical, no behavioral impact), but the impact is smaller than initially hypothesized. The benchmark (`prd/concurrent-benchmark-design.md`) confirms the single-RwLock ceiling is ~80K ops/s, set by the **critical section length (~11µs per write)** — not lock acquisition overhead. `parking_lot::RwLock` would eliminate waker allocations, yielding **at most 5-10% throughput improvement** at 128 workers. To significantly exceed 80K ops/s would require reducing the critical section or sharding the store.
