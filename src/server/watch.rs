@@ -331,13 +331,21 @@ async fn flush_global_batch_at(
         // Reject only if the gap is egregious (bookmark races of 1-2 revs
         // are normal — etcd accepts them and the watcher catches up immediately).
         let cur_rev = current_revision();
-        if c.pending.start_revision > cur_rev && c.pending.start_revision - cur_rev > 10_000 {
+        let gap = c.pending.start_revision.saturating_sub(cur_rev);
+        if c.pending.start_revision > cur_rev && gap > 10_000 {
+            let cancel_reason = format!(
+                "too large resource version: {}, current: {}",
+                c.pending.start_revision, cur_rev
+            );
             tracing::info!(
                 start_revision = c.pending.start_revision,
                 current_revision = cur_rev,
+                gap,
                 key = %String::from_utf8_lossy(&c.pending.key),
+                range_end = %String::from_utf8_lossy(&c.pending.range_end),
                 stream_id = c.stream_id,
                 remote_addr = %c.remote_addr,
+                %cancel_reason,
                 "watch_too_large"
             );
             let resp = etcdserverpb::WatchResponse {
@@ -346,10 +354,7 @@ async fn flush_global_batch_at(
                 created: false,
                 canceled: true,
                 compact_revision: 0,
-                cancel_reason: format!(
-                    "too large resource version: {}, current: {}",
-                    c.pending.start_revision, cur_rev
-                ),
+                cancel_reason,
                 events: vec![],
                 fragment: false,
             };
