@@ -1680,14 +1680,17 @@ fn scan_wal_range(
 
 fn eval_compare(state: &StoreState, cmp: &etcdserverpb::Compare) -> bool {
     let key = &cmp.key;
-    let ks = state.keys.get(key);
+
+    // A tombstoned (deleted) key counts as "does not exist" for compare purposes,
+    // matching etcd semantics where deleted keys are absent from the current store.
+    let alive = state.keys.get(key).filter(|k| k.is_alive());
 
     let result = result_from_i32(cmp.result);
     let target = target_from_i32(cmp.target);
 
     match target {
         etcdserverpb::compare::CompareTarget::Version => {
-            let actual = ks.map(|k| k.version).unwrap_or(0);
+            let actual = alive.map(|k| k.version).unwrap_or(0);
             let expected = match &cmp.target_union {
                 Some(etcdserverpb::compare::TargetUnion::Version(v)) => *v,
                 _ => 0,
@@ -1695,7 +1698,7 @@ fn eval_compare(state: &StoreState, cmp: &etcdserverpb::Compare) -> bool {
             cmp_i64(result, actual, expected)
         }
         etcdserverpb::compare::CompareTarget::Create => {
-            let actual = ks.map(|k| k.create_revision as i64).unwrap_or(0);
+            let actual = alive.map(|k| k.create_revision as i64).unwrap_or(0);
             let expected = match &cmp.target_union {
                 Some(etcdserverpb::compare::TargetUnion::CreateRevision(v)) => *v,
                 _ => 0,
@@ -1703,7 +1706,7 @@ fn eval_compare(state: &StoreState, cmp: &etcdserverpb::Compare) -> bool {
             cmp_i64(result, actual, expected)
         }
         etcdserverpb::compare::CompareTarget::Mod => {
-            let actual = ks.map(|k| k.mod_revision as i64).unwrap_or(0);
+            let actual = alive.map(|k| k.mod_revision as i64).unwrap_or(0);
             let expected = match &cmp.target_union {
                 Some(etcdserverpb::compare::TargetUnion::ModRevision(v)) => *v,
                 _ => 0,
@@ -1711,7 +1714,7 @@ fn eval_compare(state: &StoreState, cmp: &etcdserverpb::Compare) -> bool {
             cmp_i64(result, actual, expected)
         }
         etcdserverpb::compare::CompareTarget::Value => {
-            let actual: &[u8] = ks.map(|k| k.value.as_ref()).unwrap_or(&[]);
+            let actual: &[u8] = alive.map(|k| k.value.as_ref()).unwrap_or(&[]);
             let expected = match &cmp.target_union {
                 Some(etcdserverpb::compare::TargetUnion::Value(v)) => v.as_slice(),
                 _ => &[],
@@ -1719,7 +1722,7 @@ fn eval_compare(state: &StoreState, cmp: &etcdserverpb::Compare) -> bool {
             cmp_bytes(result, actual, expected)
         }
         etcdserverpb::compare::CompareTarget::Lease => {
-            let actual = ks.map(|k| k.lease).unwrap_or(0);
+            let actual = alive.map(|k| k.lease).unwrap_or(0);
             let expected = match &cmp.target_union {
                 Some(etcdserverpb::compare::TargetUnion::Lease(v)) => *v,
                 _ => 0,
@@ -3434,5 +3437,149 @@ mod unsupported_features_tests {
     fn test_put_ignore_lease_on_missing_key_should_error() {
         // Expected: Err with "key not found" when ignore_lease is set
         // on a non-existent key. Currently no error is returned.
+    }
+}
+
+#[cfg(test)]
+mod eval_compare_tests {
+    use super::*;
+
+    fn make_compare(key: &[u8], target: i32, result_val: i32, target_val: i64) -> etcdserverpb::Compare {
+        let target_union = match target {
+            0 => Some(etcdserverpb::compare::TargetUnion::Version(target_val)),
+            1 => Some(etcdserverpb::compare::TargetUnion::CreateRevision(target_val)),
+            2 => Some(etcdserverpb::compare::TargetUnion::ModRevision(target_val)),
+            3 => Some(etcdserverpb::compare::TargetUnion::Value(vec![])),
+            4 => Some(etcdserverpb::compare::TargetUnion::Lease(target_val)),
+            _ => None,
+        };
+        etcdserverpb::Compare {
+            key: key.to_vec(),
+            range_end: vec![],
+            result: result_val,
+            target,
+            target_union,
+        }
+    }
+
+    static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_wal() -> String {
+        let dir = std::env::temp_dir();
+        let n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let name = format!("rudurru_evalcmp_{}_{}.wal", std::process::id(), n);
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().to_string()
+    }
+
+    /// Helper: create a StoreState with a temporary WAL. This avoids Store's
+    /// async background tasks and global-atomic pollution between tests.
+    fn fresh_state(records: Vec<wal::KvWalRecord>) -> StoreState {
+        let p = temp_wal();
+        // Write records into a temporary WAL, then re-open it.
+        {
+            let mut w = wal::WalFile::open(&p).unwrap();
+            for r in &records {
+                w.append_kv(r).unwrap();
+            }
+        }
+        let wal = wal::WalFile::open(&p).unwrap();
+        let mut state = StoreState::new(wal);
+        let mut max_rev = 0u64;
+        for rec in &records {
+            let rev = rec.mod_revision().unwrap_or(0) as u64;
+            apply_record(&mut state, rec);
+            max_rev = max_rev.max(rev);
+        }
+        state.next_rev = max_rev + 1;
+        let _ = std::fs::remove_file(&p);
+        state
+    }
+
+    fn make_put_record(key: &[u8], value: &[u8], rev: u64, lease: i64) -> wal::KvWalRecord {
+        let flags = wal::IS_CREATE | if lease != 0 { wal::HAS_LEASE } else { 0 };
+        wal::KvWalRecord::new(flags, key, value, rev as i64, rev as i64, 1, lease)
+    }
+
+    fn make_delete_record(key: &[u8], rev: u64) -> wal::KvWalRecord {
+        wal::KvWalRecord::new(wal::DELETED, key, b"", rev as i64, rev as i64, 1, 0)
+    }
+
+    #[test]
+    fn test_eval_compare_alive_key_matches() {
+        let state = fresh_state(vec![
+            make_put_record(b"/registry/test/key", b"value1", 1, 0),
+        ]);
+
+        let cmp = make_compare(b"/registry/test/key", 2, 0, 1);
+        assert!(eval_compare(&state, &cmp), "alive key should match its mod_revision");
+
+        let cmp = make_compare(b"/registry/test/key", 0, 0, 1);
+        assert!(eval_compare(&state, &cmp), "alive key should match its version");
+
+        let cmp = make_compare(b"/registry/test/key", 0, 3, 2);
+        assert!(eval_compare(&state, &cmp), "alive key version != 2 should match");
+    }
+
+    #[test]
+    fn test_eval_compare_tombstone_does_not_match() {
+        let state = fresh_state(vec![
+            make_put_record(b"/registry/test/key", b"value1", 1, 0),
+            make_delete_record(b"/registry/test/key", 2),
+        ]);
+
+        let cmp = make_compare(b"/registry/test/key", 2, 0, 1);
+        assert!(!eval_compare(&state, &cmp), "tombstoned key should NOT match its old mod_revision");
+    }
+
+    #[test]
+    fn test_eval_compare_tombstone_all_targets() {
+        let state = fresh_state(vec![
+            make_put_record(b"/registry/test/key", b"value1", 1, 42),
+            make_delete_record(b"/registry/test/key", 2),
+        ]);
+
+        let cmp = make_compare(b"/registry/test/key", 0, 0, 1);
+        assert!(!eval_compare(&state, &cmp), "tombstone: version compare should be false");
+
+        let cmp = make_compare(b"/registry/test/key", 1, 0, 1);
+        assert!(!eval_compare(&state, &cmp), "tombstone: create_rev compare should be false");
+
+        let cmp = make_compare(b"/registry/test/key", 2, 0, 1);
+        assert!(!eval_compare(&state, &cmp), "tombstone: mod_rev compare should be false");
+
+        let mut cmp = make_compare(b"/registry/test/key", 3, 0, 0);
+        cmp.target_union = Some(etcdserverpb::compare::TargetUnion::Value(b"value1".to_vec()));
+        assert!(!eval_compare(&state, &cmp), "tombstone: value compare should be false");
+
+        let cmp = make_compare(b"/registry/test/key", 4, 0, 42);
+        assert!(!eval_compare(&state, &cmp), "tombstone: lease compare should be false");
+    }
+
+    #[test]
+    fn test_eval_compare_missing_key_does_not_match() {
+        let state = fresh_state(vec![]);
+
+        // A key that never existed — should behave same as tombstone.
+        // Comparing mod_revision != 0 (any non-zero value) against a missing
+        // key will fail because missing keys yield actual=0.
+        let cmp = make_compare(b"/registry/nonexistent", 2, 0, 1);
+        assert!(!eval_compare(&state, &cmp), "missing key should not match mod_revision == 1");
+    }
+
+    #[test]
+    fn test_eval_compare_recreated_key_matches() {
+        let state = fresh_state(vec![
+            make_put_record(b"/registry/test/key", b"v1", 1, 0),
+            make_delete_record(b"/registry/test/key", 2),
+            make_put_record(b"/registry/test/key", b"v2", 3, 0),
+        ]);
+
+        let cmp = make_compare(b"/registry/test/key", 2, 0, 3);
+        assert!(eval_compare(&state, &cmp), "recreated key should match its new mod_revision");
+
+        let cmp = make_compare(b"/registry/test/key", 2, 0, 1);
+        assert!(!eval_compare(&state, &cmp), "recreated key should NOT match old mod_revision");
     }
 }
