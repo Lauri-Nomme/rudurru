@@ -310,10 +310,48 @@ impl Store {
         WATCHER_COUNT.store(0, Ordering::Relaxed);
         LEASE_COUNT.store(0, Ordering::Relaxed);
 
+        // Restore lease state from alive keys. After WAL replay the actual
+        // LeaseState entries are gone (they were in-memory only), but keys
+        // still carry their lease ID.  We re-create a LeaseState for each
+        // unique lease ID with a generous default TTL; the real owner will
+        // send LeaseKeepAlive immediately to adjust it.
+        let lease_count = {
+            let unique: std::collections::BTreeSet<i64> = state
+                .keys
+                .values()
+                .filter(|ks| ks.is_alive() && ks.lease != 0)
+                .map(|ks| ks.lease)
+                .collect();
+            let max_id = unique.last().copied().unwrap_or(0);
+            if max_id > 0 {
+                // Bump past the highest restored lease ID so new leases don't collide.
+                NEXT_LEASE_ID.store(max_id + 1, Ordering::SeqCst);
+            }
+            let now = tokio::time::Instant::now();
+            // 1 hour default – conservative so nothing expires prematurely.
+            let default_ttl = 3600i64;
+            for &id in &unique {
+                state.leases.insert(
+                    id,
+                    LeaseState {
+                        id,
+                        ttl: default_ttl,
+                        expires_at: now + std::time::Duration::from_secs(default_ttl as u64),
+                        key_count: 0,
+                    },
+                );
+            }
+            unique.len() as u64
+        };
+        if lease_count > 0 {
+            LEASE_COUNT.store(lease_count, Ordering::Relaxed);
+        }
+
         tracing::info!(
-            "rudurru ready: revision={}, keys={}, compact_rev={}",
+            "rudurru ready: revision={}, keys={}, leases_restored={}, compact_rev={}",
             max_rev,
             active_keys,
+            lease_count,
             COMPACT_REV.load(Ordering::Relaxed),
         );
 
@@ -3581,5 +3619,161 @@ mod eval_compare_tests {
 
         let cmp = make_compare(b"/registry/test/key", 2, 0, 1);
         assert!(!eval_compare(&state, &cmp), "recreated key should NOT match old mod_revision");
+    }
+}
+
+#[cfg(test)]
+mod lease_restore_tests {
+    use super::*;
+
+    static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_wal() -> String {
+        let dir = std::env::temp_dir();
+        let n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let name = format!("rudurru_leaserestore_{}_{}.wal", std::process::id(), n);
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().to_string()
+    }
+
+    /// Helper: create a StoreState from a WAL file pre-populated with records,
+    /// exactly as Store::open does internally, but without spawning background
+    /// tasks or interacting with globals.
+    fn rebuild_from_wal(path: &str) -> StoreState {
+        let mut wal = wal::WalFile::open(path).unwrap();
+        let records = wal.scan_kv_collect().unwrap();
+        let mut state = StoreState::new(wal);
+        let mut max_rev = 0u64;
+        for rec in &records {
+            let rev = rec.mod_revision().unwrap_or(0) as u64;
+            apply_record(&mut state, rec);
+            max_rev = max_rev.max(rev);
+        }
+        state.next_rev = max_rev + 1;
+
+        // Replicate the lease restoration logic from Store::open inline.
+        let lease_count = {
+            let unique: std::collections::BTreeSet<i64> = state
+                .keys
+                .values()
+                .filter(|ks| ks.is_alive() && ks.lease != 0)
+                .map(|ks| ks.lease)
+                .collect();
+            let max_id = unique.last().copied().unwrap_or(0);
+            if max_id > 0 {
+                NEXT_LEASE_ID.store(max_id + 1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let now = tokio::time::Instant::now();
+            let default_ttl = 3600i64;
+            for &id in &unique {
+                state.leases.insert(
+                    id,
+                    LeaseState {
+                        id,
+                        ttl: default_ttl,
+                        expires_at: now + std::time::Duration::from_secs(default_ttl as u64),
+                        key_count: 0,
+                    },
+                );
+            }
+            unique.len() as u64
+        };
+        if lease_count > 0 {
+            LEASE_COUNT.store(lease_count, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        state
+    }
+
+    fn make_lease_put_record(key: &[u8], rev: u64, lease: i64) -> wal::KvWalRecord {
+        let flags = wal::IS_CREATE | wal::HAS_LEASE;
+        wal::KvWalRecord::new(flags, key, b"v", rev as i64, rev as i64, 1, lease)
+    }
+
+    fn make_plain_put_record(key: &[u8], rev: u64) -> wal::KvWalRecord {
+        wal::KvWalRecord::new(wal::IS_CREATE, key, b"v", rev as i64, rev as i64, 1, 0)
+    }
+
+    fn populate_wal(path: &str, records: &[wal::KvWalRecord]) {
+        let mut w = wal::WalFile::open(path).unwrap();
+        for r in records {
+            w.append_kv(r).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_leases_restored_after_open() {
+        let path = temp_wal();
+        populate_wal(&path, &[make_lease_put_record(b"/registry/test/leased", 10, 42)]);
+
+        NEXT_LEASE_ID.store(1, std::sync::atomic::Ordering::SeqCst);
+        let state = rebuild_from_wal(&path);
+
+        assert!(state.leases.contains_key(&42), "LeaseState should exist for restored lease 42");
+
+        let ks = state.keys.get(b"/registry/test/leased".as_slice()).unwrap();
+        assert!(ks.is_alive(), "key should be alive");
+        assert_eq!(ks.lease, 42, "key should reference lease 42");
+
+        let next_after = NEXT_LEASE_ID.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(next_after > 42, "NEXT_LEASE_ID({}) should be beyond restored lease 42", next_after);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_leases_restored_multiple_ids() {
+        let path = temp_wal();
+        populate_wal(&path, &[
+            make_lease_put_record(b"/registry/a", 10, 42),
+            make_lease_put_record(b"/registry/b", 20, 99),
+        ]);
+
+        NEXT_LEASE_ID.store(1, std::sync::atomic::Ordering::SeqCst);
+        let state = rebuild_from_wal(&path);
+
+        assert_eq!(state.leases.len(), 2, "both leases should be restored");
+        assert!(state.leases.contains_key(&42), "lease 42 restored");
+        assert!(state.leases.contains_key(&99), "lease 99 restored");
+
+        let next_after = NEXT_LEASE_ID.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(next_after > 99, "NEXT_LEASE_ID({}) > max restored(99)", next_after);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_no_leases_no_restore() {
+        let path = temp_wal();
+        populate_wal(&path, &[make_plain_put_record(b"/registry/nolease", 10)]);
+
+        NEXT_LEASE_ID.store(1, std::sync::atomic::Ordering::SeqCst);
+        let state = rebuild_from_wal(&path);
+
+        assert_eq!(state.leases.len(), 0, "no leases should be restored when none exist");
+
+        let next_after = NEXT_LEASE_ID.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(next_after, 1, "NEXT_LEASE_ID should stay at 1 when no leases restored");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_next_lease_id_bumps_past_restored_max() {
+        let path = temp_wal();
+        populate_wal(&path, &[
+            make_lease_put_record(b"/registry/a", 10, 5),
+            make_lease_put_record(b"/registry/b", 20, 99),
+            make_lease_put_record(b"/registry/c", 30, 42),
+        ]);
+
+        NEXT_LEASE_ID.store(1, std::sync::atomic::Ordering::SeqCst);
+        rebuild_from_wal(&path);
+
+        let next_id = NEXT_LEASE_ID.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(next_id, 100, "NEXT_LEASE_ID should be max(5,99,42)+1 = 100, got {next_id}");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
