@@ -221,6 +221,68 @@ async fn test_watch_client_assigned_id() {
 }
 
 #[tokio::test]
+async fn test_watch_replay_prev_kv() {
+    let mut client = common::connect().await;
+    let key = key!("watch/replay_prev_kv");
+
+    // Create history: three versions of the same key
+    client.put(key.as_str(), "v1", None).await.unwrap();
+    let get1 = client.get(key.as_str(), None).await.unwrap();
+    let rev1 = get1.kvs()[0].mod_revision() + 1; // revision after first put
+
+    client.put(key.as_str(), "v2", None).await.unwrap();
+
+    client.put(key.as_str(), "v3", None).await.unwrap();
+
+    // Create a watch from rev1 (after v1 was created, before v2):
+    // We should receive events for v2 (mod_rev=rev1) and v3.
+    let opts = Some(WatchOptions::new().with_start_revision(rev1).with_prev_key());
+    let mut watch = client.watch(key.as_str(), opts).await.unwrap();
+
+    // First event: v2 put, prev_kv should be v1
+    let resp1 = next_event(&mut watch, 5).await;
+    assert_eq!(resp1.events().len(), 1);
+    let ev1 = &resp1.events()[0];
+    assert_eq!(ev1.event_type(), EventType::Put);
+    assert_eq!(ev1.kv().unwrap().value(), b"v2");
+    let prev1 = ev1.prev_kv().expect("prev_kv should be present for v2 event");
+    assert_eq!(prev1.value(), b"v1", "replayed v2 prev_kv should be v1");
+
+    // Second event: v3 put, prev_kv should be v2
+    let resp2 = next_event(&mut watch, 5).await;
+    assert_eq!(resp2.events().len(), 1);
+    let ev2 = &resp2.events()[0];
+    assert_eq!(ev2.event_type(), EventType::Put);
+    assert_eq!(ev2.kv().unwrap().value(), b"v3");
+    let prev2 = ev2.prev_kv().expect("prev_kv should be present for v3 event");
+    assert_eq!(prev2.value(), b"v2", "replayed v3 prev_kv should be v2");
+}
+
+#[tokio::test]
+async fn test_watch_replay_prev_kv_delete() {
+    let mut client = common::connect().await;
+    let key = key!("watch/replay_prev_kv_del");
+
+    client.put(key.as_str(), "to_be_deleted", None).await.unwrap();
+    let get = client.get(key.as_str(), None).await.unwrap();
+    let rev = get.kvs()[0].mod_revision() + 1; // revision after put, before delete
+
+    // Delete the key
+    client.delete(key.as_str(), None).await.unwrap();
+
+    // Watch from after the put (before the delete) with prev_kv
+    let opts = Some(WatchOptions::new().with_start_revision(rev).with_prev_key());
+    let mut watch = client.watch(key.as_str(), opts).await.unwrap();
+
+    let resp = next_event(&mut watch, 5).await;
+    assert_eq!(resp.events().len(), 1);
+    let ev = &resp.events()[0];
+    assert_eq!(ev.event_type(), EventType::Delete);
+    let prev = ev.prev_kv().expect("prev_kv should be present for delete event");
+    assert_eq!(prev.value(), b"to_be_deleted", "delete event prev_kv should be the deleted value");
+}
+
+#[tokio::test]
 async fn test_watch_compact_revision() {
     let mut client = common::connect().await;
     let key = key!("watch/compact_rev");

@@ -3,6 +3,7 @@ use crate::proto::etcdserverpb::watch_request;
 use crate::proto::mvccpb;
 use crate::storage::{self, current_revision, wal, Store, WatchEvent, WatchRegistration};
 use prost::bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,23 +48,6 @@ fn should_send_event(filters: &[i32], event_type: i32) -> bool {
         }
     }
     true
-}
-
-fn kvrec_to_event(rec: &wal::KvWalRecord) -> Option<WatchEvent> {
-    let deleted = (rec.flags & wal::DELETED) != 0;
-    let rev = rec.mod_revision().unwrap_or(0) as u64;
-    let key = rec.key()?.to_vec();
-    Some(WatchEvent {
-        revision: rev,
-        event_type: if deleted {
-            mvccpb::event::EventType::Delete
-        } else {
-            mvccpb::event::EventType::Put
-        },
-        key,
-        kv_bytes: Bytes::from(rec.kv_bytes.clone()),
-        prev_kv_bytes: Bytes::new(),
-    })
 }
 
 struct PendingCreate {
@@ -292,7 +276,26 @@ async fn global_watch_loop(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<Gl
     }
 }
 
+fn current_checkpoint(store: &Store) -> (u64, u64) {
+    let state = store.state.read();
+    let rev = current_revision();
+    let off = std::fs::metadata(&state.wal.path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    (rev, off)
+}
+
 async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
+    let (checkpoint_rev, checkpoint_offset) = current_checkpoint(store);
+    flush_global_batch_at(batch, store, checkpoint_rev, checkpoint_offset).await;
+}
+
+async fn flush_global_batch_at(
+    batch: &mut Vec<GlobalCreate>,
+    store: &Arc<Store>,
+    checkpoint_rev: u64,
+    checkpoint_offset: u64,
+) {
     if batch.is_empty() {
         return;
     }
@@ -375,20 +378,11 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
         return;
     }
 
-    // ── checkpoint rev + offset ────────────────────────────────────
-    let (checkpoint_rev, checkpoint_offset) = {
-        let state = store.state.read();
-        let rev = current_revision();
-        let off = std::fs::metadata(&state.wal.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        (rev, off)
-    };
-
     // ── Phase 1: scan without lock, shared across all streams ──────
-    let phase1_us = {
+    let (phase1_us, mut prev_kv_map) = {
         let t0 = Instant::now();
         let wal_path = store.wal_path().await;
+        let mut prev_kv_map: HashMap<Vec<u8>, Bytes> = HashMap::new();
         if let Ok(mut reader) = wal::WalFile::open(&wal_path) {
             let _ = reader.scan_kv(0, |rec| {
                 let rev = rec.mod_revision().unwrap_or(0) as u64;
@@ -399,9 +393,24 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
                     Some(k) => k,
                     None => return,
                 };
-                let event = match kvrec_to_event(rec) {
-                    Some(e) => e,
-                    None => return,
+                let deleted = (rec.flags & wal::DELETED) != 0;
+                let event_type = if deleted {
+                    mvccpb::event::EventType::Delete
+                } else {
+                    mvccpb::event::EventType::Put
+                };
+                let prev_kv = prev_kv_map.get(key).cloned().unwrap_or(Bytes::new());
+                if deleted {
+                    prev_kv_map.remove(key);
+                } else {
+                    prev_kv_map.insert(key.to_vec(), Bytes::from(rec.kv_bytes.clone()));
+                }
+                let event = WatchEvent {
+                    revision: rev,
+                    event_type,
+                    key: key.to_vec(),
+                    kv_bytes: Bytes::from(rec.kv_bytes.clone()),
+                    prev_kv_bytes: prev_kv,
                 };
                 for ctx in &active {
                     if rev >= ctx.start_revision
@@ -413,7 +422,7 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
                 }
             });
         }
-        t0.elapsed().as_micros()
+        (t0.elapsed().as_micros(), prev_kv_map)
     };
 
     // ── Phase 2: under lock, catch up then register all ────────────
@@ -423,27 +432,44 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
 
     let t_work = Instant::now();
 
-    let _ = state.wal.scan_kv(checkpoint_offset, |rec| {
-        let rev = rec.mod_revision().unwrap_or(0) as u64;
-        if rev <= checkpoint_rev {
-            return;
-        }
-        let key = match rec.key() {
-            Some(k) => k,
-            None => return,
-        };
-        let event = match kvrec_to_event(rec) {
-            Some(e) => e,
-            None => return,
-        };
-        for ctx in &active {
-            if storage::matches_range(ctx.bound.to_ref(), key)
-                && should_send_event(&ctx.filters, event.event_type as i32)
-            {
-                let _ = ctx.event_tx.send(event.clone());
+    {
+        let _ = state.wal.scan_kv(checkpoint_offset, |rec| {
+            let rev = rec.mod_revision().unwrap_or(0) as u64;
+            if rev <= checkpoint_rev {
+                return;
             }
-        }
-    });
+            let key = match rec.key() {
+                Some(k) => k,
+                None => return,
+            };
+            let deleted = (rec.flags & wal::DELETED) != 0;
+            let event_type = if deleted {
+                mvccpb::event::EventType::Delete
+            } else {
+                mvccpb::event::EventType::Put
+            };
+            let prev_kv = prev_kv_map.get(key).cloned().unwrap_or(Bytes::new());
+            if deleted {
+                prev_kv_map.remove(key);
+            } else {
+                prev_kv_map.insert(key.to_vec(), Bytes::from(rec.kv_bytes.clone()));
+            }
+            let event = WatchEvent {
+                revision: rev,
+                event_type,
+                key: key.to_vec(),
+                kv_bytes: Bytes::from(rec.kv_bytes.clone()),
+                prev_kv_bytes: prev_kv,
+            };
+            for ctx in &active {
+                if storage::matches_range(ctx.bound.to_ref(), key)
+                    && should_send_event(&ctx.filters, event.event_type as i32)
+                {
+                    let _ = ctx.event_tx.send(event.clone());
+                }
+            }
+        });
+    }
 
     for ctx in &active {
         state.register_watcher(WatchRegistration {
@@ -492,5 +518,102 @@ async fn flush_global_batch(batch: &mut Vec<GlobalCreate>, store: &Arc<Store>) {
             fragment: false,
         };
         let _ = ctx.reply.take().unwrap().send(Ok(resp));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::mvccpb::KeyValue;
+    use prost::Message;
+
+    fn temp_wal() -> String {
+        format!("/tmp/rudurru_watch_test_{}", std::process::id())
+    }
+
+    fn decode_val(bytes: &Bytes) -> Vec<u8> {
+        KeyValue::decode(bytes.as_ref())
+            .map(|kv| kv.value.to_vec())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_phase2_prev_kv_uses_phase1_map() {
+        let path = temp_wal();
+        // Clean up from prior runs
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).await.unwrap());
+
+        // Build history: v1, v2 at known revisions
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"foo".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"foo".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Snapshot the checkpoint state AFTER v2
+        let checkpoint_rev = current_revision();
+        let checkpoint_offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        // Simulate a concurrent put between Phase 1 and Phase 2
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"foo".to_vec(),
+                value: b"v3".to_vec(),
+                ..Default::default()
+            })
+            .await;
+
+        // Set up a watcher that filters from v2 onward (prev_kv=true)
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (reply_tx, _reply_rx) = oneshot::channel();
+
+        let mut batch = vec![GlobalCreate {
+            pending: PendingCreate {
+                key: b"foo".to_vec(),
+                range_end: vec![],
+                start_revision: checkpoint_rev, // ≥ v2, < v3
+                progress_notify: false,
+                filters: vec![],
+                prev_kv: true,
+            },
+            event_tx,
+            reply: reply_tx,
+            stream_id: 1,
+            remote_addr: "test".into(),
+            watch_id: 42,
+        }];
+
+        flush_global_batch_at(&mut batch, &store, checkpoint_rev, checkpoint_offset).await;
+
+        // Collect replayed events
+        let mut events: Vec<WatchEvent> = Vec::new();
+        while let Ok(e) = event_rx.try_recv() {
+            events.push(e);
+        }
+
+        // We expect two events: v2 (from Phase 1) and v3 (from Phase 2)
+        assert_eq!(events.len(), 2, "should replay v2 and v3");
+
+        // v2 event: kv=v2, prev_kv should be v1
+        let ev2 = &events[0];
+        assert_eq!(decode_val(&ev2.kv_bytes), b"v2");
+        assert_eq!(decode_val(&ev2.prev_kv_bytes), b"v1", "v2 prev_kv should be v1");
+
+        // v3 event: kv=v3, prev_kv should be v2
+        let ev3 = &events[1];
+        assert_eq!(decode_val(&ev3.kv_bytes), b"v3");
+        assert_eq!(decode_val(&ev3.prev_kv_bytes), b"v2", "v3 prev_kv should be v2 — fails without Phase 1→Phase 2 prev_kv_map handoff");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
