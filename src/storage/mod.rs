@@ -157,7 +157,14 @@ impl StoreState {
         }
     }
 
-    fn apply(&mut self, key: Vec<u8>, value: Vec<u8>, lease: i64, rev: u64) -> Option<KeyState> {
+    fn apply(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        lease: i64,
+        rev: u64,
+        kv_bytes: Option<Bytes>,
+    ) -> Option<KeyState> {
         let prev = self.keys.get(&key).filter(|k| k.is_alive()).cloned();
         let is_new = prev.is_none();
         // Detect whether this key was previously deleted (lost a lifetime)
@@ -169,12 +176,12 @@ impl StoreState {
             create_revision: prev.as_ref().map(|k| k.create_revision).unwrap_or(rev),
             version: prev.as_ref().map(|k| k.version + 1).unwrap_or(1),
             lease,
-            
+
             delete_revision: 0,
             rebirth,
             kv_bytes: Bytes::new(),
         };
-        entry.kv_bytes = make_kv_bytes(&key, &entry);
+        entry.kv_bytes = kv_bytes.unwrap_or_else(|| make_kv_bytes(&key, &entry));
         let event_key = key.clone();
         self.keys.insert(key, entry.clone());
         if is_new {
@@ -938,7 +945,7 @@ impl Store {
             tracing::error!("WAL append failed: {e}");
         }
 
-        let prev = state.apply(key, value, lease, rev);
+        let prev = state.apply(key, value, lease, rev, None);
 
         let header = Some(state.header());
         let prev_kv = if req.prev_kv {
@@ -1507,60 +1514,13 @@ impl Store {
 /// and fires watch events for any watchers caught up during replay.
 fn apply_record(state: &mut StoreState, rec: &wal::KvWalRecord) {
     let deleted = (rec.flags & wal::DELETED) != 0;
+    let rev = rec.mod_revision().unwrap_or(0) as u64;
 
     if deleted {
         let key = rec.key().unwrap_or_default().to_vec();
-        let del_rev = rec.mod_revision().unwrap_or(0) as u64;
-        // Keep the key in the map with deleted=true so that historical queries
-        // can see it. Preserve the last known value in kv_bytes.
-        if let Some(entry) = state.keys.get_mut(&key) {
-            
-            entry.delete_revision = del_rev;
-        }
-        // If the key was never seen (WAL has delete-only records), insert it.
-        state.keys.entry(key.clone()).or_insert(KeyState {
-            value: Arc::from(&b""[..]),
-            mod_revision: del_rev,
-            create_revision: del_rev,
-            version: 0,
-            lease: 0,
-            
-            delete_revision: del_rev,
-            rebirth: false,
-            kv_bytes: Bytes::from(rec.kv_bytes.clone()),
-        });
-        let event = WatchEvent {
-            revision: del_rev,
-            event_type: mvccpb::event::EventType::Delete,
-            key: key.clone(),
-            kv_bytes: Bytes::from(rec.kv_bytes.clone()),
-            prev_kv_bytes: Bytes::from(rec.kv_bytes.clone()),
-        };
-        state.notify_watchers(event);
+        state.apply_delete(key, rev);
     } else if let Ok(kv) = mvccpb::KeyValue::decode(&rec.kv_bytes[..]) {
-        let key = kv.key.clone();
-        let value = kv.value.clone();
-        let entry = KeyState {
-            value: Arc::from(value.into_boxed_slice()),
-            mod_revision: kv.mod_revision as u64,
-            create_revision: kv.create_revision as u64,
-            version: kv.version,
-            lease: kv.lease,
-            
-            delete_revision: 0,
-            rebirth: false,
-            kv_bytes: Bytes::from(rec.kv_bytes.clone()),
-        };
-        state.keys.insert(key.clone(), entry);
-
-        let event = WatchEvent {
-            revision: rec.mod_revision().unwrap_or(0) as u64,
-            event_type: mvccpb::event::EventType::Put,
-            key,
-            kv_bytes: Bytes::from(rec.kv_bytes.clone()),
-            prev_kv_bytes: Bytes::new(),
-        };
-        state.notify_watchers(event);
+        state.apply(kv.key, kv.value, kv.lease, rev, Some(Bytes::from(rec.kv_bytes.clone())));
     }
 }
 

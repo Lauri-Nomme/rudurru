@@ -225,22 +225,48 @@ pattern.
 
 **Files:** `src/storage/mod.rs:1500-1556` (replay) vs `160-221` (runtime)
 
+**Status:** ✅ Fixed — `apply_record` now delegates to `apply()`/`apply_delete()`.
+
 The startup replay path and the runtime mutation path implement similar logic
 independently:
 - Both insert/update keys in the BTreeMap
 - Both fire watch events
 - Both handle tombstoned keys
 
-But there are subtle differences:
-- Replay uses `rec.kv_bytes.clone()`; runtime uses `make_kv_bytes()` which
+But before the fix there were subtle differences:
+- Replay used `rec.kv_bytes.clone()`; runtime used `make_kv_bytes()` which
   re-encodes from `KeyState` fields
-- Replay doesn't compute `rebirth` flag (it's always `false` on replay, which
-  is correct since historical queries during replay are meaningless)
-- Replay deserializes `mvccpb::KeyValue` from `kv_bytes`; runtime constructs
+- Replay didn't compute `rebirth` flag (always `false` on replay)
+- Replay deserialized `mvccpb::KeyValue` from `kv_bytes`; runtime constructed
   from field data
+- Replay duplicated KeyState construction, insert logic, WatchEvent creation,
+  and `notify_watchers` calls — all independently of `apply`/`apply_delete`
 
-A shared `fn apply_wal_record(&mut self, rec: &KvWalRecord)` would guarantee
-that both paths produce identical state.
+**Diagram of the fix:**
+
+```
+BEFORE:                                            AFTER:
+                                                  │
+put()       apply_record()                       put()         apply_record()
+  │           │                                    │              │
+  │           ├── KeyState {kv: raw}               │              │
+  │           ├── keys.insert                      │              │
+  │           ├── WatchEvent {kv: raw}             │              │
+  │           └── notify_watchers                  │              │
+  │                                ──►            │              │
+  ├── KeyState {kv: empty}                        └──► apply(k,v,l,r,kv_opt) ◄──┘
+  ├── make_kv_bytes(&key,&entry)                        │
+  ├── keys.insert                                        ├── KeyState { ... }
+  ├── WatchEvent {kv: encoded}                           ├── kv_bytes = kv_opt
+  └── notify_watchers                                    │  .unwrap_or_else(make_kv_bytes)
+                                                         ├── keys.insert
+Both paths:                                              ├── WatchEvent {kv_bytes}
+- same logic, different code                            └── notify_watchers
+- same intent, different behavior
+                                                    ONE code path.
+                                                    kv_bytes = Some(raw) during replay,
+                                                    None during runtime → make_kv_bytes.
+```
 
 ### 3.2 `store_hash()` uses `DefaultHasher`
 
