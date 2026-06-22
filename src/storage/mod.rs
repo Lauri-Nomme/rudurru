@@ -182,7 +182,7 @@ impl StoreState {
             kv_bytes: Bytes::new(),
         };
         entry.kv_bytes = kv_bytes.unwrap_or_else(|| make_kv_bytes(&key, &entry));
-        let event_key = key.clone();
+        let event_key = Bytes::from(key.clone());
         self.keys.insert(key, entry.clone());
         if is_new {
             KEY_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -219,7 +219,7 @@ impl StoreState {
         let event = WatchEvent {
             revision: rev,
             event_type: mvccpb::event::EventType::Delete,
-            key: key.clone(),
+            key: Bytes::from(key),
             kv_bytes: prev.kv_bytes.clone(),
             prev_kv_bytes: prev.kv_bytes.clone(),
         };

@@ -444,7 +444,7 @@ async fn flush_global_batch_at(
                 let event = WatchEvent {
                     revision: rev,
                     event_type,
-                    key: key.to_vec(),
+                    key: Bytes::copy_from_slice(key),
                     kv_bytes: Bytes::from(rec.kv_bytes.clone()),
                     prev_kv_bytes: prev_kv,
                 };
@@ -493,7 +493,7 @@ async fn flush_global_batch_at(
             let event = WatchEvent {
                 revision: rev,
                 event_type,
-                key: key.to_vec(),
+                    key: Bytes::copy_from_slice(key),
                 kv_bytes: Bytes::from(rec.kv_bytes.clone()),
                 prev_kv_bytes: prev_kv,
             };
