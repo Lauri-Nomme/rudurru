@@ -3729,3 +3729,35 @@ mod lease_restore_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod resolve_range_tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_range_prefix_0xff_does_not_wrap() {
+        let key = b"abc\xFF";
+        let range_end = b"abc\x00";
+        let bound = resolve_range(key, range_end);
+        assert!(
+            !matches!(bound, RangeBound::Prefix(_)),
+            "expected Range, got Prefix for key ending in 0xFF: {bound:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_range_prefix_normal() {
+        let key = b"abc";
+        let range_end = b"abd";
+        let bound = resolve_range(key, range_end);
+        assert!(matches!(bound, RangeBound::Prefix(_)), "expected Prefix, got {bound:?}");
+    }
+
+    #[test]
+    fn test_resolve_range_prefix_0xff_suffix() {
+        let key = b"abc\xFF";
+        let range_end = b"abc\xFF\x00";
+        let bound = resolve_range(key, range_end);
+        assert!(matches!(bound, RangeBound::Prefix(_)), "expected Prefix via \\0 suffix, got {bound:?}");
+    }
+}
