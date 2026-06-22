@@ -332,29 +332,7 @@ impl WalFile {
         F: FnMut(&KvWalRecord),
     {
         let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-        drop(file);
-        let mut f = f;
-        let mut ofs = 0;
-        while ofs < buf.len() {
-            match KvWalRecord::deserialize(&buf[ofs..]) {
-                Ok((rec, consumed)) => {
-                    f(&rec);
-                    ofs += consumed;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        wal_offset = offset + ofs as u64,
-                        error = %e,
-                        "kvwal_record_error"
-                    );
-                    break;
-                }
-            }
-        }
-        Ok(offset + buf.len() as u64)
+        scan_kv_file(&mut *file, offset, f)
     }
 
     pub fn scan_kv_collect(&mut self) -> io::Result<Vec<KvWalRecord>> {
@@ -393,6 +371,53 @@ impl WalFile {
         self.dirty.store(false, Ordering::Release);
         Ok(())
     }
+}
+
+/// Read records from a file starting at `offset`, calling `f` for each.
+/// Uses streaming reads instead of loading the entire file into memory.
+pub fn scan_kv_file<F>(file: &mut std::fs::File, offset: u64, mut f: F) -> io::Result<u64>
+where
+    F: FnMut(&KvWalRecord),
+{
+    file.seek(SeekFrom::Start(offset))?;
+    let mut cur = offset;
+    let mut header = [0u8; KV_HEADER_SIZE];
+    loop {
+        match file.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let rec_len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+        if rec_len < KV_HEADER_SIZE + KV_CRC_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rec_len too small",
+            ));
+        }
+        let mut buf = header.to_vec();
+        buf.resize(rec_len, 0);
+        match file.read_exact(&mut buf[KV_HEADER_SIZE..]) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                tracing::warn!(wal_offset = cur, "partial_wal_record");
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+
+        match KvWalRecord::deserialize(&buf) {
+            Ok((rec, consumed)) => {
+                f(&rec);
+                cur += consumed as u64;
+            }
+            Err(e) => {
+                tracing::warn!(wal_offset = cur, error = %e, "kvwal_record_error");
+                break;
+            }
+        }
+    }
+    Ok(cur)
 }
 
 // ── Legacy old-format WalRecord (for migration tool only) ─────────

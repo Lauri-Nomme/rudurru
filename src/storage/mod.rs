@@ -1671,8 +1671,6 @@ fn scan_wal_range(
     range_end: &[u8],
     up_to_rev: u64,
 ) -> std::io::Result<HashMap<Vec<u8>, Bytes>> {
-    use std::io::Read;
-
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1682,51 +1680,30 @@ fn scan_wal_range(
         Err(e) => return Err(e),
     };
 
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    drop(file);
-
     let bound = resolve_range(key, range_end);
     let mut state: HashMap<Vec<u8>, Bytes> = HashMap::new();
 
-    let mut ofs = 0;
-    while ofs < buf.len() {
-        match wal::KvWalRecord::deserialize(&buf[ofs..]) {
-            Ok((rec, consumed)) => {
-                let rev = rec.mod_revision().unwrap_or(0) as u64;
-                let rec_key = match rec.key() {
-                    Some(k) => k,
-                    None => {
-                        ofs += consumed;
-                        continue;
-                    }
-                };
+    wal::scan_kv_file(&mut file, 0, |rec| {
+        let rev = rec.mod_revision().unwrap_or(0) as u64;
+        let rec_key = match rec.key() {
+            Some(k) => k,
+            None => return,
+        };
 
-                // Only process records in the requested key range
-                if !matches_range(bound.to_ref(), rec_key) {
-                    ofs += consumed;
-                    continue;
-                }
+        // Only process records in the requested key range
+        if !matches_range(bound.to_ref(), rec_key) {
+            return;
+        }
 
-                if rev <= up_to_rev {
-                    let is_delete = (rec.flags & wal::DELETED) != 0;
-                    if is_delete {
-                        state.remove(rec_key);
-                    } else {
-                        state.insert(
-                            rec_key.to_vec(),
-                            Bytes::copy_from_slice(&rec.kv_bytes),
-                        );
-                    }
-                }
-                ofs += consumed;
-            }
-            Err(_) => {
-                // Partial/corrupt record at tail — stop
-                break;
+        if rev <= up_to_rev {
+            let is_delete = (rec.flags & wal::DELETED) != 0;
+            if is_delete {
+                state.remove(rec_key);
+            } else {
+                state.insert(rec_key.to_vec(), Bytes::copy_from_slice(&rec.kv_bytes));
             }
         }
-    }
+    })?;
 
     Ok(state)
 }
