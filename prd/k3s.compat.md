@@ -65,13 +65,9 @@ Our `execute_txn_ops` runs operations sequentially and does not roll back on fai
 
 Mitigation: WAL append failures are extremely rare (`sync_all` errors on disk-full or IO error). The current behavior (continue on error, don't roll back) is no worse than a crash at the same point.
 
-### 3. Watch WAL Replay with Compaction
+### 3. ~~Watch WAL Replay with Compaction~~ ✅
 
-If a watcher specifies `start_revision < compact_rev`, replay returns no events and the watcher stays registered. The kube-apiserver's informer will miss events and hang until timeout. This can happen if:
-- kube-apiserver restarts after a long compaction interval
-- A watch client reconnects after being disconnected for a long time
-
-Fix: return `compact_revision` in the WatchResponse and cancel the watcher. Currently not implemented.
+If a watcher specifies `start_revision < compact_rev`, the server returns `compact_revision` in the WatchResponse and cancels the watcher before registration. See `flush_global_batch_at` in `src/server/watch.rs`. **Implemented.**
 
 ### 4. Revision Semantics
 

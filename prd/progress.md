@@ -117,8 +117,8 @@ Each `WatchCreateRequest` spawns a `tokio::spawn` task that reads from the watch
 **6. Global `AtomicI64` watch_id counter**
 `NEXT_WATCH_ID` is a global atomic, starting at 1. The proto allows client-assigned IDs (non-zero), so the server only assigns IDs when the client sends `watch_id=0`. A per-stream counter would be sufficient but a global one keeps it simple.
 
-**7. Progress response as immediate reply**
-`WatchProgressRequest` sends back a `WatchResponse` with header only (no events, `watch_id=0`). Periodic progress notifications (`progress_notify` flag on create) are **not implemented** — the server sends no unsolicited progress responses.
+**7. Progress response as immediate reply + periodic timer**
+`WatchProgressRequest` sends back a `WatchResponse` with header only (no events, `watch_id=0`). Periodic progress notifications (`progress_notify` flag on create) are implemented via `tokio::time::interval` — the event forwarding task uses `tokio::select!` between `event_rx.recv()` and a 300-second interval tick, sending an empty `WatchResponse` with the current revision header on each tick.
 
 ### CRC32C Bug Discovered & Fixed
 
@@ -136,7 +136,7 @@ This bug was invisible to KV/Txn integration tests because they operate on the l
 
 1. **WAL replay creates synthetic events.** During replay, `create_revision` and `mod_revision` are set to `rec.revision` (the WAL record's revision, which is the delete/write revision), not the original `create_revision`. `version` is set to 1, `prev_kv` is None. This is incorrect for keys that were created and modified multiple times, but acceptable because the WAL format doesn't store this metadata per record — it would need a separate index.
 
-2. **No compaction awareness in watcher WAL replay.** If `start_revision` is below `compact_rev`, the watcher should receive a `WatchResponse` with `compact_revision` set and `canceled: true`. Currently, replay returns nothing for compacted revisions and the watcher stays registered, waiting for events that will never come. This would manifest as a hung watcher if a client reconnects after compaction.
+2. ~~**No compaction awareness in watcher WAL replay.**~~ ✅ **Fixed.** If `start_revision` is below `compact_rev`, the watcher receives a `WatchResponse` with `compact_revision` set and `canceled: true`, and is never registered. See `flush_global_batch_at` in `watch.rs`.
 
 3. **Watcher cleanup on disconnect is indirect.** When the client disconnects, the main handler loop gets `Ok(None)` from `in_stream.message()` and exits. The `tx` sender is dropped, closing the output channel. Forward tasks detect the send error and cancel their watcher. However, if the main handler is blocked on `in_stream.message()` (waiting for the next request) and the client disconnects silently, tonic should return `None` — but this depends on the TCP keepalive / HTTP/2 ping behavior. A `Drop`-based cleanup guard on the response channel would be more robust.
 
@@ -146,13 +146,13 @@ This bug was invisible to KV/Txn integration tests because they operate on the l
 
 | Gap | Impact | When to Fix |
 |-----|--------|-------------|
-| No `progress_notify` timer | Clients using `progress_notify` flag won't receive periodic progress updates | Phase 6 or if a client needs it |
-| No compaction error on WAL replay | Watcher at compacted revision silently returns no events and stays registered | Phase 5 (Lease + compaction hardening) |
+| ~~No `progress_notify` timer~~ ✅ | Periodic progress updates sent via `tokio::time::interval` in event forwarding task | **Done** |
+| ~~No compaction error on WAL replay~~ ✅ | Watcher at compacted revision receives `compact_revision` + canceled | **Done** |
 | WAL replay event metadata is approximated | `create_revision`, `version`, `prev_kv` in replayed events may be wrong | Requires storing KV metadata in WAL (breaking format change) |
 | No `fragment` support | Large watch responses not split | If k3s watches large keys |
-| Server has no graceful shutdown | Active watch streams are dropped on server exit | Phase 5 |
+| ~~Server has no graceful shutdown~~ ✅ | Ctrl+C triggers tonic graceful shutdown | **Done** |
 | `mpsc::unbounded_channel` memory unbounded | Slow consumer causes OOM risk | Add channel capacity limit or back-pressure |
-| `resolve_range` called on every event notification | ~5 branches + BTreeMap iteration per event per watcher | Cache `RangeBound` in `WatchRegistration` |
+| ~~`resolve_range` called on every event notification~~ ✅ | `RangeBound` cached in `WatchRegistration.bound` | **Done** |
 
 ### Test Coverage
 

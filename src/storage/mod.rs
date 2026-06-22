@@ -1011,6 +1011,13 @@ impl Store {
         ops: Vec<etcdserverpb::RequestOp>,
         succeeded: bool,
     ) -> etcdserverpb::TxnResponse {
+        if ops.len() > 1 {
+            tracing::warn!(
+                op_count = ops.len(),
+                succeeded,
+                "txn_multi_op: partial execution possible on WAL write failure — txn is not atomic across multiple ops"
+            );
+        }
         let mut responses = Vec::with_capacity(ops.len());
 
         for op in ops {

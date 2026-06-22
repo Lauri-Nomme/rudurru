@@ -504,7 +504,7 @@ fn replay_from_wal(start_rev: u64, prefix: &[u8], tx: Sender) {
 
 **Progress notifications:**
 
-If `progress_notify` is set, the server periodically (every 5 minutes, matching etcd behavior) sends an empty `WatchResponse` with the current header. Implemented with a `tokio::time::interval` per watcher.
+If `progress_notify` is set, the server periodically (every 5 minutes, matching etcd behavior) sends an empty `WatchResponse` with the current header. Implemented with a `tokio::time::interval` per watcher in the event forwarding task (`src/server/watch.rs`).
 
 **Watch cancellation:**
 
@@ -764,11 +764,11 @@ See `Cargo.toml` for exact versions.
 - `Txn` — condition evaluation, multi-op execution, single revision
 - `Compact` — WAL rewrite, tombstone GC
 
-### Phase 3: Watch
+### Phase 3: Watch (done)
 - Watch stream lifecycle (create, cancel, disconnect)
 - Event replay from WAL
 - Push notifications via mpsc
-- Progress notifications
+- Progress notifications (manual + periodic via `progress_notify` timer)
 
 ### Phase 4: Lease
 - LeaseGrant / LeaseRevoke / LeaseKeepAlive

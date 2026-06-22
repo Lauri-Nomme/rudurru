@@ -131,6 +131,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 } else {
                                     next_watch_id()
                                 };
+                                let progress_notify = create.progress_notify;
 
                                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
                                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -173,22 +174,52 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 let tx_clone = tx.clone();
                                 let store_clone = store.clone();
                                 tokio::spawn(async move {
-                                    while let Some(event) = event_rx.recv().await {
-                                        let resp = etcdserverpb::WatchResponse {
-                                            header: Some(make_header(event.revision as i64)),
-                                            watch_id,
-                                            created: false,
-                                            canceled: false,
-                                            compact_revision: 0,
-                                            cancel_reason: String::new(),
-                                            events: vec![event_to_proto(&event)],
-                                            fragment: false,
-                                        };
-                                        if tx_clone.send(Ok(resp)).await.is_err() {
-                                            tracing::warn!(watch_id, "watch_dropped");
-                                            let mut s = store_clone.state.write();
-                                            s.cancel_watcher(watch_id);
-                                            break;
+                                    let mut interval =
+                                        tokio::time::interval(Duration::from_secs(300));
+                                    interval.tick().await;
+                                    loop {
+                                        tokio::select! {
+                                            biased;
+                                            event = event_rx.recv() => {
+                                                let Some(event) = event else { break };
+                                                let resp = etcdserverpb::WatchResponse {
+                                                    header: Some(make_header(event.revision as i64)),
+                                                    watch_id,
+                                                    created: false,
+                                                    canceled: false,
+                                                    compact_revision: 0,
+                                                    cancel_reason: String::new(),
+                                                    events: vec![event_to_proto(&event)],
+                                                    fragment: false,
+                                                };
+                                                if tx_clone.send(Ok(resp)).await.is_err() {
+                                                    tracing::warn!(watch_id, "watch_dropped");
+                                                    let mut s = store_clone.state.write();
+                                                    s.cancel_watcher(watch_id);
+                                                    break;
+                                                }
+                                            }
+                                            _ = interval.tick() => {
+                                                if !progress_notify {
+                                                    continue;
+                                                }
+                                                let resp = etcdserverpb::WatchResponse {
+                                                    header: Some(make_header(current_revision() as i64)),
+                                                    watch_id,
+                                                    created: false,
+                                                    canceled: false,
+                                                    compact_revision: 0,
+                                                    cancel_reason: String::new(),
+                                                    events: vec![],
+                                                    fragment: false,
+                                                };
+                                                if tx_clone.send(Ok(resp)).await.is_err() {
+                                                    tracing::warn!(watch_id, "watch_dropped");
+                                                    let mut s = store_clone.state.write();
+                                                    s.cancel_watcher(watch_id);
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                 });
