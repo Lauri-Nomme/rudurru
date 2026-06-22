@@ -618,10 +618,10 @@ The split is clean and practical.
 | **P2** | Lease revocations use per-key revisions (1.5) | 2 lines | Low | ✅ |
 | **P2** | Extract delete-under-lease helper (2.4) | 20 lines | Medium | ✅ |
 | **P2** | Simplify module split (5) | 2–4 hours | Medium | Pending (deferred to last) |
-| **P3** | Stream WAL reader (2.1) | ~3 days | High | In progress |
-| **P3** | Unify `apply_record` + `apply` (3.1) | 1 day | Medium | In progress |
-| **P3** | Lease validation on put (1.6) | 3 lines | Low | In progress |
-| **P3** | `lease_keep_alive` return error (1.4) | 5 lines | Low | In progress |
+| **P3** | Stream WAL reader (2.1) | ~3 days | High | ✅ |
+| **P3** | Unify `apply_record` + `apply` (3.1) | 1 day | Medium | ✅ |
+| **P3** | Lease validation on put (1.6) | 3 lines | Low | ✅ |
+| **P3** | `lease_keep_alive` return error (1.4) | 5 lines | Low | ✅ |
 | **P4** | `KeyState` visibility (4.1) | 15 min | Low | Pending |
 | **P4** | Split `impl Store` blocks (4.2) | 30 min | Low | Pending |
 | **P4** | `WatchEvent.key` → `Bytes` (4.5) | 2 hours | Low | Pending |
