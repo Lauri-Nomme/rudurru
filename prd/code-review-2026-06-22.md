@@ -622,7 +622,7 @@ The split is clean and practical.
 | **P3** | Unify `apply_record` + `apply` (3.1) | 1 day | Medium | ✅ |
 | **P3** | Lease validation on put (1.6) | 3 lines | Low | ✅ |
 | **P3** | `lease_keep_alive` return error (1.4) | 5 lines | Low | ✅ |
-| **P4** | `KeyState` visibility (4.1) | 15 min | Low | Pending |
-| **P4** | Split `impl Store` blocks (4.2) | 30 min | Low | Pending |
-| **P4** | `WatchEvent.key` → `Bytes` (4.5) | 2 hours | Low | Pending |
-| **P4** | `resolve_range` prefix edge case (1.7) | 5 lines | Low | Pending |
+| **P4** | `KeyState` visibility (4.1) | 15 min | Low | ✅ |
+| **P4** | Split `impl Store` blocks (4.2) | 30 min | Low | Pending (deferred) |
+| **P4** | `WatchEvent.key` → `Bytes` (4.5) | 2 hours | Low | ✅ |
+| **P4** | `resolve_range` prefix edge case (1.7) | 5 lines | Low | ✅ |
