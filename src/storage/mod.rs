@@ -175,7 +175,8 @@ impl StoreState {
             kv_bytes: Bytes::new(),
         };
         entry.kv_bytes = make_kv_bytes(&key, &entry);
-        self.keys.insert(key.clone(), entry.clone());
+        let event_key = key.clone();
+        self.keys.insert(key, entry.clone());
         if is_new {
             KEY_COUNT.fetch_add(1, Ordering::Relaxed);
         }
@@ -183,7 +184,7 @@ impl StoreState {
         let event = WatchEvent {
             revision: rev,
             event_type: mvccpb::event::EventType::Put,
-            key: key.clone(),
+            key: event_key,
             kv_bytes: entry.kv_bytes.clone(),
             prev_kv_bytes: prev
                 .as_ref()
@@ -850,7 +851,7 @@ impl Store {
     pub async fn put(&self, req: etcdserverpb::PutRequest) -> etcdserverpb::PutResponse {
         let rev = next_revision();
         let mut state = self.state.write();
-        let key = req.key.clone();
+        let key = req.key;
 
         let prev_entry = state.keys.get(&key);
         let value = if req.ignore_value {
@@ -890,7 +891,7 @@ impl Store {
             tracing::error!("WAL append failed: {e}");
         }
 
-        let prev = state.apply(key.clone(), value, lease, rev);
+        let prev = state.apply(key, value, lease, rev);
 
         let header = Some(state.header());
         let prev_kv = if req.prev_kv {
