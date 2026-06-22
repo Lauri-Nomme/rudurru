@@ -97,7 +97,20 @@ impl etcdserverpb::lease_server::Lease for Lease {
                             id = msg.id,
                             "LeaseKeepAlive"
                         );
-                        let resp = store.lease_keep_alive(msg.id).await;
+                        let resp = match store.lease_keep_alive(msg.id).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::trace!(
+                                    remote_addr = %remote,
+                                    id = msg.id,
+                                    response = "error",
+                                    error = %e.message(),
+                                    "LeaseKeepAliveResp"
+                                );
+                                let _ = tx.send(Err(e)).await;
+                                continue;
+                            }
+                        };
                         tracing::trace!(
                             remote_addr = %remote,
                             id = resp.id,

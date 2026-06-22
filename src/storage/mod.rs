@@ -1198,24 +1198,26 @@ impl Store {
         }
     }
 
-    pub async fn lease_keep_alive(&self, id: i64) -> etcdserverpb::LeaseKeepAliveResponse {
+    pub async fn lease_keep_alive(
+        &self,
+        id: i64,
+    ) -> Result<etcdserverpb::LeaseKeepAliveResponse, Status> {
         let mut state = self.state.write();
         if let Some(ls) = state.leases.get_mut(&id) {
             let ttl = ls.ttl;
             ls.expires_at =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
             state.expiry_notify.notify_one();
-            etcdserverpb::LeaseKeepAliveResponse {
+            Ok(etcdserverpb::LeaseKeepAliveResponse {
                 header: Some(state.header()),
                 id,
                 ttl,
-            }
+            })
         } else {
-            etcdserverpb::LeaseKeepAliveResponse {
-                header: Some(state.header()),
-                id,
-                ttl: -1,
-            }
+            Err(Status::new(
+                tonic::Code::NotFound,
+                "etcdserver: lease not found",
+            ))
         }
     }
 
