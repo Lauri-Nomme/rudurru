@@ -42,18 +42,18 @@ fn next_lease_id() -> i64 {
 /// without scanning the WAL.
 #[derive(Debug, Clone)]
 pub struct KeyState {
-    pub value: Arc<[u8]>,
-    pub mod_revision: u64,
-    pub create_revision: u64,
-    pub version: i64,
-    pub lease: i64,
+    pub(crate) value: Arc<[u8]>,
+    pub(crate) mod_revision: u64,
+    pub(crate) create_revision: u64,
+    pub(crate) version: i64,
+    pub(crate) lease: i64,
     /// 0 = alive (not deleted). Non-zero = revision at which this key was deleted.
-    pub delete_revision: u64,
+    pub(crate) delete_revision: u64,
     /// True if this key ever went through a delete→recreate cycle.
     /// When `rebirth && create_revision > target_rev`, a prior lifetime may
     /// have existed at target_rev, so the WAL is needed to confirm.
-    pub rebirth: bool,
-    pub kv_bytes: Bytes,
+    pub(crate) rebirth: bool,
+    pub(crate) kv_bytes: Bytes,
 }
 
 impl KeyState {
