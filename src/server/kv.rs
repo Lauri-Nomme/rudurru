@@ -274,9 +274,13 @@ impl etcdserverpb::kv_server::Kv for Kv {
         let revision = req.get_ref().revision;
         let physical = req.get_ref().physical;
         let keys_before = self.store.state.read().keys.len();
-        let resp = self.store.compact(req.into_inner()).await;
+        let result = self.store.compact(req.into_inner()).await;
         let keys_after = self.store.state.read().keys.len();
-        let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
+        let rev = result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.header.as_ref().map(|h| h.revision))
+            .unwrap_or(0);
         tracing::info!(
             remote_addr = %remote,
             revision,
@@ -284,9 +288,9 @@ impl etcdserverpb::kv_server::Kv for Kv {
             keys_before,
             keys_after,
             response_revision = rev,
-            response = "ok",
+            response = if result.is_ok() { "ok" } else { "error" },
             "Compact"
         );
-        Ok(Response::new(resp))
+        result.map(Response::new)
     }
 }

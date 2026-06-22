@@ -1072,18 +1072,34 @@ impl Store {
     pub async fn compact(
         &self,
         req: etcdserverpb::CompactionRequest,
-    ) -> etcdserverpb::CompactionResponse {
+    ) -> Result<etcdserverpb::CompactionResponse, Status> {
+        let rev = req.revision as u64;
+        let current = current_revision();
+
+        if rev > current {
+            return Err(Status::new(
+                tonic::Code::OutOfRange,
+                "etcdserver: mvcc: required revision is a future revision",
+            ));
+        }
+        if rev <= COMPACT_REV.load(Ordering::Relaxed) {
+            return Err(Status::new(
+                tonic::Code::OutOfRange,
+                "etcdserver: mvcc: required revision has been compacted",
+            ));
+        }
+
         let state = self.state.write();
-        COMPACT_REV.store(req.revision as u64, Ordering::SeqCst);
+        COMPACT_REV.store(rev, Ordering::SeqCst);
 
         // NOTE: etcd's Compact does NOT delete current key-values from the store.
         // It only sets compact_rev to allow garbage collection of old MVCC revisions.
         // The current snapshot must be retained.
         // The old code called state.keys.retain(...) which deleted current data — BUG.
 
-        etcdserverpb::CompactionResponse {
+        Ok(etcdserverpb::CompactionResponse {
             header: Some(state.header()),
-        }
+        })
     }
 
     // ── Lease operations ────────────────────────────────────────────────
