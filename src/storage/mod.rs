@@ -221,6 +221,43 @@ impl StoreState {
         Some(prev)
     }
 
+    fn delete_keys_for_lease(&mut self, id: i64) {
+        let keys_to_delete: Vec<Vec<u8>> = self
+            .keys
+            .iter()
+            .filter(|(_, ks)| ks.lease == id && ks.is_alive())
+            .map(|(k, _)| k.clone())
+            .collect();
+        if keys_to_delete.is_empty() {
+            return;
+        }
+        let rev = next_revision();
+        let mut records = Vec::with_capacity(keys_to_delete.len());
+        for key in &keys_to_delete {
+            let prev = self.keys.get(key).filter(|k| k.is_alive()).cloned();
+            self.apply_delete(key.clone(), rev);
+
+            if let Some(p) = &prev {
+                let mut flags = wal::DELETED;
+                if p.lease != 0 {
+                    flags |= wal::HAS_LEASE;
+                }
+                records.push(wal::KvWalRecord::new(
+                    flags,
+                    key,
+                    &p.value,
+                    p.create_revision as i64,
+                    rev as i64,
+                    p.version,
+                    p.lease,
+                ));
+            }
+        }
+        if let Err(e) = self.wal.append_kv_batch(&records) {
+            tracing::error!("WAL batch append failed on lease key deletion: {e}");
+        }
+    }
+
     // Watcher management
     pub(crate) fn register_watcher(&mut self, reg: WatchRegistration) -> i64 {
         let watch_id = reg.watch_id;
@@ -1143,38 +1180,7 @@ impl Store {
         LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
         state.expiry_notify.notify_one();
         tracing::info!(id, "lease_revoked");
-        let keys_to_delete: Vec<Vec<u8>> = state
-            .keys
-            .iter()
-            .filter(|(_, ks)| ks.lease == id && ks.is_alive())
-            .map(|(k, _)| k.clone())
-            .collect();
-        let mut records = Vec::with_capacity(keys_to_delete.len());
-        let rev = next_revision();
-        for key in &keys_to_delete {
-            let prev = state.keys.get(key).filter(|k| k.is_alive()).cloned();
-            state.apply_delete(key.clone(), rev);
-
-            if let Some(p) = &prev {
-                let mut flags = wal::DELETED;
-                if p.lease != 0 {
-                    flags |= wal::HAS_LEASE;
-                }
-                let record = wal::KvWalRecord::new(
-                    flags,
-                    key,
-                    &p.value,
-                    p.create_revision as i64,
-                    rev as i64,
-                    p.version,
-                    p.lease,
-                );
-                records.push(record);
-            }
-        }
-        if let Err(e) = state.wal.append_kv_batch(&records) {
-            tracing::error!("WAL batch append failed on lease revoke: {e}");
-        }
+        state.delete_keys_for_lease(id);
         etcdserverpb::LeaseRevokeResponse {
             header: Some(state.header()),
         }
@@ -1322,36 +1328,7 @@ impl Store {
                 for id in expired {
                     s.leases.remove(&id);
                     LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
-                    let keys_to_delete: Vec<Vec<u8>> = s
-                        .keys
-                        .iter()
-                        .filter(|(_, ks)| ks.lease == id && ks.is_alive())
-                        .map(|(k, _)| k.clone())
-                        .collect();
-                    let rev = next_revision();
-                    for key in &keys_to_delete {
-                        let prev = s.keys.get(key).filter(|k| k.is_alive()).cloned();
-                        s.apply_delete(key.clone(), rev);
-
-                        if let Some(p) = &prev {
-                            let mut flags = wal::DELETED;
-                            if p.lease != 0 {
-                                flags |= wal::HAS_LEASE;
-                            }
-                            let record = wal::KvWalRecord::new(
-                                flags,
-                                key,
-                                &p.value,
-                                p.create_revision as i64,
-                                rev as i64,
-                                p.version,
-                                p.lease,
-                            );
-                            if let Err(e) = s.wal.append_kv(&record) {
-                                tracing::error!("WAL append failed on lease expiry: {e}");
-                            }
-                        }
-                    }
+                    s.delete_keys_for_lease(id);
                 }
             }
         });
