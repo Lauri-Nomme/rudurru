@@ -241,22 +241,19 @@ impl StoreState {
         let rev = next_revision();
         let mut records = Vec::with_capacity(keys_to_delete.len());
         for key in &keys_to_delete {
-            let prev = self.keys.get(key).filter(|k| k.is_alive()).cloned();
-            self.apply_delete(key.clone(), rev);
-
-            if let Some(p) = &prev {
+            if let Some(prev) = self.apply_delete(key.clone(), rev) {
                 let mut flags = wal::DELETED;
-                if p.lease != 0 {
+                if prev.lease != 0 {
                     flags |= wal::HAS_LEASE;
                 }
                 records.push(wal::KvWalRecord::new(
                     flags,
                     key,
-                    &p.value,
-                    p.create_revision as i64,
+                    &prev.value,
+                    prev.create_revision as i64,
                     rev as i64,
-                    p.version,
-                    p.lease,
+                    prev.version,
+                    prev.lease,
                 ));
             }
         }
