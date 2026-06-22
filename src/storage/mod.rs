@@ -998,7 +998,7 @@ impl Store {
 
     pub async fn txn(&self, req: etcdserverpb::TxnRequest) -> etcdserverpb::TxnResponse {
         let success = {
-            let state = self.state.write();
+            let state = self.state.read();
             req.compare.iter().all(|c| eval_compare(&state, c))
         };
 
