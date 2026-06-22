@@ -584,19 +584,19 @@ The split is clean and practical.
 
 ## 7. Summary — Priority for Action
 
-| Priority | Issue | Effort | Impact |
-|----------|-------|--------|--------|
-| **P1** | Txn eval uses write lock (1.1) | 1 line | Low (k3s uses single-op CAS) |
-| **P1** | `compact()` no validation (1.3) | 5 lines | Low (no malicious clients) |
-| **P1** | Double key clone in put (2.2) | 1 line | Negligible |
-| **P2** | Lease revocations use per-key revisions (1.5) | 2 lines | Low (order of events differs from etcd) |
-| **P2** | Extract delete-under-lease helper (2.4) | 20 lines | Medium (DRY + maintainability) |
-| **P2** | Simplify module split (5) | 2–4 hours | Medium (navigation + onboarding) |
-| **P3** | Stream WAL reader (2.1) | ~3 days | High (eliminates 270MB allocation) |
-| **P3** | Unify `apply_record` + `apply` (3.1) | 1 day | Medium (correctness risk) |
-| **P3** | Lease validation on put (1.6) | 3 lines | Low (correctness edge case) |
-| **P3** | `lease_keep_alive` return error (1.4) | 5 lines | Low (etcd compat) |
-| **P4** | `KeyState` visibility (4.1) | 15 min | Low (API hygiene) |
-| **P4** | Split `impl Store` blocks (4.2) | 30 min | Low (navigation) |
-| **P4** | `WatchEvent.key` → `Bytes` (4.5) | 2 hours | Low (per-write alloc reduction) |
-| **P4** | `resolve_range` prefix edge case (1.7) | 5 lines | Low (rare key pattern) |
+| Priority | Issue | Effort | Impact | Status |
+|----------|-------|--------|--------|--------|
+| **P1** | Txn eval uses write lock (1.1) | 1 line | Low | ✅ |
+| **P1** | `compact()` no validation (1.3) | 5 lines | Low | ✅ |
+| **P1** | Double key clone in put (2.2) | 1 line | Negligible | ✅ |
+| **P2** | Lease revocations use per-key revisions (1.5) | 2 lines | Low | ✅ |
+| **P2** | Extract delete-under-lease helper (2.4) | 20 lines | Medium | ✅ |
+| **P2** | Simplify module split (5) | 2–4 hours | Medium | Pending (deferred to last) |
+| **P3** | Stream WAL reader (2.1) | ~3 days | High | In progress |
+| **P3** | Unify `apply_record` + `apply` (3.1) | 1 day | Medium | In progress |
+| **P3** | Lease validation on put (1.6) | 3 lines | Low | In progress |
+| **P3** | `lease_keep_alive` return error (1.4) | 5 lines | Low | In progress |
+| **P4** | `KeyState` visibility (4.1) | 15 min | Low | Pending |
+| **P4** | Split `impl Store` blocks (4.2) | 30 min | Low | Pending |
+| **P4** | `WatchEvent.key` → `Bytes` (4.5) | 2 hours | Low | Pending |
+| **P4** | `resolve_range` prefix edge case (1.7) | 5 lines | Low | Pending |

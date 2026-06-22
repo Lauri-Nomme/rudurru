@@ -176,7 +176,18 @@ impl etcdserverpb::kv_server::Kv for Kv {
             lease = inner.lease,
             "Put"
         );
-        let resp = self.store.put(inner).await;
+        let resp = match self.store.put(inner).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(
+                    remote_addr = %remote,
+                    response = "error",
+                    error = %e.message(),
+                    "PutResp"
+                );
+                return Err(e);
+            }
+        };
         let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
         tracing::trace!(
             remote_addr = %remote,
@@ -245,7 +256,18 @@ impl etcdserverpb::kv_server::Kv for Kv {
             log_request_op("TxnFailure", op);
         }
 
-        let resp = self.store.txn(inner).await;
+        let resp = match self.store.txn(inner).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::info!(
+                    remote_addr = %remote,
+                    response = "error",
+                    error = %e.message(),
+                    "TxnResp"
+                );
+                return Err(e);
+            }
+        };
 
         let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
         tracing::info!(

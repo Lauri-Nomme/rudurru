@@ -885,7 +885,10 @@ impl Store {
         })
     }
 
-    pub async fn put(&self, req: etcdserverpb::PutRequest) -> etcdserverpb::PutResponse {
+    pub async fn put(
+        &self,
+        req: etcdserverpb::PutRequest,
+    ) -> Result<etcdserverpb::PutResponse, Status> {
         let rev = next_revision();
         let mut state = self.state.write();
         let key = req.key;
@@ -903,6 +906,13 @@ impl Store {
         } else {
             req.lease
         };
+
+        if lease != 0 && !state.leases.contains_key(&lease) {
+            return Err(Status::new(
+                tonic::Code::NotFound,
+                "etcdserver: lease not found",
+            ));
+        }
 
         let prev = prev_entry.filter(|k| k.is_alive()).cloned();
         let mut flags = 0u8;
@@ -939,7 +949,7 @@ impl Store {
             Bytes::new()
         };
 
-        etcdserverpb::PutResponse { header, prev_kv }
+        Ok(etcdserverpb::PutResponse { header, prev_kv })
     }
 
     pub async fn delete_range(
@@ -1034,7 +1044,10 @@ impl Store {
         }
     }
 
-    pub async fn txn(&self, req: etcdserverpb::TxnRequest) -> etcdserverpb::TxnResponse {
+    pub async fn txn(
+        &self,
+        req: etcdserverpb::TxnRequest,
+    ) -> Result<etcdserverpb::TxnResponse, Status> {
         let success = {
             let state = self.state.read();
             req.compare.iter().all(|c| eval_compare(&state, c))
@@ -1048,7 +1061,7 @@ impl Store {
         &self,
         ops: Vec<etcdserverpb::RequestOp>,
         succeeded: bool,
-    ) -> etcdserverpb::TxnResponse {
+    ) -> Result<etcdserverpb::TxnResponse, Status> {
         if ops.len() > 1 {
             tracing::warn!(
                 op_count = ops.len(),
@@ -1061,13 +1074,13 @@ impl Store {
         for op in ops {
             match op.request {
                 Some(etcdserverpb::request_op::Request::RequestRange(r)) => {
-                    let resp = self.range(r).await.unwrap();
+                    let resp = self.range(r).await?;
                     responses.push(etcdserverpb::ResponseOp {
                         response: Some(etcdserverpb::response_op::Response::ResponseRange(resp)),
                     });
                 }
                 Some(etcdserverpb::request_op::Request::RequestPut(p)) => {
-                    let resp = self.put(p).await;
+                    let resp = self.put(p).await?;
                     responses.push(etcdserverpb::ResponseOp {
                         response: Some(etcdserverpb::response_op::Response::ResponsePut(resp)),
                     });
@@ -1099,12 +1112,11 @@ impl Store {
             let state = self.state.read();
             state.header()
         };
-
-        etcdserverpb::TxnResponse {
+        Ok(etcdserverpb::TxnResponse {
             header: Some(header),
             succeeded,
             responses,
-        }
+        })
     }
 
     pub async fn compact(
@@ -3055,10 +3067,10 @@ mod historical_tests {
     async fn test_historical_min_mod_revision() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
-        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
         let rev = current_revision();
-        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await.unwrap();
 
         // Current-state: min_mod_revision filters current mod_revision
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -3074,9 +3086,9 @@ mod historical_tests {
     async fn test_historical_max_mod_revision() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         let rev1 = current_revision();
-        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"".to_vec(), range_end: vec![0],
@@ -3091,8 +3103,8 @@ mod historical_tests {
     async fn test_historical_min_create_revision() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
-        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
         let rev_b = current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -3108,9 +3120,9 @@ mod historical_tests {
     async fn test_historical_max_create_revision() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         let rev_a = current_revision();
-        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"".to_vec(), range_end: vec![0],
@@ -3125,9 +3137,9 @@ mod historical_tests {
     async fn test_historical_kv_metadata() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         let create_rev = current_revision();
-        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         // Historical: metadata should reflect state at create_rev
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -3156,9 +3168,9 @@ mod historical_tests {
     async fn test_historical_from_key_query() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"va".to_vec(),..Default::default()}).await;
-        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"vb".to_vec(),..Default::default()}).await;
-        store.put(etcdserverpb::PutRequest{key:b"c".to_vec(),value:b"vc".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"va".to_vec(),..Default::default()}).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"vb".to_vec(),..Default::default()}).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"c".to_vec(),value:b"vc".to_vec(),..Default::default()}).await.unwrap();
         let rev = current_revision();
 
         // From-key: all keys >= "b"
@@ -3174,7 +3186,7 @@ mod historical_tests {
     async fn test_historical_non_existent_key() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"existing".to_vec(),value:b"v".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"existing".to_vec(),value:b"v".to_vec(),..Default::default()}).await.unwrap();
         let rev = current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -3190,7 +3202,7 @@ mod historical_tests {
     async fn test_historical_non_existent_prefix() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"/real/k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"/real/k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         let rev = current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -3205,7 +3217,7 @@ mod historical_tests {
     async fn test_historical_exact_create_revision() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         let create_rev = current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -3223,8 +3235,8 @@ mod historical_tests {
     async fn test_historical_more_flag_limit_zero() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
-        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"".to_vec(), range_end: vec![0],
@@ -3240,10 +3252,10 @@ mod historical_tests {
     async fn test_current_state_min_max_mod_revision() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
-        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
         let rev = current_revision();
-        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"".to_vec(), range_end: vec![0],
@@ -3265,8 +3277,8 @@ mod historical_tests {
     async fn test_current_state_min_max_create_revision() {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
-        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await;
-        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await;
+        store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
+        store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
         let rev_k2 = current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
