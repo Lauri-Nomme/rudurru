@@ -1150,8 +1150,8 @@ impl Store {
             .map(|(k, _)| k.clone())
             .collect();
         let mut records = Vec::with_capacity(keys_to_delete.len());
+        let rev = next_revision();
         for key in &keys_to_delete {
-            let rev = next_revision();
             let prev = state.keys.get(key).filter(|k| k.is_alive()).cloned();
             state.apply_delete(key.clone(), rev);
 
@@ -1328,8 +1328,8 @@ impl Store {
                         .filter(|(_, ks)| ks.lease == id && ks.is_alive())
                         .map(|(k, _)| k.clone())
                         .collect();
+                    let rev = next_revision();
                     for key in &keys_to_delete {
-                        let rev = next_revision();
                         let prev = s.keys.get(key).filter(|k| k.is_alive()).cloned();
                         s.apply_delete(key.clone(), rev);
 
