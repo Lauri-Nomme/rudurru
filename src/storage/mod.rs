@@ -121,7 +121,7 @@ pub struct WatchRegistration {
 pub struct WatchEvent {
     pub revision: u64,
     pub event_type: mvccpb::event::EventType,
-    pub key: Vec<u8>,
+    pub key: Bytes,
     pub kv_bytes: Bytes,
     pub prev_kv_bytes: Bytes,
 }
@@ -1540,10 +1540,13 @@ pub(crate) fn resolve_range(key: &[u8], range_end: &[u8]) -> RangeBound {
     }
 
     // Prefix encoding: range_end == key with last byte incremented
+    // Key ending in 0xFF wraps to 0x00, which collides with the \0
+    // suffix encoding — skip prefix detection in that case.
     if range_end.len() == key.len()
         && !range_end.is_empty()
         && range_end[..range_end.len() - 1] == key[..key.len() - 1]
         && range_end[key.len() - 1] == key[key.len() - 1].wrapping_add(1)
+        && key[key.len() - 1] != 0xFF
     {
         return RangeBound::Prefix(key.to_vec());
     }
