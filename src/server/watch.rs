@@ -414,6 +414,43 @@ async fn flush_global_batch_at(
         return;
     }
 
+    // Reject client-assigned watch IDs that conflict with existing watchers
+    // before doing any work. We need to peek into state, so we acquire and
+    // release the lock briefly before Phase 1.
+    {
+        let state = store.state.read();
+        let mut rejected = Vec::new();
+        for (i, ctx) in active.iter().enumerate() {
+            if state.watchers.iter().any(|w| w.watch_id == ctx.watch_id)
+                || active[..i].iter().any(|other| other.watch_id == ctx.watch_id)
+            {
+                rejected.push(i);
+            }
+        }
+        drop(state);
+        for &i in rejected.iter().rev() {
+            let mut ctx = active.swap_remove(i);
+            let resp = etcdserverpb::WatchResponse {
+                header: Some(make_header(current_revision() as i64)),
+                watch_id: -1,
+                created: false,
+                canceled: true,
+                compact_revision: 0,
+                cancel_reason: "duplicate watch_id".into(),
+                events: vec![],
+                fragment: false,
+            };
+            tracing::info!(watch_id = ctx.watch_id, stream_id = ctx.stream_id, "watch_duplicate_id");
+            if let Some(reply) = ctx.reply.take() {
+                let _ = reply.send(Ok(resp));
+            }
+        }
+    }
+
+    if active.is_empty() {
+        return;
+    }
+
     // ── Phase 1: scan without lock, shared across all streams ──────
     let (phase1_us, mut prev_kv_map) = {
         let t0 = Instant::now();
