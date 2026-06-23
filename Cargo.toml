@@ -21,6 +21,7 @@ etcd-client = { version = "0.18", default-features = false }
 rusqlite = { version = "0.31", features = ["bundled"] }
 crc32c = "0.6"
 parking_lot = "0.12"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
 tempfile = "3"

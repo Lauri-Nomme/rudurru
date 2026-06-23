@@ -1315,7 +1315,7 @@ impl Store {
     pub async fn store_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let state = self.state.read();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
         for (k, ks) in state.keys.iter() {
             if ks.delete_revision != 0 {
                 continue;
