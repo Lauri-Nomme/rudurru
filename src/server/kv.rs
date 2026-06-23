@@ -214,7 +214,18 @@ impl etcdserverpb::kv_server::Kv for Kv {
             range_end = %fmt_key(&inner.range_end),
             "DeleteRange"
         );
-        let resp = self.store.delete_range(inner).await;
+        let resp = match self.store.delete_range(inner).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::trace!(
+                    remote_addr = %remote,
+                    response = "error",
+                    error = %e.message(),
+                    "DeleteRangeResp"
+                );
+                return Err(e);
+            }
+        };
         let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
         tracing::trace!(
             remote_addr = %remote,

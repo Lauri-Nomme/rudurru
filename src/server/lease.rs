@@ -33,18 +33,30 @@ impl etcdserverpb::lease_server::Lease for Lease {
             requested_id = inner.id,
             "LeaseGrant"
         );
-        let resp = self.store.lease_grant(inner).await;
-        let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
-        tracing::info!(
-            remote_addr = %remote,
-            granted_id = resp.id,
-            ttl = resp.ttl,
-            revision = rev,
-            error = %resp.error,
-            response = "ok",
-            "LeaseGrantResp"
-        );
-        Ok(Response::new(resp))
+        match self.store.lease_grant(inner).await {
+            Ok(resp) => {
+                let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
+                tracing::info!(
+                    remote_addr = %remote,
+                    granted_id = resp.id,
+                    ttl = resp.ttl,
+                    revision = rev,
+                    error = %resp.error,
+                    response = "ok",
+                    "LeaseGrantResp"
+                );
+                Ok(Response::new(resp))
+            }
+            Err(e) => {
+                tracing::info!(
+                    remote_addr = %remote,
+                    response = "error",
+                    error = %e.message(),
+                    "LeaseGrantResp"
+                );
+                Err(e)
+            }
+        }
     }
 
     async fn lease_revoke(
@@ -61,15 +73,27 @@ impl etcdserverpb::lease_server::Lease for Lease {
             id = inner.id,
             "LeaseRevoke"
         );
-        let resp = self.store.lease_revoke(inner).await;
-        let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
-        tracing::info!(
-            remote_addr = %remote,
-            revision = rev,
-            response = "ok",
-            "LeaseRevokeResp"
-        );
-        Ok(Response::new(resp))
+        match self.store.lease_revoke(inner).await {
+            Ok(resp) => {
+                let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
+                tracing::info!(
+                    remote_addr = %remote,
+                    revision = rev,
+                    response = "ok",
+                    "LeaseRevokeResp"
+                );
+                Ok(Response::new(resp))
+            }
+            Err(e) => {
+                tracing::info!(
+                    remote_addr = %remote,
+                    response = "error",
+                    error = %e.message(),
+                    "LeaseRevokeResp"
+                );
+                Err(e)
+            }
+        }
     }
 
     type LeaseKeepAliveStream =
@@ -148,19 +172,31 @@ impl etcdserverpb::lease_server::Lease for Lease {
             keys = inner.keys,
             "LeaseTimeToLive"
         );
-        let resp = self.store.lease_time_to_live(inner).await;
-        let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
-        tracing::info!(
-            remote_addr = %remote,
-            id = resp.id,
-            ttl = resp.ttl,
-            granted_ttl = resp.granted_ttl,
-            keys_count = resp.keys.len(),
-            revision = rev,
-            response = "ok",
-            "LeaseTimeToLiveResp"
-        );
-        Ok(Response::new(resp))
+        match self.store.lease_time_to_live(inner).await {
+            Ok(resp) => {
+                let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
+                tracing::info!(
+                    remote_addr = %remote,
+                    id = resp.id,
+                    ttl = resp.ttl,
+                    granted_ttl = resp.granted_ttl,
+                    keys_count = resp.keys.len(),
+                    revision = rev,
+                    response = "ok",
+                    "LeaseTimeToLiveResp"
+                );
+                Ok(Response::new(resp))
+            }
+            Err(e) => {
+                tracing::info!(
+                    remote_addr = %remote,
+                    response = "error",
+                    error = %e.message(),
+                    "LeaseTimeToLiveResp"
+                );
+                Err(e)
+            }
+        }
     }
 
     async fn lease_leases(
@@ -172,13 +208,25 @@ impl etcdserverpb::lease_server::Lease for Lease {
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".into());
         tracing::info!(remote_addr = %remote, "LeaseLeases");
-        let resp = self.store.lease_leases().await;
-        tracing::info!(
-            remote_addr = %remote,
-            lease_count = resp.leases.len(),
-            response = "ok",
-            "LeaseLeasesResp"
-        );
-        Ok(Response::new(resp))
+        match self.store.lease_leases().await {
+            Ok(resp) => {
+                tracing::info!(
+                    remote_addr = %remote,
+                    lease_count = resp.leases.len(),
+                    response = "ok",
+                    "LeaseLeasesResp"
+                );
+                Ok(Response::new(resp))
+            }
+            Err(e) => {
+                tracing::info!(
+                    remote_addr = %remote,
+                    response = "error",
+                    error = %e.message(),
+                    "LeaseLeasesResp"
+                );
+                Err(e)
+            }
+        }
     }
 }

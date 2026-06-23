@@ -228,7 +228,7 @@ impl StoreState {
         Some(prev)
     }
 
-    fn delete_keys_for_lease(&mut self, id: i64) {
+    fn delete_keys_for_lease(&mut self, id: i64) -> Result<(), Status> {
         let keys_to_delete: Vec<Vec<u8>> = self
             .keys
             .iter()
@@ -236,30 +236,41 @@ impl StoreState {
             .map(|(k, _)| k.clone())
             .collect();
         if keys_to_delete.is_empty() {
-            return;
+            return Ok(());
         }
         let rev = next_revision();
+        // Build WAL records before mutating state.
         let mut records = Vec::with_capacity(keys_to_delete.len());
         for key in &keys_to_delete {
-            if let Some(prev) = self.apply_delete(key.clone(), rev) {
+            let prev = self.keys.get(key).filter(|k| k.is_alive()).cloned();
+            if let Some(p) = prev {
                 let mut flags = wal::DELETED;
-                if prev.lease != 0 {
+                if p.lease != 0 {
                     flags |= wal::HAS_LEASE;
                 }
                 records.push(wal::KvWalRecord::new(
                     flags,
                     key,
-                    &prev.value,
-                    prev.create_revision as i64,
+                    &p.value,
+                    p.create_revision as i64,
                     rev as i64,
-                    prev.version,
-                    prev.lease,
+                    p.version,
+                    p.lease,
                 ));
             }
         }
         if let Err(e) = self.wal.append_kv_batch(&records) {
             tracing::error!("WAL batch append failed on lease key deletion: {e}");
+            return Err(Status::new(
+                tonic::Code::Internal,
+                "WAL write failed during lease key deletion",
+            ));
         }
+        // Apply deletions to state only after WAL write succeeds.
+        for key in &keys_to_delete {
+            self.apply_delete(key.clone(), rev);
+        }
+        Ok(())
     }
 
     // Watcher management
@@ -940,6 +951,10 @@ impl Store {
         );
         if let Err(e) = state.wal.append_kv(&record) {
             tracing::error!("WAL append failed: {e}");
+            return Err(Status::new(
+                tonic::Code::Internal,
+                "etcdserver: wal write failed",
+            ));
         }
 
         let prev = state.apply(key, value, lease, rev, None);
@@ -959,7 +974,7 @@ impl Store {
     pub async fn delete_range(
         &self,
         req: etcdserverpb::DeleteRangeRequest,
-    ) -> etcdserverpb::DeleteRangeResponse {
+    ) -> Result<etcdserverpb::DeleteRangeResponse, Status> {
         let rev = next_revision();
         let mut state = self.state.write();
 
@@ -1010,17 +1025,17 @@ impl Store {
                 .collect(),
         };
 
-        let mut prev_kvs = Vec::new();
+        // Build WAL records before mutating state.
+        let mut records: Vec<wal::KvWalRecord> = Vec::with_capacity(keys_to_delete.len());
+        let mut prevs: Vec<Option<KeyState>> = Vec::with_capacity(keys_to_delete.len());
         for key in &keys_to_delete {
             let prev = state.keys.get(key).filter(|k| k.is_alive()).cloned();
-            state.apply_delete(key.clone(), rev);
-
             if let Some(p) = &prev {
                 let mut flags = wal::DELETED;
                 if p.lease != 0 {
                     flags |= wal::HAS_LEASE;
                 }
-                let record = wal::KvWalRecord::new(
+                records.push(wal::KvWalRecord::new(
                     flags,
                     key,
                     &p.value,
@@ -1028,24 +1043,35 @@ impl Store {
                     rev as i64,
                     p.version,
                     p.lease,
-                );
-                if let Err(e) = state.wal.append_kv(&record) {
-                    tracing::error!("WAL append failed: {e}");
-                }
+                ));
             }
+            prevs.push(prev);
+        }
 
+        if let Err(e) = state.wal.append_kv_batch(&records) {
+            tracing::error!("WAL batch append on delete_range failed: {e}");
+            return Err(Status::new(
+                tonic::Code::Internal,
+                "etcdserver: wal write failed",
+            ));
+        }
+
+        // Apply deletions to state only after WAL write succeeds.
+        let mut prev_kvs = Vec::new();
+        for (i, key) in keys_to_delete.iter().enumerate() {
+            state.apply_delete(key.clone(), rev);
             if req.prev_kv {
-                if let Some(p) = prev {
+                if let Some(p) = &prevs[i] {
                     prev_kvs.push(p.kv_bytes.clone());
                 }
             }
         }
 
-        etcdserverpb::DeleteRangeResponse {
+        Ok(etcdserverpb::DeleteRangeResponse {
             header: Some(state.header()),
             deleted: keys_to_delete.len() as i64,
             prev_kvs,
-        }
+        })
     }
 
     pub async fn txn(
@@ -1090,7 +1116,7 @@ impl Store {
                     });
                 }
                 Some(etcdserverpb::request_op::Request::RequestDeleteRange(d)) => {
-                    let resp = self.delete_range(d).await;
+                    let resp = self.delete_range(d).await?;
                     responses.push(etcdserverpb::ResponseOp {
                         response: Some(etcdserverpb::response_op::Response::ResponseDeleteRange(
                             resp,
@@ -1161,7 +1187,7 @@ impl Store {
     pub async fn lease_grant(
         &self,
         req: etcdserverpb::LeaseGrantRequest,
-    ) -> etcdserverpb::LeaseGrantResponse {
+    ) -> Result<etcdserverpb::LeaseGrantResponse, Status> {
         let mut state = self.state.write();
         let id = if req.id != 0 { req.id } else { next_lease_id() };
         let ttl = req.ttl;
@@ -1178,28 +1204,28 @@ impl Store {
         LEASE_COUNT.fetch_add(1, Ordering::Relaxed);
         state.expiry_notify.notify_one();
         tracing::info!(id, ttl, "lease_granted");
-        etcdserverpb::LeaseGrantResponse {
+        Ok(etcdserverpb::LeaseGrantResponse {
             header: Some(state.header()),
             id,
             ttl,
             error: String::new(),
-        }
+        })
     }
 
     pub async fn lease_revoke(
         &self,
         req: etcdserverpb::LeaseRevokeRequest,
-    ) -> etcdserverpb::LeaseRevokeResponse {
+    ) -> Result<etcdserverpb::LeaseRevokeResponse, Status> {
         let mut state = self.state.write();
         let id = req.id;
         state.leases.remove(&id);
         LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
         state.expiry_notify.notify_one();
         tracing::info!(id, "lease_revoked");
-        state.delete_keys_for_lease(id);
-        etcdserverpb::LeaseRevokeResponse {
+        state.delete_keys_for_lease(id)?;
+        Ok(etcdserverpb::LeaseRevokeResponse {
             header: Some(state.header()),
-        }
+        })
     }
 
     pub async fn lease_keep_alive(
@@ -1228,7 +1254,7 @@ impl Store {
     pub async fn lease_time_to_live(
         &self,
         req: etcdserverpb::LeaseTimeToLiveRequest,
-    ) -> etcdserverpb::LeaseTimeToLiveResponse {
+    ) -> Result<etcdserverpb::LeaseTimeToLiveResponse, Status> {
         let state = self.state.read();
         if let Some(ls) = state.leases.get(&req.id) {
             let remaining = (ls
@@ -1245,35 +1271,37 @@ impl Store {
             } else {
                 vec![]
             };
-            etcdserverpb::LeaseTimeToLiveResponse {
+            Ok(etcdserverpb::LeaseTimeToLiveResponse {
                 header: Some(state.header()),
                 id: req.id,
                 ttl: remaining.max(0),
                 granted_ttl: ls.ttl,
                 keys,
-            }
+            })
         } else {
-            etcdserverpb::LeaseTimeToLiveResponse {
+            Ok(etcdserverpb::LeaseTimeToLiveResponse {
                 header: Some(state.header()),
                 id: req.id,
                 ttl: -1,
                 granted_ttl: -1,
                 keys: vec![],
-            }
+            })
         }
     }
 
-    pub async fn lease_leases(&self) -> etcdserverpb::LeaseLeasesResponse {
+    pub async fn lease_leases(
+        &self,
+    ) -> Result<etcdserverpb::LeaseLeasesResponse, Status> {
         let state = self.state.read();
         let leases = state
             .leases
             .keys()
             .map(|id| etcdserverpb::LeaseStatus { id: *id })
             .collect();
-        etcdserverpb::LeaseLeasesResponse {
+        Ok(etcdserverpb::LeaseLeasesResponse {
             header: Some(state.header()),
             leases,
-        }
+        })
     }
 
     // ── Maintenance operations ──────────────────────────────────────────
@@ -1332,22 +1360,31 @@ impl Store {
                 }
 
                 // Collect and process expired leases under the write lock.
-                let mut s = state.write();
-                let now = tokio::time::Instant::now();
-                let expired: Vec<i64> = s
-                    .leases
-                    .iter()
-                    .filter(|(_, ls)| ls.expires_at <= now)
-                    .map(|(id, _)| *id)
-                    .collect();
-                if expired.is_empty() {
-                    continue;
+                {
+                    let mut s = state.write();
+                    let now = tokio::time::Instant::now();
+                    let expired: Vec<i64> = s
+                        .leases
+                        .iter()
+                        .filter(|(_, ls)| ls.expires_at <= now)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if expired.is_empty() {
+                        continue;
+                    }
+                    for id in &expired {
+                        s.leases.remove(id);
+                        LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        if let Err(e) = s.delete_keys_for_lease(*id) {
+                            tracing::error!(lease_id = id, error = %e, "expiry_task: lease key deletion failed");
+                        }
+                    }
+                    // expired drops here, releasing the write lock
                 }
-                for id in expired {
-                    s.leases.remove(&id);
-                    LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
-                    s.delete_keys_for_lease(id);
-                }
+                // Re-arm notification for any lease operations that occurred during
+                // processing — their notify_one() calls were coalesced while we held
+                // the write lock and were not waiting on notified().
+                notify.notify_one();
             }
         });
     }
