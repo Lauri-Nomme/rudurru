@@ -617,12 +617,21 @@ The split is clean and practical.
 | **P1** | Double key clone in put (2.2) | 1 line | Negligible | ✅ |
 | **P2** | Lease revocations use per-key revisions (1.5) | 2 lines | Low | ✅ |
 | **P2** | Extract delete-under-lease helper (2.4) | 20 lines | Medium | ✅ |
-| **P2** | Simplify module split (5) | 2–4 hours | Medium | Pending (deferred to last) |
+| **P2** | Simplify module split (5) | 2–4 hours | Medium | Deferred |
 | **P3** | Stream WAL reader (2.1) | ~3 days | High | ✅ |
 | **P3** | Unify `apply_record` + `apply` (3.1) | 1 day | Medium | ✅ |
 | **P3** | Lease validation on put (1.6) | 3 lines | Low | ✅ |
 | **P3** | `lease_keep_alive` return error (1.4) | 5 lines | Low | ✅ |
 | **P4** | `KeyState` visibility (4.1) | 15 min | Low | ✅ |
-| **P4** | Split `impl Store` blocks (4.2) | 30 min | Low | Pending (deferred) |
+| **P4** | Split `impl Store` blocks (4.2) | 30 min | Low | Deferred |
 | **P4** | `WatchEvent.key` → `Bytes` (4.5) | 2 hours | Low | ✅ |
 | **P4** | `resolve_range` prefix edge case (1.7) | 5 lines | Low | ✅ |
+| **P5** | Propagate WAL failures (1.2) | 50 lines | High | ✅ |
+| **P5** | `store_hash()` → `xxhash` (3.2) | 1 line | Low | ✅ |
+| **P5** | Duplicate watch_id check (3.3) | 30 lines | Low | ✅ |
+| **P5** | `Notify` coalescing in expiry (3.4) | 5 lines | Low | ✅ |
+| **P5** | `Result` type consistency (4.3) | 50 lines | Low | ✅ |
+| **P5** | Ignored send errors (4.4) | 15 lines | Low | ✅ |
+| 2.3 | `count_wal_records` for logging | 5 min | Negligible | Won't do |
+| 2.5 | `scan_wal_range` reads from byte 0 | — | Low | Analyzed (see `analysis/opt-2.5-2.6.md`) |
+| 2.6 | Watcher list O(W) scan | — | Low | Analyzed (see `analysis/opt-2.5-2.6.md`) |
