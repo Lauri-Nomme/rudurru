@@ -490,7 +490,9 @@ async fn flush_global_batch_at(
                         && storage::matches_range(ctx.bound.to_ref(), key)
                         && should_send_event(&ctx.filters, event.event_type as i32)
                     {
-                        let _ = ctx.event_tx.send(event.clone());
+                        if ctx.event_tx.send(event.clone()).is_err() {
+                            tracing::warn!(watch_id = ctx.watch_id, "phase1_event_send_failed");
+                        }
                     }
                 }
             });
@@ -538,7 +540,9 @@ async fn flush_global_batch_at(
                 if storage::matches_range(ctx.bound.to_ref(), key)
                     && should_send_event(&ctx.filters, event.event_type as i32)
                 {
-                    let _ = ctx.event_tx.send(event.clone());
+                    if ctx.event_tx.send(event.clone()).is_err() {
+                        tracing::warn!(watch_id = ctx.watch_id, "phase2_event_send_failed");
+                    }
                 }
             }
         });

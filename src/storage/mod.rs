@@ -324,7 +324,9 @@ impl StoreState {
             if !watcher.prev_kv {
                 event.prev_kv_bytes = Bytes::new();
             }
-            let _ = watcher.sender.send(event);
+            if watcher.sender.send(event).is_err() {
+                tracing::warn!(watch_id = watcher.watch_id, "watcher_send_failed");
+            }
         }
     }
 }
