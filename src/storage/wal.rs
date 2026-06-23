@@ -791,8 +791,14 @@ mod tests {
     }
 
     fn temp_wal_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
-        let name = format!("rudurru_test_{}.wal", std::process::id());
+        let name = format!(
+            "rudurru_wal_test_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);
         path

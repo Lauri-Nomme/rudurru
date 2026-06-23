@@ -1805,10 +1805,18 @@ mod compact_tests {
     use super::*;
 
     fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
-        let name = format!("rudurru_compact_{}.wal", std::process::id());
+        let name = format!(
+            "rudurru_compact_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);
+        // Reset global state to avoid cross-test interference in parallel runs.
+        COMPACT_REV.store(0, Ordering::SeqCst);
         path.to_string_lossy().to_string()
     }
 
@@ -2049,8 +2057,14 @@ mod historical_tests {
     use super::*;
 
     fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
-        let name = format!("rudurru_historical_{}.wal", std::process::id());
+        let name = format!(
+            "rudurru_historical_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);
         // Reset compact rev before each test to avoid test interference

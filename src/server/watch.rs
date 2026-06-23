@@ -605,7 +605,13 @@ mod tests {
     use prost::Message;
 
     fn temp_wal() -> String {
-        format!("/tmp/rudurru_watch_test_{}", std::process::id())
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "/tmp/rudurru_watch_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     fn decode_val(bytes: &Bytes) -> Vec<u8> {
