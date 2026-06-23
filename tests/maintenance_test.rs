@@ -31,13 +31,26 @@ async fn test_alarm_get() {
     assert!(resp.alarms().is_empty(), "no alarms should be active");
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static HASHKV_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn hashkv_key(suffix: &str) -> String {
+    let pid = std::process::id();
+    format!("hashkv_{pid}_{}_{}", HASHKV_COUNTER.fetch_add(1, Ordering::Relaxed), suffix)
+}
+
 #[tokio::test]
 async fn test_hash_kv() {
     let mut client = common::connect().await;
 
-    client.put("hashkv_a", "data_a", None).await.unwrap();
-    client.put("hashkv_b", "data_b", None).await.unwrap();
-    let get = client.get("hashkv_b", None).await.unwrap();
+    let a = hashkv_key("a");
+    let b = hashkv_key("b");
+    let c = hashkv_key("c");
+
+    client.put(a.clone(), "data_a", None).await.unwrap();
+    client.put(b.clone(), "data_b", None).await.unwrap();
+    let get = client.get(b, None).await.unwrap();
     let rev = get.header().unwrap().revision();
 
     let resp = client.hash_kv(rev).await.unwrap();
@@ -45,8 +58,8 @@ async fn test_hash_kv() {
     assert!(resp.header().is_some(), "hash_kv should have a header");
     assert!(resp.compact_version() >= 0, "compact_version should be >= 0");
 
-    client.put("hashkv_c", "data_c", None).await.unwrap();
-    let get2 = client.get("hashkv_c", None).await.unwrap();
+    client.put(c.clone(), "data_c", None).await.unwrap();
+    let get2 = client.get(c, None).await.unwrap();
     let rev2 = get2.header().unwrap().revision();
     let resp2 = client.hash_kv(rev2).await.unwrap();
     assert_ne!(resp.hash(), resp2.hash(), "hash should differ with more keys");
@@ -68,12 +81,13 @@ async fn test_hash() {
     let hash1 = client.hash().await.unwrap();
     assert!(hash1.hash() != 0);
 
-    client.put("hash_test_key", "data", None).await.unwrap();
+    let key = hashkv_key("hash_test");
+    client.put(key.clone(), "data", None).await.unwrap();
 
     let hash2 = client.hash().await.unwrap();
     assert_ne!(hash1.hash(), hash2.hash(), "hash should change after write");
 
-    client.delete("hash_test_key", None).await.unwrap();
+    client.delete(key, None).await.unwrap();
 }
 
 #[tokio::test]
