@@ -247,7 +247,7 @@ impl etcdserverpb::kv_server::Kv for Kv {
             .unwrap_or_else(|| "unknown".into());
         let inner = req.into_inner();
 
-        tracing::info!(
+        tracing::trace!(
             remote_addr = %remote,
             compare_count = inner.compare.len(),
             success_count = inner.success.len(),
@@ -281,7 +281,7 @@ impl etcdserverpb::kv_server::Kv for Kv {
         };
 
         let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
-        tracing::info!(
+        tracing::trace!(
             remote_addr = %remote,
             succeeded = resp.succeeded,
             response_count = resp.responses.len(),

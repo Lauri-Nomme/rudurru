@@ -27,7 +27,7 @@ impl etcdserverpb::lease_server::Lease for Lease {
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".into());
         let inner = req.into_inner();
-        tracing::info!(
+        tracing::trace!(
             remote_addr = %remote,
             ttl = inner.ttl,
             requested_id = inner.id,
@@ -36,7 +36,7 @@ impl etcdserverpb::lease_server::Lease for Lease {
         match self.store.lease_grant(inner).await {
             Ok(resp) => {
                 let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
-                tracing::info!(
+                tracing::trace!(
                     remote_addr = %remote,
                     granted_id = resp.id,
                     ttl = resp.ttl,
@@ -68,7 +68,7 @@ impl etcdserverpb::lease_server::Lease for Lease {
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".into());
         let inner = req.into_inner();
-        tracing::info!(
+        tracing::trace!(
             remote_addr = %remote,
             id = inner.id,
             "LeaseRevoke"
@@ -76,7 +76,7 @@ impl etcdserverpb::lease_server::Lease for Lease {
         match self.store.lease_revoke(inner).await {
             Ok(resp) => {
                 let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
-                tracing::info!(
+                tracing::trace!(
                     remote_addr = %remote,
                     revision = rev,
                     response = "ok",
@@ -166,7 +166,7 @@ impl etcdserverpb::lease_server::Lease for Lease {
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".into());
         let inner = req.into_inner();
-        tracing::info!(
+        tracing::trace!(
             remote_addr = %remote,
             id = inner.id,
             keys = inner.keys,
@@ -175,7 +175,7 @@ impl etcdserverpb::lease_server::Lease for Lease {
         match self.store.lease_time_to_live(inner).await {
             Ok(resp) => {
                 let rev = resp.header.as_ref().map(|h| h.revision).unwrap_or(0);
-                tracing::info!(
+                tracing::trace!(
                     remote_addr = %remote,
                     id = resp.id,
                     ttl = resp.ttl,
@@ -207,10 +207,10 @@ impl etcdserverpb::lease_server::Lease for Lease {
             .remote_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".into());
-        tracing::info!(remote_addr = %remote, "LeaseLeases");
+        tracing::trace!(remote_addr = %remote, "LeaseLeases");
         match self.store.lease_leases().await {
             Ok(resp) => {
-                tracing::info!(
+                tracing::trace!(
                     remote_addr = %remote,
                     lease_count = resp.leases.len(),
                     response = "ok",
