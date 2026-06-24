@@ -1,7 +1,7 @@
 # WAL Garbage Collection — Design
 
 **Date:** 2026-06-15
-**Status:** Design phase
+**Status:** Deployed, running in production
 
 ## Problem
 
