@@ -120,19 +120,30 @@ impl Store {
         &self,
         req: etcdserverpb::RangeRequest,
     ) -> Result<etcdserverpb::RangeResponse, Status> {
-        let target_rev = if req.revision > 0 {
+        let mut target_rev = if req.revision > 0 {
             req.revision as u64
         } else {
             0
         };
         let current_rev = current_revision();
 
-        // Future revision
+        // Future revision — etcd accepts small races from bookmark watches
+        // and returns the current state. Only reject egregious gaps that
+        // indicate a genuinely bogus revision (>10k, matching watch threshold).
         if target_rev > current_rev {
-            return Err(Status::new(
-                tonic::Code::Unavailable,
-                "etcdserver: mvcc: required revision is a future revision",
-            ));
+            if target_rev.saturating_sub(current_rev) > 10_000 {
+                return Err(Status::new(
+                    tonic::Code::Unavailable,
+                    "etcdserver: mvcc: required revision is a future revision",
+                ));
+            }
+            tracing::info!(
+                target_rev,
+                current_rev,
+                gap = target_rev.saturating_sub(current_rev),
+                "range future revision within tolerance, serving current state"
+            );
+            target_rev = 0; // fall through to current-state path
         }
 
         // Compacted revision

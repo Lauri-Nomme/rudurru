@@ -199,27 +199,30 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                                     break;
                                                 }
                                             }
-                                            _ = interval.tick() => {
-                                                if !progress_notify {
-                                                    continue;
-                                                }
-                                                let resp = etcdserverpb::WatchResponse {
-                                                    header: Some(make_header(current_revision() as i64)),
-                                                    watch_id,
-                                                    created: false,
-                                                    canceled: false,
-                                                    compact_revision: 0,
-                                                    cancel_reason: String::new(),
-                                                    events: vec![],
-                                                    fragment: false,
-                                                };
-                                                if tx_clone.send(Ok(resp)).await.is_err() {
-                                                    tracing::warn!(watch_id, "watch_dropped");
-                                                    let mut s = store_clone.state.write();
-                                                    s.cancel_watcher(watch_id);
-                                                    break;
-                                                }
-                                            }
+                            _ = interval.tick() => {
+                                if !progress_notify {
+                                    continue;
+                                }
+                                let rev = current_revision();
+                                tracing::info!(watch_id, rev, "progress_notify periodic tick, sending response");
+                                let resp = etcdserverpb::WatchResponse {
+                                    header: Some(make_header(rev as i64)),
+                                    watch_id,
+                                    created: false,
+                                    canceled: false,
+                                    compact_revision: 0,
+                                    cancel_reason: String::new(),
+                                    events: vec![],
+                                    fragment: false,
+                                };
+                                if tx_clone.send(Ok(resp)).await.is_err() {
+                                    tracing::warn!(watch_id, "watch_dropped");
+                                    let mut s = store_clone.state.write();
+                                    s.cancel_watcher(watch_id);
+                                    break;
+                                }
+                                tracing::info!(watch_id, rev, "progress_notify periodic response sent");
+                            }
                                         }
                                     }
                                 });
@@ -247,8 +250,10 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     }
                                 }
                                 watch_request::RequestUnion::ProgressRequest(_) => {
+                                    let rev = current_revision();
+                                    tracing::debug!(stream_id, rev, "WatchProgressRequest received");
                                     let resp = etcdserverpb::WatchResponse {
-                                        header: Some(make_header(current_revision() as i64)),
+                                        header: Some(make_header(rev as i64)),
                                         watch_id: 0,
                                         created: false,
                                         canceled: false,
@@ -260,6 +265,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     if tx.send(Ok(resp)).await.is_err() {
                                         return;
                                     }
+                                    tracing::debug!(stream_id, rev, "WatchProgressRequest response sent");
                                 }
                                 _ => {}
                             },
