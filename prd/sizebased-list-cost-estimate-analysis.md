@@ -302,6 +302,46 @@ those versions.
 
 ---
 
+## The Second Bug: Broadcast vs Unicast
+
+Even after fixing the version check (so `RequestWatchProgress` is enabled),
+progress request responses still weren't delivered. The etcd client library's
+`dispatchEvent` (watch.go:714-736) distinguishes two modes:
+
+```go
+// InvalidWatchID = -1
+if wr.IsProgressNotify() && pbresp.WatchId == InvalidWatchID {
+    return w.broadcastResponse(wr)   // send to ALL watchers
+}
+return w.unicastResponse(wr, pbresp.WatchId)  // send to ONE watcher
+```
+
+`broadcastResponse` (watch.go:739-747) sends the response to every active
+watcher's channel. `unicastResponse` (watch.go:750-761) looks up a specific
+watcher by ID; if not found, it returns `false` and the response is dropped.
+
+Rudurru's `ProgressRequest` handler sent `watch_id: 0` (`AutoWatchID` in etcd
+terminology — value 0, meaning "auto-assign"). But no watcher has ID 0
+(rudurru assigns IDs starting from 1 at watch.rs:14). So `unicastResponse`
+always returned `false`, and every progress notification was silently dropped.
+
+The periodic 300s timer (watch.rs:202-225) worked because it used the correct
+per-watcher `watch_id`, so unicast succeeded — but 300s is far too slow for the
+3s `blockTimeout`.
+
+**Fix: `watch_id: -1`** (InvalidWatchID) so the client library broadcasts the
+response to all watchers:
+
+```rust
+// watch.rs:257
+watch_id: -1,
+```
+
+This matches the real etcd behavior: a `WatchProgressRequest` (no target
+watch_id) should notify every active watcher on the stream.
+
+---
+
 ## What We Changed (Summary)
 
 ### Quick fix (reversible via config):
@@ -311,15 +351,14 @@ kube-apiserver-arg:
 ```
 Disables the `resourceSizeEstimator` entirely — no estimate, no error.
 
-### Proper fix (rudurru side):
+### Proper fix (rudurru side — two changes):
 ```rust
-// maintenance.rs:49
+// maintenance.rs:49  — pass the etcd version blacklist check
 version: "3.5.14".into(),
+
+// watch.rs:257  — broadcast progress responses to all watchers
+watch_id: -1,
 ```
-Reports a version that passes the Kubernetes blacklist check, enabling
-`RequestWatchProgress` support. This lets progress notifications flow,
-keeping the watch cache's `w.resourceVersion` in sync with the global
-revision.
 
 Upstream status: the bug [#134343](https://github.com/kubernetes/kubernetes/issues/134343)
 was closed as "not planned". The feature gate is still configurable in K3s v1.36

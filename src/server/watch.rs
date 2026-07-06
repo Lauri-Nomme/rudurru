@@ -254,7 +254,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     tracing::debug!(stream_id, rev, "WatchProgressRequest received");
                                     let resp = etcdserverpb::WatchResponse {
                                         header: Some(make_header(rev as i64)),
-                                        watch_id: 0,
+                                        watch_id: -1,
                                         created: false,
                                         canceled: false,
                                         compact_revision: 0,
