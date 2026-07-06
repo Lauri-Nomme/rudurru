@@ -17,6 +17,7 @@ async fn test_status_full() {
 
     let status = client.status().await.unwrap();
     assert!(!status.version().is_empty(), "version should not be empty");
+    assert_eq!(status.version(), "3.5.14", "version must match expected value: Kubernetes v1.36 blacklists [3.5.0, 3.5.13) for RequestWatchProgress");
     assert!(status.db_size() > 0, "db_size should be > 0");
     assert!(status.leader() > 0, "leader should be set");
     assert!(status.raft_index() > 0, "raft_index should be > 0");

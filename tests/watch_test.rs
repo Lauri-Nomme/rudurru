@@ -86,7 +86,11 @@ async fn test_watch_progress_notify() {
         .expect("stream ended")
         .expect("watch error");
 
-    assert!(resp.watch_id() != 0 || resp.events().is_empty());
+    // NOTE: The Rust etcd client rewrites watch_id to the watcher's client-side
+    // handle, so we cannot assert the raw server field. We only verify the
+    // response arrives and carries no events.
+    assert!(resp.events().is_empty(), "progress notification should not contain events");
+    assert!(resp.header().is_some(), "progress notification must have a header");
 }
 
 #[tokio::test]

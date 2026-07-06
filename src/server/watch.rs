@@ -31,6 +31,19 @@ fn make_header(revision: i64) -> etcdserverpb::ResponseHeader {
     }
 }
 
+fn make_progress_response(rev: i64) -> etcdserverpb::WatchResponse {
+    etcdserverpb::WatchResponse {
+        header: Some(make_header(rev)),
+        watch_id: -1,
+        created: false,
+        canceled: false,
+        compact_revision: 0,
+        cancel_reason: String::new(),
+        events: vec![],
+        fragment: false,
+    }
+}
+
 fn event_to_proto(event: &WatchEvent) -> mvccpb::Event {
     mvccpb::Event {
         r#type: event.event_type as i32,
@@ -252,16 +265,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 watch_request::RequestUnion::ProgressRequest(_) => {
                                     let rev = current_revision();
                                     tracing::debug!(stream_id, rev, "WatchProgressRequest received");
-                                    let resp = etcdserverpb::WatchResponse {
-                                        header: Some(make_header(rev as i64)),
-                                        watch_id: -1,
-                                        created: false,
-                                        canceled: false,
-                                        compact_revision: 0,
-                                        cancel_reason: String::new(),
-                                        events: vec![],
-                                        fragment: false,
-                                    };
+                                    let resp = make_progress_response(rev as i64);
                                     if tx.send(Ok(resp)).await.is_err() {
                                         return;
                                     }
@@ -704,5 +708,23 @@ mod tests {
         assert_eq!(decode_val(&ev3.prev_kv_bytes), b"v2", "v3 prev_kv should be v2 — fails without Phase 1→Phase 2 prev_kv_map handoff");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_progress_response_uses_broadcast_watch_id() {
+        let resp = make_progress_response(42);
+        assert_eq!(resp.watch_id, -1, "WatchProgressRequest response must use InvalidWatchID (-1) for the etcd client to broadcast to all watchers");
+    }
+
+    #[test]
+    fn test_progress_response_structure() {
+        let resp = make_progress_response(12345);
+        assert!(resp.header.is_some(), "must have header");
+        assert_eq!(resp.header.unwrap().revision, 12345);
+        assert!(!resp.created, "progress notification is not a create");
+        assert!(!resp.canceled, "progress notification is not a cancel");
+        assert_eq!(resp.compact_revision, 0);
+        assert!(resp.events.is_empty(), "progress notification carries no events");
+        assert!(!resp.fragment);
     }
 }
