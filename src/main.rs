@@ -1,7 +1,8 @@
 use anyhow::Context;
 use rudurru::server;
 use rudurru::storage::Store;
-use std::net::SocketAddr;
+use std::io::Write;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use tonic::transport::Server;
 
@@ -42,19 +43,28 @@ async fn main() -> anyhow::Result<()> {
 
     let listen_addr = std::env::var("RUDURRU_LISTEN").unwrap_or_else(|_| "[::]:2379".to_string());
 
+    let metrics_addr = std::env::var("RUDURRU_METRICS_ADDR").ok();
+
     let store = Arc::new(Store::open(&wal_path).await?);
 
     let addr: SocketAddr = listen_addr.parse().context("parse listen address")?;
 
     tracing::info!(
         git_revision = env!("GIT_REVISION"),
+        metrics_addr = metrics_addr.as_deref().unwrap_or("(none)"),
         "Rudurru listening on {addr}, WAL: {wal_path}"
     );
 
-    // Periodic status logging + malloc_trim (every 60s)
+    // Periodic status logging + malloc_trim + metrics push (every 60s)
     let status_wal = wal_path.clone();
     tokio::spawn(async move {
+        let sock = metrics_addr.as_ref().and_then(|addr| {
+            let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+            sock.connect(addr).ok()?;
+            Some(sock)
+        });
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut buf = Vec::new();
         loop {
             interval.tick().await;
             let keys = rudurru::storage::KEY_COUNT.load(std::sync::atomic::Ordering::Relaxed);
@@ -65,6 +75,18 @@ async fn main() -> anyhow::Result<()> {
             let rev = rudurru::storage::current_revision();
             let (rss_kb, vsize_kb, peak_kb) = read_proc_mem();
             tracing::info!(rev, keys, watchers, leases, wal_size, rss_kb, vsize_kb, peak_kb, "rudurru status");
+            if let Some(ref sock) = sock {
+                buf.clear();
+                let _ = writeln!(buf, "rudurru.rev:{rev}|g");
+                let _ = writeln!(buf, "rudurru.keys:{keys}|g");
+                let _ = writeln!(buf, "rudurru.watchers:{watchers}|g");
+                let _ = writeln!(buf, "rudurru.leases:{leases}|g");
+                let _ = writeln!(buf, "rudurru.wal_size:{wal_size}|g");
+                let _ = writeln!(buf, "rudurru.mem.rss_kb:{rss_kb}|g");
+                let _ = writeln!(buf, "rudurru.mem.vsize_kb:{vsize_kb}|g");
+                let _ = writeln!(buf, "rudurru.mem.peak_kb:{peak_kb}|g");
+                let _ = sock.send(&buf);
+            }
             // Release free memory cached by glibc back to the OS.
             // Without this, glibc holds freed mmap'd regions indefinitely,
             // causing RSS to remain high after bulk key deletion.
