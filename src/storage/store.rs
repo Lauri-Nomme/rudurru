@@ -882,7 +882,7 @@ impl Store {
         );
         LEASE_COUNT.fetch_add(1, Ordering::Relaxed);
         state.expiry_notify.notify_one();
-        tracing::info!(id, ttl, "lease_granted");
+        tracing::debug!(id, ttl, "lease_granted");
         Ok(etcdserverpb::LeaseGrantResponse {
             header: Some(state.header()),
             id,

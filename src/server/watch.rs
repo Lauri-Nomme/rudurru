@@ -217,7 +217,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     continue;
                                 }
                                 let rev = current_revision();
-                                tracing::info!(watch_id, rev, "progress_notify periodic tick, sending response");
+                                tracing::debug!(watch_id, rev, "progress_notify periodic tick, sending response");
                                 let resp = etcdserverpb::WatchResponse {
                                     header: Some(make_header(rev as i64)),
                                     watch_id,
@@ -234,7 +234,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     s.cancel_watcher(watch_id);
                                     break;
                                 }
-                                tracing::info!(watch_id, rev, "progress_notify periodic response sent");
+                                tracing::debug!(watch_id, rev, "progress_notify periodic response sent");
                             }
                                         }
                                     }
