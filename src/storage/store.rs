@@ -162,6 +162,54 @@ impl Store {
         // Current state (revision == 0) — unchanged logic
         let state = self.state.read();
         let bound = resolve_range(&req.key, &req.range_end);
+
+        // Point queries are exact-key lookups, so resolve them with a single
+        // BTreeMap::get. This is both cheaper than materialising [key, key+1)
+        // bounds and an iterator, and correct: a [key, key+1) scan also matches
+        // unrelated keys that merely share this key as a prefix, which would
+        // hand the caller a completely different object.
+        if let RangeBoundRef::Point(key) = bound.to_ref() {
+            let mut kvs: Vec<Bytes> = Vec::with_capacity(1);
+
+            if let Some(ks) = state.keys.get(key) {
+                if ks.delete_revision == 0
+                    && (req.min_mod_revision <= 0
+                        || (ks.mod_revision as i64) >= req.min_mod_revision)
+                    && (req.max_mod_revision <= 0
+                        || (ks.mod_revision as i64) <= req.max_mod_revision)
+                    && (req.min_create_revision <= 0
+                        || (ks.create_revision as i64) >= req.min_create_revision)
+                    && (req.max_create_revision <= 0
+                        || (ks.create_revision as i64) <= req.max_create_revision)
+                {
+                    kvs.push(if req.keys_only {
+                        let (kv_bytes, _, _) = wal::encode_kv(key, b"", 0, 0, 0, 0);
+                        Bytes::from(kv_bytes)
+                    } else {
+                        ks.kv_bytes.clone()
+                    });
+                }
+            }
+
+            let count = kvs.len() as i64;
+
+            if req.count_only {
+                return Ok(etcdserverpb::RangeResponse {
+                    header: Some(state.header()),
+                    kvs: vec![],
+                    more: false,
+                    count,
+                });
+            }
+
+            return Ok(etcdserverpb::RangeResponse {
+                header: Some(state.header()),
+                kvs,
+                more: false,
+                count,
+            });
+        }
+
         let cap = if req.limit > 0 {
             req.limit as usize
         } else {
@@ -171,16 +219,8 @@ impl Store {
 
         let (range_start, range_end): (Option<Vec<u8>>, Option<Vec<u8>>) = match bound.to_ref() {
             RangeBoundRef::All => (None, None),
-            RangeBoundRef::Point(k) => {
-                let mut end = k.to_vec();
-                if let Some(last) = end.last_mut() {
-                    *last = last.wrapping_add(1);
-                    if *last == 0 {
-                        end.push(0);
-                    }
-                }
-                (Some(k.to_vec()), Some(end))
-            }
+            // Point queries are resolved and returned above.
+            RangeBoundRef::Point(_) => unreachable!("point range handled before bounds"),
             RangeBoundRef::From(k) => (Some(k.to_vec()), None),
             RangeBoundRef::Prefix(p) => (Some(p.to_vec()), None),
             RangeBoundRef::Range(start, end) => (Some(start.to_vec()), Some(end.to_vec())),

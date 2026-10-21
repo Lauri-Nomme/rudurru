@@ -368,3 +368,79 @@ async fn test_put_update_keeps_create_revision() {
     );
     assert_eq!(kv.version(), 2, "version increments on update");
 }
+
+/// A point Get must be an exact-key lookup. `{base}/a` is a strict prefix of
+/// `{base}/ab`, and a naive [key, key+1) scan would return the longer key.
+#[tokio::test]
+async fn test_get_exact_key_with_prefix_sibling() {
+    let mut client = common::connect().await;
+    let base = key!("kv/prefix_sibling");
+
+    client.put(format!("{base}/a"), "A", None).await.unwrap();
+    client.put(format!("{base}/ab"), "AB", None).await.unwrap();
+
+    let resp = client.get(format!("{base}/a"), None).await.unwrap();
+    assert_eq!(resp.count(), 1, "exact key must match exactly once");
+    assert_eq!(resp.kvs().len(), 1);
+    assert_eq!(
+        resp.kvs()[0].key(),
+        format!("{base}/a").as_bytes(),
+        "point Get returned a different key that shares the prefix"
+    );
+    assert_eq!(resp.kvs()[0].value(), b"A");
+}
+
+/// Regression: getting a key that does not exist must not return a sibling
+/// whose name merely starts with it. Returning the sibling made the API server
+/// retry a DELETE forever, because the revision it read back never matched.
+#[tokio::test]
+async fn test_get_missing_key_does_not_leak_prefix_sibling() {
+    let mut client = common::connect().await;
+    let base = key!("kv/prefix_ghost");
+
+    // Only the longer key exists.
+    client.put(format!("{base}/ab"), "AB", None).await.unwrap();
+
+    let resp = client.get(format!("{base}/a"), None).await.unwrap();
+    assert_eq!(
+        resp.count(),
+        0,
+        "missing key resolved to a prefix sibling: {:?}",
+        resp.kvs()
+            .iter()
+            .map(|kv| String::from_utf8_lossy(kv.key()).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(resp.kvs().is_empty());
+
+    // Sanity: the prefix range still sees the real key.
+    let resp = client
+        .get(
+            format!("{base}/"),
+            Some(GetOptions::new().with_prefix().with_count_only()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.count(), 1);
+}
+
+/// The same exactness guarantee has to hold for historical (revision) reads,
+/// which go through a different bounds helper.
+#[tokio::test]
+async fn test_get_missing_key_historical_does_not_leak_prefix_sibling() {
+    let mut client = common::connect().await;
+    let base = key!("kv/prefix_ghost_hist");
+
+    let put_resp = client.put(format!("{base}/ab"), "AB", None).await.unwrap();
+    let rev = put_resp.header().unwrap().revision();
+
+    let resp = client
+        .get(
+            format!("{base}/a"),
+            Some(GetOptions::new().with_revision(rev)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.count(), 0, "historical point lookup leaked a sibling");
+    assert!(resp.kvs().is_empty());
+}

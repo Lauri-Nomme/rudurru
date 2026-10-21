@@ -121,13 +121,12 @@ fn btree_bounds(bound: RangeBoundRef<'_>) -> (Option<Vec<u8>>, Option<Vec<u8>>) 
     match bound {
         RangeBoundRef::All => (None, None),
         RangeBoundRef::Point(k) => {
+            // Exact-key lookup. Appending 0x00 yields the smallest key that
+            // sorts strictly after `k`, so [k, k\0) contains only `k` itself.
+            // Incrementing the last byte instead would also match unrelated
+            // keys that share `k` as a prefix.
             let mut end = k.to_vec();
-            if let Some(last) = end.last_mut() {
-                *last = last.wrapping_add(1);
-                if *last == 0 {
-                    end.push(0);
-                }
-            }
+            end.push(0);
             (Some(k.to_vec()), Some(end))
         }
         RangeBoundRef::From(k) => (Some(k.to_vec()), None),
@@ -596,7 +595,8 @@ mod historical_tests {
             err.message()
         );
 
-        // Non-compacted revision should still work
+        // Non-compacted revision should still work. This is a point query for
+        // "k": "k2" merely shares its prefix and must not be returned.
         let ok = store
             .range(etcdserverpb::RangeRequest {
                 key: b"k".to_vec(),
@@ -605,7 +605,12 @@ mod historical_tests {
             })
             .await
             .unwrap();
-        assert_eq!(ok.count, 2, "both keys exist at non-compacted rev");
+        assert_eq!(
+            ok.count, 1,
+            "point query must only match the exact key, not prefix siblings"
+        );
+        let kv = mvccpb::KeyValue::decode(&ok.kvs[0][..]).unwrap();
+        assert_eq!(kv.key, b"k");
 
         COMPACT_REV.store(0, Ordering::SeqCst);
         let _ = std::fs::remove_file(&path);
@@ -2292,5 +2297,169 @@ mod resolve_range_tests {
         let range_end = b"abc\xFF\x00";
         let bound = resolve_range(key, range_end);
         assert!(matches!(bound, RangeBound::Prefix(_)), "expected Prefix via \\0 suffix, got {bound:?}");
+    }
+}
+
+#[cfg(test)]
+mod point_range_tests {
+    use super::*;
+    use crate::proto::mvccpb;
+    use prost::Message;
+
+    fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir();
+        let name = format!(
+            "rudurru_point_range_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().to_string()
+    }
+
+    async fn put(store: &Store, key: &[u8], value: &[u8]) {
+        store
+            .put(etcdserverpb::PutRequest {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                ..Default::default()
+            })
+            .await;
+    }
+
+    fn kv_key(kv_bytes: &Bytes) -> Vec<u8> {
+        mvccpb::KeyValue::decode(&kv_bytes[..]).unwrap().key
+    }
+
+    /// `btree_bounds` is used by the historical/WAL paths. A point bound must
+    /// span exactly one key: "a" is a strict prefix of "ab", so a [a, b) span
+    /// would wrongly pull "ab" in.
+    #[test]
+    fn btree_bounds_point_is_exact() {
+        let mut map: std::collections::BTreeMap<Vec<u8>, ()> = Default::default();
+        for k in [b"a".to_vec(), b"ab".to_vec(), b"b".to_vec()] {
+            map.insert(k, ());
+        }
+
+        let (start, end) = btree_bounds(RangeBoundRef::Point(b"a"));
+        let hits: Vec<Vec<u8>> = map
+            .range(start.unwrap()..end.unwrap())
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(
+            hits,
+            vec![b"a".to_vec()],
+            "point bound must not include 'ab'"
+        );
+
+        // A point bound for a key with no exact match must be empty, even
+        // though a prefix sibling exists.
+        let (start, end) = btree_bounds(RangeBoundRef::Point(b"aa"));
+        let hits: Vec<Vec<u8>> = map
+            .range(start.unwrap()..end.unwrap())
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "missing key must not resolve to a sibling: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_range_returns_only_the_exact_key() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        put(&store, b"prefix/a", b"A").await;
+        put(&store, b"prefix/ab", b"AB").await;
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"prefix/a".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.count, 1, "exactly one key must match");
+        assert_eq!(resp.kvs.len(), 1);
+        assert_eq!(kv_key(&resp.kvs[0]), b"prefix/a");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression: a point lookup of a *missing* key whose prefix is shared by
+    /// an existing key must return nothing, not the sibling. This is what made
+    /// the API server loop forever on a DELETE of a non-existent secret.
+    #[tokio::test]
+    async fn point_range_missing_key_does_not_leak_prefix_sibling() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        put(&store, b"prefix/ab", b"AB").await;
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"prefix/a".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.count, 0, "must not resolve 'prefix/a' to 'prefix/ab'");
+        assert!(resp.kvs.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn point_range_skips_deleted_key() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        put(&store, b"prefix/a", b"A").await;
+        store
+            .delete_range(etcdserverpb::DeleteRangeRequest {
+                key: b"prefix/a".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"prefix/a".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.count, 0, "deleted keys must not be visible");
+        assert!(resp.kvs.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The historical path uses `btree_bounds`, which had the same defect.
+    #[tokio::test]
+    async fn historical_point_range_does_not_leak_prefix_sibling() {
+        let path = temp_wal();
+        let store = Store::open(&path).await.unwrap();
+        put(&store, b"prefix/ab", b"AB").await;
+        let rev = current_revision() as i64;
+
+        let resp = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"prefix/a".to_vec(),
+                revision: rev,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.count, 0, "historical point lookup leaked a sibling");
+        assert!(resp.kvs.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 }
