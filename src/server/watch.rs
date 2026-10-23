@@ -404,10 +404,21 @@ async fn flush_global_batch_at(
         }
 
         let bound = storage::resolve_range(&c.pending.key, &c.pending.range_end);
+        // etcd semantics: "No start_revision is 'now'". A create request with
+        // start_revision = 0 must only receive events from the current revision
+        // onwards, not a replay of everything already stored under the key.
+        // Without this, every watch created without an explicit revision is
+        // handed the key's entire history (replayed from the WAL) before it
+        // starts seeing live events.
+        let start_revision = if c.pending.start_revision == 0 {
+            store.current_revision() + 1
+        } else {
+            c.pending.start_revision
+        };
         active.push(WatchContext {
             key: c.pending.key,
             range_end: c.pending.range_end,
-            start_revision: c.pending.start_revision,
+            start_revision,
             watch_id: c.watch_id,
             progress_notify: c.pending.progress_notify,
             filters: c.pending.filters,
@@ -706,6 +717,71 @@ mod tests {
         let ev3 = &events[1];
         assert_eq!(decode_val(&ev3.kv_bytes), b"v3");
         assert_eq!(decode_val(&ev3.prev_kv_bytes), b"v2", "v3 prev_kv should be v2 — fails without Phase 1→Phase 2 prev_kv_map handoff");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// etcd: "No start_revision is 'now'". A watch created without an explicit
+    /// start revision must not be handed the key's existing history.
+    #[tokio::test]
+    async fn test_watch_without_start_revision_starts_at_now() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).await.unwrap());
+
+        // History that predates the watch.
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"foo".to_vec(),
+                value: b"old".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (checkpoint_rev, checkpoint_offset) = current_checkpoint(&store);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (reply_tx, _reply_rx) = oneshot::channel();
+
+        let mut batch = vec![GlobalCreate {
+            pending: PendingCreate {
+                key: b"foo".to_vec(),
+                range_end: vec![],
+                start_revision: 0, // "now"
+                progress_notify: false,
+                filters: vec![],
+                prev_kv: false,
+            },
+            event_tx,
+            reply: reply_tx,
+            stream_id: 1,
+            remote_addr: "test".into(),
+            watch_id: 77,
+        }];
+
+        flush_global_batch_at(&mut batch, &store, checkpoint_rev, checkpoint_offset).await;
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "start_revision=0 must not replay existing history"
+        );
+
+        // Live events must still arrive.
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"foo".to_vec(),
+                value: b"new".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let event = event_rx.try_recv().expect("watch must receive live event");
+        assert_eq!(
+            decode_val(&event.kv_bytes),
+            b"new",
+            "only the post-create write should be delivered"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
