@@ -5,7 +5,6 @@ use crate::storage::state::{KeyState, LeaseState, StoreState};
 use crate::storage::wal;
 use crate::storage::{
     btree_bounds, eval_compare, matches_range, resolve_range, scan_wal_range, RangeBoundRef,
-    KEY_COUNT, LEASE_COUNT, WATCHER_COUNT,
 };
 use prost::bytes::Bytes;
 use std::collections::BTreeMap;
@@ -14,6 +13,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::Status;
+
+#[derive(Clone, Copy, Debug)]
+pub struct StoreStats {
+    pub revision: u64,
+    pub keys: u64,
+    pub watchers: u64,
+    pub leases: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -41,10 +48,6 @@ impl Store {
         }
 
         state.next_rev = max_rev + 1;
-        let active_keys = state.keys.values().filter(|ks| ks.is_alive()).count() as u64;
-        KEY_COUNT.store(active_keys, Ordering::Relaxed);
-        WATCHER_COUNT.store(0, Ordering::Relaxed);
-        LEASE_COUNT.store(0, Ordering::Relaxed);
 
         // Restore lease state from alive keys. After WAL replay the actual
         // LeaseState entries are gone (they were in-memory only), but keys
@@ -79,14 +82,10 @@ impl Store {
             }
             unique.len() as u64
         };
-        if lease_count > 0 {
-            LEASE_COUNT.store(lease_count, Ordering::Relaxed);
-        }
-
         tracing::info!(
             "rudurru ready: revision={}, keys={}, leases_restored={}, compact_rev={}",
             max_rev,
-            active_keys,
+            state.key_count,
             lease_count,
             state.compact_rev,
         );
@@ -111,6 +110,21 @@ impl Store {
     /// Highest revision allocated by this store.
     pub fn current_revision(&self) -> u64 {
         self.state.read().current_revision()
+    }
+
+    /// Point-in-time counters for the status log and metrics.
+    ///
+    /// Derived from the state under one read lock rather than kept in separate
+    /// atomics: there is nothing to keep in sync, and no counter can drift from
+    /// the data it describes.
+    pub fn stats(&self) -> StoreStats {
+        let state = self.state.read();
+        StoreStats {
+            revision: state.current_revision(),
+            keys: state.key_count,
+            watchers: state.watchers.len() as u64,
+            leases: state.leases.len() as u64,
+        }
     }
 
     pub async fn wal_path(&self) -> String {
@@ -927,7 +941,6 @@ impl Store {
                 key_count: 0,
             },
         );
-        LEASE_COUNT.fetch_add(1, Ordering::Relaxed);
         state.expiry_notify.notify_one();
         tracing::debug!(id, ttl, "lease_granted");
         Ok(etcdserverpb::LeaseGrantResponse {
@@ -945,7 +958,6 @@ impl Store {
         let mut state = self.state.write();
         let id = req.id;
         state.leases.remove(&id);
-        LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
         state.expiry_notify.notify_one();
         tracing::info!(id, "lease_revoked");
         state.delete_keys_for_lease(id)?;

@@ -106,6 +106,10 @@ pub struct StoreState {
     pub next_rev: u64,
     /// Next lease id to hand out. Restored past the highest lease id in the WAL.
     pub next_lease_id: i64,
+    /// Number of keys currently alive (tombstones excluded). Maintained by
+    /// `apply`/`apply_delete`, so it is O(1) to read and needs no separate
+    /// process-wide counter.
+    pub key_count: u64,
     /// Highest revision released for garbage collection by `compact`.
     pub compact_rev: u64,
     pub wal: wal::WalFile,
@@ -120,6 +124,7 @@ impl StoreState {
             watchers: Vec::new(),
             next_rev: 1,
             next_lease_id: 1,
+            key_count: 0,
             compact_rev: 0,
             wal,
             expiry_notify: Arc::new(Notify::new()),

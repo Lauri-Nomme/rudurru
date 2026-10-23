@@ -1,5 +1,4 @@
 use crate::storage::state::StoreState;
-use crate::storage::LEASE_COUNT;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -63,7 +62,6 @@ pub(crate) fn start_expiry_task(state: Arc<RwLock<StoreState>>) {
                 }
                 for id in &expired {
                     s.leases.remove(id);
-                    LEASE_COUNT.fetch_sub(1, Ordering::Relaxed);
                     if let Err(e) = s.delete_keys_for_lease(*id) {
                         tracing::error!(lease_id = id, error = %e, "expiry_task: lease key deletion failed");
                     }

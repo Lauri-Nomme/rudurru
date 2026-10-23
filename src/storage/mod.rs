@@ -6,18 +6,12 @@ mod store;
 mod background;
 
 pub use state::{KeyState, LeaseState, StoreState, WatchEvent, WatchRegistration};
-pub use store::Store;
+pub use store::{Store, StoreStats};
 
 
 use crate::proto::etcdserverpb;
 use prost::bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
-
-/// Approximate counters for the periodic status log (no read lock needed).
-pub static KEY_COUNT: AtomicU64 = AtomicU64::new(0);
-pub static WATCHER_COUNT: AtomicU64 = AtomicU64::new(0);
-pub static LEASE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Translate key + range_end from proto into a range bound for BTreeMap.
 pub(crate) fn resolve_range(key: &[u8], range_end: &[u8]) -> RangeBound {
@@ -2147,10 +2141,6 @@ mod lease_restore_tests {
             }
             unique.len() as u64
         };
-        if lease_count > 0 {
-            LEASE_COUNT.store(lease_count, std::sync::atomic::Ordering::Relaxed);
-        }
-
         state
     }
 
@@ -2444,6 +2434,87 @@ mod point_range_tests {
 
         assert_eq!(resp.count, 0, "historical point lookup leaked a sibling");
         assert!(resp.kvs.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+    use crate::proto::etcdserverpb;
+
+    fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "/tmp/rudurru_stats_test_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// `Store::stats()` is derived from the state, so it must track puts,
+    /// tombstones, leases and watchers without any separate counter to drift.
+    #[tokio::test]
+    async fn stats_are_derived_from_state() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        for key in [b"a".as_slice(), b"b".as_slice()] {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: key.to_vec(),
+                    value: b"v".to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.stats().keys, 2);
+
+        // Deleting leaves a tombstone: it must not be counted as a live key.
+        store
+            .delete_range(etcdserverpb::DeleteRangeRequest {
+                key: b"a".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let stats = store.stats();
+        assert_eq!(stats.keys, 1, "tombstones must not be counted");
+        assert_eq!(stats.revision, store.current_revision());
+
+        let lease = store
+            .lease_grant(etcdserverpb::LeaseGrantRequest {
+                ttl: 60,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(store.stats().leases, 1);
+
+        store
+            .lease_revoke(etcdserverpb::LeaseRevokeRequest { id: lease })
+            .await
+            .unwrap();
+        assert_eq!(store.stats().leases, 0);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        store.state.write().register_watcher(WatchRegistration {
+            key: b"b".to_vec(),
+            range_end: Vec::new(),
+            start_revision: 0,
+            sender: tx,
+            watch_id: 9,
+            progress_notify: false,
+            filters: Vec::new(),
+            prev_kv: false,
+            bound: resolve_range(b"b", b""),
+        });
+        assert_eq!(store.stats().watchers, 1);
 
         let _ = std::fs::remove_file(&path);
     }

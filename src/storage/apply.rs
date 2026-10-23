@@ -33,7 +33,7 @@ impl StoreState {
         let event_key = Bytes::from(key.clone());
         self.keys.insert(key, entry.clone());
         if is_new {
-            crate::storage::KEY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.key_count += 1;
         }
 
         let event = WatchEvent {
@@ -59,7 +59,7 @@ impl StoreState {
         let prev = entry.clone();
 
         entry.delete_revision = rev;
-        crate::storage::KEY_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.key_count = self.key_count.saturating_sub(1);
 
         let event = WatchEvent {
             revision: rev,
