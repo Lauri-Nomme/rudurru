@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Periodic status logging + malloc_trim + metrics push (every 60s)
     let status_wal = wal_path.clone();
+    let status_store = store.clone();
     tokio::spawn(async move {
         let sock = metrics_addr.as_ref().and_then(|addr| {
             let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -67,12 +68,12 @@ async fn main() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         loop {
             interval.tick().await;
-            let keys = rudurru::storage::KEY_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-            let watchers =
-                rudurru::storage::WATCHER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-            let leases = rudurru::storage::LEASE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let stats = status_store.stats();
+            let keys = stats.keys;
+            let watchers = stats.watchers;
+            let leases = stats.leases;
             let wal_size = std::fs::metadata(&status_wal).map(|m| m.len()).unwrap_or(0);
-            let rev = rudurru::storage::current_revision();
+            let rev = stats.revision;
             let (rss_kb, vsize_kb, peak_kb) = read_proc_mem();
             tracing::info!(rev, keys, watchers, leases, wal_size, rss_kb, vsize_kb, peak_kb, "rudurru status");
             if let Some(ref sock) = sock {

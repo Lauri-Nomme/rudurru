@@ -1,7 +1,7 @@
 use crate::proto::mvccpb;
 use crate::storage::state::make_kv_bytes;
 use crate::storage::wal;
-use crate::storage::{next_revision, StoreState, WatchEvent};
+use crate::storage::{StoreState, WatchEvent};
 use prost::bytes::Bytes;
 use prost::Message;
 use tonic::Status;
@@ -33,7 +33,7 @@ impl StoreState {
         let event_key = Bytes::from(key.clone());
         self.keys.insert(key, entry.clone());
         if is_new {
-            crate::storage::KEY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.key_count += 1;
         }
 
         let event = WatchEvent {
@@ -59,7 +59,7 @@ impl StoreState {
         let prev = entry.clone();
 
         entry.delete_revision = rev;
-        crate::storage::KEY_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.key_count = self.key_count.saturating_sub(1);
 
         let event = WatchEvent {
             revision: rev,
@@ -83,7 +83,7 @@ impl StoreState {
         if keys_to_delete.is_empty() {
             return Ok(());
         }
-        let rev = next_revision();
+        let rev = self.alloc_revision();
         let mut records = Vec::with_capacity(keys_to_delete.len());
         for key in &keys_to_delete {
             let prev = self.keys.get(key).filter(|k| k.is_alive()).cloned();

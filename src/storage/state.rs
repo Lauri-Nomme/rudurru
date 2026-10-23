@@ -2,7 +2,6 @@ use crate::proto::etcdserverpb;
 use crate::proto::mvccpb;
 use crate::storage::RangeBound;
 use crate::storage::wal;
-use crate::storage::current_revision;
 use prost::bytes::Bytes;
 use prost::Message;
 use std::collections::BTreeMap;
@@ -105,6 +104,14 @@ pub struct StoreState {
     pub leases: BTreeMap<i64, LeaseState>,
     pub watchers: Vec<WatchRegistration>,
     pub next_rev: u64,
+    /// Next lease id to hand out. Restored past the highest lease id in the WAL.
+    pub next_lease_id: i64,
+    /// Number of keys currently alive (tombstones excluded). Maintained by
+    /// `apply`/`apply_delete`, so it is O(1) to read and needs no separate
+    /// process-wide counter.
+    pub key_count: u64,
+    /// Highest revision released for garbage collection by `compact`.
+    pub compact_rev: u64,
     pub wal: wal::WalFile,
     pub expiry_notify: Arc<Notify>,
 }
@@ -116,16 +123,43 @@ impl StoreState {
             leases: BTreeMap::new(),
             watchers: Vec::new(),
             next_rev: 1,
+            next_lease_id: 1,
+            key_count: 0,
+            compact_rev: 0,
             wal,
             expiry_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Allocate the next revision for this store.
+    ///
+    /// Must be called with the store write lock held, so the revision order
+    /// matches the order records reach the WAL. Keeping the clock on the state
+    /// rather than in a process-wide static also makes independently opened
+    /// stores (i.e. tests) independent of each other.
+    pub fn alloc_revision(&mut self) -> u64 {
+        let rev = self.next_rev;
+        self.next_rev += 1;
+        rev
+    }
+
+    /// Highest revision allocated so far (0 for a fresh store).
+    pub fn current_revision(&self) -> u64 {
+        self.next_rev.saturating_sub(1)
+    }
+
+    /// Allocate the next lease id for this store.
+    pub fn alloc_lease_id(&mut self) -> i64 {
+        let id = self.next_lease_id;
+        self.next_lease_id += 1;
+        id
     }
 
     pub(crate) fn header(&self) -> etcdserverpb::ResponseHeader {
         etcdserverpb::ResponseHeader {
             cluster_id: 1,
             member_id: 1,
-            revision: current_revision() as i64,
+            revision: self.current_revision() as i64,
             raft_term: 1,
         }
     }
