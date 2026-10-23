@@ -2,7 +2,7 @@ use crate::proto::etcdserverpb;
 use crate::proto::mvccpb;
 use crate::storage::RangeBound;
 use crate::storage::wal;
-use prost::bytes::Bytes;
+use prost::bytes::{Bytes, BytesMut};
 use prost::Message;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -67,6 +67,56 @@ pub(crate) fn make_kv_bytes(key: &[u8], ks: &KeyState) -> Bytes {
     );
     Bytes::from(kv_bytes)
 }
+
+/// Byte offset of the `mod_revision` varint inside a blob produced by
+/// [`wal::encode_kv`], i.e. just past its field tag.
+///
+/// The encoder emits a fixed field order, so the offset is simply the preceding
+/// lengths added up — no tag checks, and the `create_revision` varint in between
+/// only has to be skipped, never decoded:
+///
+/// ```text
+/// 0       tag 0x0a
+/// 1 .. 6  5-byte overlong key length
+/// 6 ..    key
+/// +1      tag 0x10                               (create_revision)
+/// +1..10  create_revision varint, minimal width  (skipped)
+/// +1      tag 0x18                               (mod_revision)   <- returned
+/// then 10 bytes of value
+/// ```
+#[inline]
+fn mod_revision_field_offset(kv_bytes: &[u8]) -> usize {
+    let key_len = ((kv_bytes[1] as u32) & 0x7f)
+        | (((kv_bytes[2] as u32) & 0x7f) << 7)
+        | (((kv_bytes[3] as u32) & 0x7f) << 14)
+        | (((kv_bytes[4] as u32) & 0x7f) << 21)
+        | (((kv_bytes[5] as u32) & 0x0f) << 28);
+
+    // tag + overlong length + key + create_revision tag
+    let mut i = 1 + 5 + key_len as usize + 1;
+    // advance to the varint's terminating byte (high bit clear)
+    while kv_bytes[i] & 0x80 != 0 {
+        i += 1;
+    }
+    i + 2 // past that byte, past the mod_revision tag
+}
+
+/// Copy `kv_bytes` with its `mod_revision` replaced by `rev`.
+///
+/// `mod_revision` is encoded with the fixed-width "overlong" varint
+/// ([`wal::encode_overlong_u64`]), so the field is overwritten in place: one
+/// exact-size allocation and a 10-byte store, no re-encoding, and nothing after
+/// it shifts. Every `kv_bytes` in a [`KeyState`] originates from
+/// [`make_kv_bytes`] or from a WAL record built by [`wal::encode_kv`], so the
+/// layout is guaranteed.
+#[inline]
+pub(crate) fn with_mod_revision(kv_bytes: &Bytes, rev: u64) -> Bytes {
+    let offset = mod_revision_field_offset(kv_bytes);
+    let mut out = BytesMut::from(&kv_bytes[..]);
+    out[offset..offset + 10].copy_from_slice(&wal::encode_overlong_u64(rev));
+    out.freeze()
+}
+
 
 #[derive(Debug)]
 pub struct LeaseState {
@@ -161,6 +211,95 @@ impl StoreState {
             member_id: 1,
             revision: self.current_revision() as i64,
             raft_term: 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Patching the fixed-width `mod_revision` in place must produce exactly
+    /// what a full re-encode would, for every key length and varint width of the
+    /// fields that precede it.
+    #[test]
+    fn with_mod_revision_matches_re_encoding() {
+        let keys: [&[u8]; 4] = [
+            b"",
+            b"k",
+            b"/registry/replicasets/default/immich-microservices-85fc7f49bf",
+            &[0xff; 200],
+        ];
+        // (create_revision, previous mod_revision, new mod_revision)
+        let cases: [(i64, u64, u64); 5] = [
+            (1, 1, 2),                          // narrow, one varint byte each
+            (1, 1, 1_000_000),                  // new revision much wider
+            (200, 300, 301),                    // 2-byte create_revision shifts the field
+            (16_384, 30_000, 4_000_000_000),    // 3-byte create_revision
+            (i64::MAX, u64::MAX / 2, u64::MAX), // extreme values
+        ];
+
+        for key in keys {
+            for (create_rev, prev_rev, new_rev) in cases {
+                let (original, ..) =
+                    wal::encode_kv(key, b"some value", create_rev, prev_rev as i64, 7, 0);
+                let patched = with_mod_revision(&Bytes::from(original), new_rev);
+                let (expected, ..) =
+                    wal::encode_kv(key, b"some value", create_rev, new_rev as i64, 7, 0);
+
+                assert_eq!(
+                    &patched[..],
+                    &expected[..],
+                    "patched blob differs from re-encode (key len {}, create_rev {}, prev {}, new {})",
+                    key.len(),
+                    create_rev,
+                    prev_rev,
+                    new_rev
+                );
+            }
+        }
+    }
+
+    /// Decoding the patched blob proves nothing but `mod_revision` moved.
+    #[test]
+    fn with_mod_revision_preserves_other_fields() {
+        let key = b"/registry/pods/default/foo";
+        let (original, ..) = wal::encode_kv(key, b"payload", 42, 43, 5, 9);
+
+        let patched = with_mod_revision(&Bytes::from(original), 99);
+        let kv = mvccpb::KeyValue::decode(&patched[..]).unwrap();
+
+        assert_eq!(kv.key, key);
+        assert_eq!(kv.value, b"payload");
+        assert_eq!(kv.create_revision, 42);
+        assert_eq!(kv.version, 5);
+        assert_eq!(kv.lease, 9);
+        assert_eq!(kv.mod_revision, 99);
+    }
+
+    /// The hardcoded offset arithmetic must agree with the offset `encode_kv`
+    /// computes for itself, across key lengths and every `create_revision`
+    /// varint width. If the encoder's layout ever changes, this fails.
+    #[test]
+    fn mod_revision_offset_matches_encoder() {
+        let keys: [&[u8]; 4] = [
+            b"",
+            b"k",
+            b"/registry/replicasets/default/immich-microservices-85fc7f49bf",
+            &[0xff; 200],
+        ];
+
+        for key in keys {
+            for create_rev in [0i64, 1, 127, 128, 16_383, 16_384, 1 << 35, i64::MAX] {
+                let (blob, _, mod_rev_offset) = wal::encode_kv(key, b"v", create_rev, 7, 1, 0);
+                assert_eq!(
+                    mod_revision_field_offset(&blob),
+                    mod_rev_offset as usize,
+                    "hardcoded offset disagrees with encode_kv (key len {}, create_rev {})",
+                    key.len(),
+                    create_rev
+                );
+            }
         }
     }
 }
