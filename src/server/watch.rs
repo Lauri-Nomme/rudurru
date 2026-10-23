@@ -317,9 +317,24 @@ async fn global_watch_loop(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<Gl
     }
 }
 
+/// Snapshot the WAL boundary used to split Phase 1 (replay) from Phase 2
+/// (catch-up) when a watch is registered.
+///
+/// The pair must describe the same point in time: every revision
+/// `<= checkpoint_rev` has its WAL record below `checkpoint_offset`, and
+/// nothing newer does. `current_revision()` cannot be used for this — it is the
+/// *next allocated* revision, bumped by `Store::put()`/`delete_range()` before
+/// they take the state write lock. A writer holding a revision but not yet the
+/// lock would be counted while its record is still absent from the file, so a
+/// record landing between the two phases was skipped by Phase 1 (not in the
+/// file yet) and discarded by Phase 2 (`rev <= checkpoint_rev`).
+///
+/// `last_applied_rev` is only advanced while the write lock is held, as is the
+/// WAL append that precedes it, so holding the read lock here excludes any
+/// writer that is mid-append and makes `(rev, offset)` consistent.
 fn current_checkpoint(store: &Store) -> (u64, u64) {
     let state = store.state.read();
-    let rev = current_revision();
+    let rev = state.last_applied_rev;
     let off = std::fs::metadata(&state.wal.path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -726,5 +741,46 @@ mod tests {
         assert_eq!(resp.compact_revision, 0);
         assert!(resp.events.is_empty(), "progress notification carries no events");
         assert!(!resp.fragment);
+    }
+    /// The Phase 1 / Phase 2 split relies on every revision `<= checkpoint_rev`
+    /// having its WAL record below `checkpoint_offset`. `Store::put()` allocates
+    /// its revision (via `next_revision()`) *before* taking the state write lock,
+    /// so `current_revision()` can count a writer whose record is not in the WAL
+    /// yet — and a record landing between the phases was then replayed by
+    /// neither: Phase 1 did not see it, Phase 2 dropped it as
+    /// `rev <= checkpoint_rev`.
+    #[tokio::test]
+    async fn test_checkpoint_ignores_allocated_but_unwritten_revisions() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).await.unwrap());
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let wal_len_after_put = std::fs::metadata(&path).unwrap().len();
+
+        // A concurrent writer that has already taken its revision but has not
+        // reached `state.write()`; `Store::put()` does exactly this.
+        let in_flight_rev = storage::next_revision();
+
+        let (checkpoint_rev, checkpoint_offset) = current_checkpoint(&store);
+
+        assert!(
+            checkpoint_rev < in_flight_rev,
+            "checkpoint must not count a revision whose WAL record does not exist yet \
+             (got {checkpoint_rev}, in-flight {in_flight_rev})"
+        );
+        assert_eq!(
+            checkpoint_offset, wal_len_after_put,
+            "checkpoint offset must correspond to the same point as checkpoint_rev"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

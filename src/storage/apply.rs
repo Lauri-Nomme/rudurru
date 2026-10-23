@@ -15,6 +15,9 @@ impl StoreState {
         rev: u64,
         kv_bytes: Option<Bytes>,
     ) -> Option<crate::storage::KeyState> {
+        // Track the last revision that is actually in the WAL. Must be updated
+        // under the store write lock, together with the append that precedes it.
+        self.last_applied_rev = self.last_applied_rev.max(rev);
         let prev = self.keys.get(&key).filter(|k| k.is_alive()).cloned();
         let is_new = prev.is_none();
         let rebirth = self.keys.get(&key).map_or(false, |k| k.delete_revision != 0);
@@ -52,6 +55,7 @@ impl StoreState {
     }
 
     pub(crate) fn apply_delete(&mut self, key: Vec<u8>, rev: u64) -> Option<crate::storage::KeyState> {
+        self.last_applied_rev = self.last_applied_rev.max(rev);
         let entry = self.keys.get_mut(&key)?;
         if entry.delete_revision != 0 {
             return None;

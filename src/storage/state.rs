@@ -105,6 +105,12 @@ pub struct StoreState {
     pub leases: BTreeMap<i64, LeaseState>,
     pub watchers: Vec<WatchRegistration>,
     pub next_rev: u64,
+    /// Revision of the last record applied to this state. Advanced only while
+    /// the store write lock is held, right after the WAL append, so it always
+    /// matches the revision of the last record in the WAL — unlike
+    /// `current_revision()`, which counts revisions that were allocated but not
+    /// yet written.
+    pub last_applied_rev: u64,
     pub wal: wal::WalFile,
     pub expiry_notify: Arc<Notify>,
 }
@@ -116,6 +122,7 @@ impl StoreState {
             leases: BTreeMap::new(),
             watchers: Vec::new(),
             next_rev: 1,
+            last_applied_rev: 0,
             wal,
             expiry_notify: Arc::new(Notify::new()),
         }
