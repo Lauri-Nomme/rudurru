@@ -1,7 +1,7 @@
 use crate::proto::etcdserverpb;
 use crate::proto::etcdserverpb::watch_request;
 use crate::proto::mvccpb;
-use crate::storage::{self, current_revision, wal, Store, WatchEvent, WatchRegistration};
+use crate::storage::{self, wal, Store, WatchEvent, WatchRegistration};
 use prost::bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -216,7 +216,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                 if !progress_notify {
                                     continue;
                                 }
-                                let rev = current_revision();
+                                let rev = store_clone.current_revision();
                                 tracing::debug!(watch_id, rev, "progress_notify periodic tick, sending response");
                                 let resp = etcdserverpb::WatchResponse {
                                     header: Some(make_header(rev as i64)),
@@ -249,7 +249,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     }
                                     tracing::info!(watch_id, "watch_canceled");
                                     let resp = etcdserverpb::WatchResponse {
-                                        header: Some(make_header(current_revision() as i64)),
+                                        header: Some(make_header(store.current_revision() as i64)),
                                         watch_id,
                                         created: false,
                                         canceled: true,
@@ -263,7 +263,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     }
                                 }
                                 watch_request::RequestUnion::ProgressRequest(_) => {
-                                    let rev = current_revision();
+                                    let rev = store.current_revision();
                                     tracing::debug!(stream_id, rev, "WatchProgressRequest received");
                                     let resp = make_progress_response(rev as i64);
                                     if tx.send(Ok(resp)).await.is_err() {
@@ -319,7 +319,7 @@ async fn global_watch_loop(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<Gl
 
 fn current_checkpoint(store: &Store) -> (u64, u64) {
     let state = store.state.read();
-    let rev = current_revision();
+    let rev = state.current_revision();
     let off = std::fs::metadata(&state.wal.path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -356,7 +356,7 @@ async fn flush_global_batch_at(
                 "watch_compacted"
             );
             let resp = etcdserverpb::WatchResponse {
-                header: Some(make_header(current_revision() as i64)),
+                header: Some(make_header(store.current_revision() as i64)),
                 watch_id: -1,
                 created: false,
                 canceled: true,
@@ -371,7 +371,7 @@ async fn flush_global_batch_at(
 
         // Reject only if the gap is egregious (bookmark races of 1-2 revs
         // are normal — etcd accepts them and the watcher catches up immediately).
-        let cur_rev = current_revision();
+        let cur_rev = store.current_revision();
         let gap = c.pending.start_revision.saturating_sub(cur_rev);
         if c.pending.start_revision > cur_rev && gap > 10_000 {
             let cancel_reason = format!(
@@ -441,7 +441,7 @@ async fn flush_global_batch_at(
         for &i in rejected.iter().rev() {
             let mut ctx = active.swap_remove(i);
             let resp = etcdserverpb::WatchResponse {
-                header: Some(make_header(current_revision() as i64)),
+                header: Some(make_header(store.current_revision() as i64)),
                 watch_id: -1,
                 created: false,
                 canceled: true,
@@ -595,7 +595,7 @@ async fn flush_global_batch_at(
 
     for mut ctx in active {
         let resp = etcdserverpb::WatchResponse {
-            header: Some(make_header(current_revision() as i64)),
+            header: Some(make_header(store.current_revision() as i64)),
             watch_id: ctx.watch_id,
             created: true,
             canceled: false,
@@ -654,7 +654,7 @@ mod tests {
             .await;
 
         // Snapshot the checkpoint state AFTER v2
-        let checkpoint_rev = current_revision();
+        let checkpoint_rev = store.current_revision();
         let checkpoint_offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
         // Simulate a concurrent put between Phase 1 and Phase 2

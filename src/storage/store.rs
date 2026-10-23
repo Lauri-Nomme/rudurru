@@ -4,9 +4,8 @@ use crate::storage::background::{start_compaction_task, start_expiry_task, start
 use crate::storage::state::{KeyState, LeaseState, StoreState};
 use crate::storage::wal;
 use crate::storage::{
-    btree_bounds, current_revision, eval_compare, matches_range, next_lease_id, next_revision,
-    resolve_range, scan_wal_range, RangeBoundRef, COMPACT_REV, KEY_COUNT, LEASE_COUNT,
-    NEXT_LEASE_ID, NEXT_REV, WATCHER_COUNT,
+    btree_bounds, eval_compare, matches_range, resolve_range, scan_wal_range, RangeBoundRef,
+    KEY_COUNT, LEASE_COUNT, WATCHER_COUNT,
 };
 use prost::bytes::Bytes;
 use std::collections::BTreeMap;
@@ -32,7 +31,7 @@ impl Store {
 
         for rec in &records {
             let rev = rec.mod_revision().unwrap_or(0) as u64;
-            if rev <= COMPACT_REV.load(Ordering::Relaxed) {
+            if rev <= state.compact_rev {
                 continue;
             }
             apply_record(&mut state, rec);
@@ -42,7 +41,6 @@ impl Store {
         }
 
         state.next_rev = max_rev + 1;
-        NEXT_REV.store(state.next_rev, Ordering::SeqCst);
         let active_keys = state.keys.values().filter(|ks| ks.is_alive()).count() as u64;
         KEY_COUNT.store(active_keys, Ordering::Relaxed);
         WATCHER_COUNT.store(0, Ordering::Relaxed);
@@ -63,7 +61,7 @@ impl Store {
             let max_id = unique.last().copied().unwrap_or(0);
             if max_id > 0 {
                 // Bump past the highest restored lease ID so new leases don't collide.
-                NEXT_LEASE_ID.store(max_id + 1, Ordering::SeqCst);
+                state.next_lease_id = max_id + 1;
             }
             let now = tokio::time::Instant::now();
             // 1 hour default – conservative so nothing expires prematurely.
@@ -90,7 +88,7 @@ impl Store {
             max_rev,
             active_keys,
             lease_count,
-            COMPACT_REV.load(Ordering::Relaxed),
+            state.compact_rev,
         );
 
         let state_arc = Arc::new(RwLock::new(state));
@@ -107,7 +105,12 @@ impl Store {
 
 
     pub async fn compact_rev(&self) -> u64 {
-        COMPACT_REV.load(Ordering::Relaxed)
+        self.state.read().compact_rev
+    }
+
+    /// Highest revision allocated by this store.
+    pub fn current_revision(&self) -> u64 {
+        self.state.read().current_revision()
     }
 
     pub async fn wal_path(&self) -> String {
@@ -125,7 +128,7 @@ impl Store {
         } else {
             0
         };
-        let current_rev = current_revision();
+        let current_rev = self.current_revision();
 
         // Future revision — etcd accepts small races from bookmark watches
         // and returns the current state. Only reject egregious gaps that
@@ -147,7 +150,7 @@ impl Store {
         }
 
         // Compacted revision
-        if target_rev > 0 && target_rev < COMPACT_REV.load(Ordering::Relaxed) {
+        if target_rev > 0 && target_rev < self.compact_rev().await {
             return Err(Status::new(
                 tonic::Code::Unavailable,
                 "etcdserver: mvcc: required revision has been compacted",
@@ -623,8 +626,8 @@ impl Store {
         &self,
         req: etcdserverpb::PutRequest,
     ) -> Result<etcdserverpb::PutResponse, Status> {
-        let rev = next_revision();
         let mut state = self.state.write();
+        let rev = state.alloc_revision();
         let key = req.key;
 
         let prev_entry = state.keys.get(&key);
@@ -694,8 +697,8 @@ impl Store {
         &self,
         req: etcdserverpb::DeleteRangeRequest,
     ) -> Result<etcdserverpb::DeleteRangeResponse, Status> {
-        let rev = next_revision();
         let mut state = self.state.write();
+        let rev = state.alloc_revision();
 
         let bound = resolve_range(&req.key, &req.range_end);
 
@@ -873,7 +876,8 @@ impl Store {
         req: etcdserverpb::CompactionRequest,
     ) -> Result<etcdserverpb::CompactionResponse, Status> {
         let rev = req.revision as u64;
-        let current = current_revision();
+        let mut state = self.state.write();
+        let current = state.current_revision();
 
         if rev > current {
             return Err(Status::new(
@@ -881,15 +885,14 @@ impl Store {
                 "etcdserver: mvcc: required revision is a future revision",
             ));
         }
-        if rev <= COMPACT_REV.load(Ordering::Relaxed) {
+        if rev <= state.compact_rev {
             return Err(Status::new(
                 tonic::Code::OutOfRange,
                 "etcdserver: mvcc: required revision has been compacted",
             ));
         }
 
-        let state = self.state.write();
-        COMPACT_REV.store(rev, Ordering::SeqCst);
+        state.compact_rev = rev;
 
         // NOTE: etcd's Compact does NOT delete current key-values from the store.
         // It only sets compact_rev to allow garbage collection of old MVCC revisions.
@@ -908,7 +911,11 @@ impl Store {
         req: etcdserverpb::LeaseGrantRequest,
     ) -> Result<etcdserverpb::LeaseGrantResponse, Status> {
         let mut state = self.state.write();
-        let id = if req.id != 0 { req.id } else { next_lease_id() };
+        let id = if req.id != 0 {
+            req.id
+        } else {
+            state.alloc_lease_id()
+        };
         let ttl = req.ttl;
         let expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
         state.leases.insert(
@@ -1061,7 +1068,7 @@ impl Store {
 
         {
             let state = self.state.read();
-            snapshot_rev = current_revision();
+            snapshot_rev = state.current_revision();
             snapshot_wal_size = state.wal.file.lock().unwrap().metadata()?.len();
             let mut recs = Vec::with_capacity(state.keys.len());
             for (key, ks) in state.keys.iter() {

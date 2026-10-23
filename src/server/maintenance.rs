@@ -1,5 +1,5 @@
 use crate::proto::etcdserverpb;
-use crate::storage::{self, Store};
+use crate::storage::Store;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -7,11 +7,11 @@ use tonic::{Request, Response, Status};
 
 const CHUNK_SIZE: usize = 64 * 1024;
 
-fn header() -> etcdserverpb::ResponseHeader {
+fn header(store: &Store) -> etcdserverpb::ResponseHeader {
     etcdserverpb::ResponseHeader {
         cluster_id: 1,
         member_id: 1,
-        revision: storage::current_revision() as i64,
+        revision: store.current_revision() as i64,
         raft_term: 1,
     }
 }
@@ -34,7 +34,7 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
         _req: Request<etcdserverpb::AlarmRequest>,
     ) -> Result<Response<etcdserverpb::AlarmResponse>, Status> {
         Ok(Response::new(etcdserverpb::AlarmResponse {
-            header: Some(header()),
+            header: Some(header(&self.store)),
             alarms: vec![],
         }))
     }
@@ -45,15 +45,15 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
     ) -> Result<Response<etcdserverpb::StatusResponse>, Status> {
         let db_size = self.store.db_size().await;
         Ok(Response::new(etcdserverpb::StatusResponse {
-            header: Some(header()),
+            header: Some(header(&self.store)),
             version: "3.5.14".into(),
             db_size,
             leader: 1,
-            raft_index: storage::current_revision(),
+            raft_index: self.store.current_revision(),
             raft_term: 1,
             db_size_in_use: db_size,
             is_learner: false,
-            raft_applied_index: storage::current_revision(),
+            raft_applied_index: self.store.current_revision(),
             errors: vec![],
         }))
     }
@@ -73,7 +73,7 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
     ) -> Result<Response<etcdserverpb::HashResponse>, Status> {
         let h = self.store.store_hash().await;
         Ok(Response::new(etcdserverpb::HashResponse {
-            header: Some(header()),
+            header: Some(header(&self.store)),
             hash: h as u32,
         }))
     }
@@ -85,7 +85,7 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
         let h = self.store.store_hash().await;
         let compact_rev = self.store.compact_rev().await;
         Ok(Response::new(etcdserverpb::HashKvResponse {
-            header: Some(header()),
+            header: Some(header(&self.store)),
             hash: h as u32,
             compact_revision: compact_rev as i64,
         }))
@@ -103,7 +103,7 @@ impl etcdserverpb::maintenance_server::Maintenance for Maintenance {
         tokio::spawn(async move {
             let (buf, _rev) = {
                 let state = store.state.read();
-                let rev = storage::current_revision();
+                let rev = state.current_revision();
                 let mut buf = Vec::new();
                 // Header: revision(8) + key_count(4)
                 buf.extend_from_slice(&rev.to_le_bytes());

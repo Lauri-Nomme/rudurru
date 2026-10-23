@@ -12,29 +12,12 @@ pub use store::Store;
 use crate::proto::etcdserverpb;
 use prost::bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-/// Global revision counter. Monotonically increasing, starts at 1.
-static NEXT_REV: AtomicU64 = AtomicU64::new(1);
-
-pub fn next_revision() -> u64 {
-    NEXT_REV.fetch_add(1, Ordering::SeqCst)
-}
-
-pub fn current_revision() -> u64 {
-    NEXT_REV.load(Ordering::SeqCst).saturating_sub(1)
-}
-
-static NEXT_LEASE_ID: AtomicI64 = AtomicI64::new(1);
-static COMPACT_REV: AtomicU64 = AtomicU64::new(0);
+use std::sync::atomic::AtomicU64;
 
 /// Approximate counters for the periodic status log (no read lock needed).
 pub static KEY_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static WATCHER_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static LEASE_COUNT: AtomicU64 = AtomicU64::new(0);
-
-fn next_lease_id() -> i64 {
-    NEXT_LEASE_ID.fetch_add(1, Ordering::SeqCst)
-}
 
 /// Translate key + range_end from proto into a range bound for BTreeMap.
 pub(crate) fn resolve_range(key: &[u8], range_end: &[u8]) -> RangeBound {
@@ -290,8 +273,6 @@ mod compact_tests {
         );
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);
-        // Reset global state to avoid cross-test interference in parallel runs.
-        COMPACT_REV.store(0, Ordering::SeqCst);
         path.to_string_lossy().to_string()
     }
 
@@ -445,7 +426,7 @@ mod compact_tests {
                 })
                 .await;
 
-            final_rev = current_revision();
+            final_rev = store.current_revision();
         }
 
         // Phase 2: reopen from compacted WAL
@@ -460,7 +441,7 @@ mod compact_tests {
             .await.unwrap();
         assert_eq!(resp.count, 3, "all 3 keys after restart from compacted WAL");
         assert_eq!(
-            current_revision(),
+            store2.current_revision(),
             final_rev,
             "revision matches after restart"
         );
@@ -544,8 +525,6 @@ mod historical_tests {
         );
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);
-        // Reset compact rev before each test to avoid test interference
-        COMPACT_REV.store(0, Ordering::SeqCst);
         path.to_string_lossy().to_string()
     }
 
@@ -577,9 +556,9 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let create_rev = current_revision(); // rev 2
+        let create_rev = store.current_revision(); // rev 2
         // Compact at rev 2 — rev 1 is now below COMPACT_REV
-        COMPACT_REV.store(create_rev, Ordering::SeqCst);
+        store.state.write().compact_rev = create_rev;
 
         let err = store
             .range(etcdserverpb::RangeRequest {
@@ -612,7 +591,6 @@ mod historical_tests {
         let kv = mvccpb::KeyValue::decode(&ok.kvs[0][..]).unwrap();
         assert_eq!(kv.key, b"k");
 
-        COMPACT_REV.store(0, Ordering::SeqCst);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -669,7 +647,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev1 = current_revision();
+        let rev1 = store.current_revision();
 
         store
             .put(etcdserverpb::PutRequest {
@@ -678,7 +656,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev2 = current_revision();
+        let rev2 = store.current_revision();
 
         // Query at rev2: both keys have mod_revision == rev2, so mod_rev <= target_rev
         let resp = store
@@ -719,7 +697,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev1 = current_revision();
+        let rev1 = store.current_revision();
 
         // k2 is created after rev1 — should not appear in query at rev1
         store
@@ -759,7 +737,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let create_rev = current_revision();
+        let create_rev = store.current_revision();
 
         // Update k1 at some later revision
         store
@@ -812,7 +790,7 @@ mod historical_tests {
             .await;
 
         // Query after delete: k1 should not appear
-        let later_rev = current_revision();
+        let later_rev = store.current_revision();
         let resp = store
             .range(etcdserverpb::RangeRequest {
                 key: b"k1".to_vec(),
@@ -838,7 +816,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let create_rev = current_revision();
+        let create_rev = store.current_revision();
 
         store
             .put(etcdserverpb::PutRequest {
@@ -893,7 +871,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let later_rev = current_revision();
+        let later_rev = store.current_revision();
 
         // Put another one, query at the point before it existed
         store
@@ -937,7 +915,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         store
             .put(etcdserverpb::PutRequest {
@@ -974,7 +952,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         store
             .put(etcdserverpb::PutRequest {
@@ -1019,7 +997,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         let resp = store
             .range(etcdserverpb::RangeRequest {
@@ -1057,7 +1035,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         // Point lookup for a key that exists at rev
         let resp = store
@@ -1118,7 +1096,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         // Create another key under /a/ after rev
         store
@@ -1159,11 +1137,11 @@ mod historical_tests {
                 })
                 .await;
         }
-        let pre_compact_rev = current_revision();
+        let pre_compact_rev = store.current_revision();
 
         // Compact WAL and set compact revision
         store.compact_wal().await.unwrap();
-        COMPACT_REV.store(pre_compact_rev, Ordering::SeqCst);
+        store.state.write().compact_rev = pre_compact_rev;
 
         // Now revision 1 is below COMPACT_REV → should error
         let err = store
@@ -1181,7 +1159,7 @@ mod historical_tests {
         );
 
         // Query at pre_compact_rev: should still work (>= COMPACT_REV)
-        let compact_rev_val = COMPACT_REV.load(Ordering::Relaxed);
+        let compact_rev_val = store.state.read().compact_rev;
         assert!(
             pre_compact_rev >= compact_rev_val,
             "pre_compact_rev={} >= COMPACT_REV={}",
@@ -1215,7 +1193,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let target_rev = current_revision();
+        let target_rev = store.current_revision();
 
         // Modify k1 multiple times after target_rev
         for i in 0u64..5 {
@@ -1275,7 +1253,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         // Range from b to d (exclusive): should get b and c
         let resp = store
@@ -1325,7 +1303,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let first_rev = current_revision();
+        let first_rev = store.current_revision();
 
         // Delete k1
         store
@@ -1363,7 +1341,7 @@ mod historical_tests {
         }
 
         // Query at current revision: should see "second_life"
-        let current = current_revision();
+        let current = store.current_revision();
         let resp = store
             .range(etcdserverpb::RangeRequest {
                 key: b"k1".to_vec(),
@@ -1403,7 +1381,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let del_rev = current_revision();
+        let del_rev = store.current_revision();
 
         // Query exactly at delete revision: key should NOT be included
         // (deleted at this rev, not before it)
@@ -1446,7 +1424,7 @@ mod historical_tests {
                 })
                 .await;
         }
-        let target_rev = current_revision();
+        let target_rev = store.current_revision();
 
         // Update all 5 keys after target_rev — all become stale
         for i in 0u64..5 {
@@ -1497,7 +1475,7 @@ mod historical_tests {
                 ..Default::default()
             })
             .await;
-        let first_rev = current_revision();
+        let first_rev = store.current_revision();
 
         // Delete
         store
@@ -1544,7 +1522,7 @@ mod historical_tests {
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
-        let rev = current_revision();
+        let rev = store.current_revision();
         store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await.unwrap();
 
         // Current-state: min_mod_revision filters current mod_revision
@@ -1562,7 +1540,7 @@ mod historical_tests {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
-        let rev1 = current_revision();
+        let rev1 = store.current_revision();
         store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -1580,7 +1558,7 @@ mod historical_tests {
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
-        let rev_b = current_revision();
+        let rev_b = store.current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"".to_vec(), range_end: vec![0],
@@ -1596,7 +1574,7 @@ mod historical_tests {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
-        let rev_a = current_revision();
+        let rev_a = store.current_revision();
         store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -1613,7 +1591,7 @@ mod historical_tests {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
-        let create_rev = current_revision();
+        let create_rev = store.current_revision();
         store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         // Historical: metadata should reflect state at create_rev
@@ -1646,7 +1624,7 @@ mod historical_tests {
         store.put(etcdserverpb::PutRequest{key:b"a".to_vec(),value:b"va".to_vec(),..Default::default()}).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"vb".to_vec(),..Default::default()}).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"c".to_vec(),value:b"vc".to_vec(),..Default::default()}).await.unwrap();
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         // From-key: all keys >= "b"
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -1662,7 +1640,7 @@ mod historical_tests {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"existing".to_vec(),value:b"v".to_vec(),..Default::default()}).await.unwrap();
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"nonexistent".to_vec(), revision: rev as i64,
@@ -1678,7 +1656,7 @@ mod historical_tests {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"/real/k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
-        let rev = current_revision();
+        let rev = store.current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"/fake/".to_vec(), range_end: b"/fake0".to_vec(), revision: rev as i64,
@@ -1693,7 +1671,7 @@ mod historical_tests {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
-        let create_rev = current_revision();
+        let create_rev = store.current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"k1".to_vec(), revision: create_rev as i64,
@@ -1715,7 +1693,7 @@ mod historical_tests {
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"".to_vec(), range_end: vec![0],
-            revision: current_revision() as i64, limit: 0,
+            revision: store.current_revision() as i64, limit: 0,
             ..Default::default()
         }).await.unwrap();
         assert_eq!(resp.count, 2);
@@ -1729,7 +1707,7 @@ mod historical_tests {
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
-        let rev = current_revision();
+        let rev = store.current_revision();
         store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
@@ -1754,7 +1732,7 @@ mod historical_tests {
         let store = Store::open(&path).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1".to_vec(),..Default::default()}).await.unwrap();
         store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
-        let rev_k2 = current_revision();
+        let rev_k2 = store.current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
             key: b"".to_vec(), range_end: vec![0],
@@ -2152,7 +2130,7 @@ mod lease_restore_tests {
                 .collect();
             let max_id = unique.last().copied().unwrap_or(0);
             if max_id > 0 {
-                NEXT_LEASE_ID.store(max_id + 1, std::sync::atomic::Ordering::SeqCst);
+                state.next_lease_id = max_id + 1;
             }
             let now = tokio::time::Instant::now();
             let default_ttl = 3600i64;
@@ -2197,7 +2175,6 @@ mod lease_restore_tests {
         let path = temp_wal();
         populate_wal(&path, &[make_lease_put_record(b"/registry/test/leased", 10, 42)]);
 
-        NEXT_LEASE_ID.store(1, std::sync::atomic::Ordering::SeqCst);
         let state = rebuild_from_wal(&path);
 
         assert!(state.leases.contains_key(&42), "LeaseState should exist for restored lease 42");
@@ -2206,8 +2183,11 @@ mod lease_restore_tests {
         assert!(ks.is_alive(), "key should be alive");
         assert_eq!(ks.lease, 42, "key should reference lease 42");
 
-        let next_after = NEXT_LEASE_ID.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(next_after > 42, "NEXT_LEASE_ID({}) should be beyond restored lease 42", next_after);
+        assert!(
+            state.next_lease_id > 42,
+            "next_lease_id({}) should be beyond restored lease 42",
+            state.next_lease_id
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2220,15 +2200,17 @@ mod lease_restore_tests {
             make_lease_put_record(b"/registry/b", 20, 99),
         ]);
 
-        NEXT_LEASE_ID.store(1, std::sync::atomic::Ordering::SeqCst);
         let state = rebuild_from_wal(&path);
 
         assert_eq!(state.leases.len(), 2, "both leases should be restored");
         assert!(state.leases.contains_key(&42), "lease 42 restored");
         assert!(state.leases.contains_key(&99), "lease 99 restored");
 
-        let next_after = NEXT_LEASE_ID.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(next_after > 99, "NEXT_LEASE_ID({}) > max restored(99)", next_after);
+        assert!(
+            state.next_lease_id > 99,
+            "next_lease_id({}) > max restored(99)",
+            state.next_lease_id
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2238,13 +2220,14 @@ mod lease_restore_tests {
         let path = temp_wal();
         populate_wal(&path, &[make_plain_put_record(b"/registry/nolease", 10)]);
 
-        NEXT_LEASE_ID.store(1, std::sync::atomic::Ordering::SeqCst);
         let state = rebuild_from_wal(&path);
 
         assert_eq!(state.leases.len(), 0, "no leases should be restored when none exist");
 
-        let next_after = NEXT_LEASE_ID.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(next_after, 1, "NEXT_LEASE_ID should stay at 1 when no leases restored");
+        assert_eq!(
+            state.next_lease_id, 1,
+            "next_lease_id should stay at 1 when no leases restored"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2258,11 +2241,13 @@ mod lease_restore_tests {
             make_lease_put_record(b"/registry/c", 30, 42),
         ]);
 
-        NEXT_LEASE_ID.store(1, std::sync::atomic::Ordering::SeqCst);
-        rebuild_from_wal(&path);
+        let state = rebuild_from_wal(&path);
 
-        let next_id = NEXT_LEASE_ID.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(next_id, 100, "NEXT_LEASE_ID should be max(5,99,42)+1 = 100, got {next_id}");
+        assert_eq!(
+            state.next_lease_id, 100,
+            "next_lease_id should be max(5,99,42)+1 = 100, got {}",
+            state.next_lease_id
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2446,7 +2431,7 @@ mod point_range_tests {
         let path = temp_wal();
         let store = Store::open(&path).await.unwrap();
         put(&store, b"prefix/ab", b"AB").await;
-        let rev = current_revision() as i64;
+        let rev = store.current_revision() as i64;
 
         let resp = store
             .range(etcdserverpb::RangeRequest {

@@ -1,13 +1,13 @@
 use crate::proto::etcdserverpb;
-use crate::storage::{self, Store};
+use crate::storage::Store;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-fn header() -> etcdserverpb::ResponseHeader {
+fn header(store: &Store) -> etcdserverpb::ResponseHeader {
     etcdserverpb::ResponseHeader {
         cluster_id: 1,
         member_id: 1,
-        revision: storage::current_revision() as i64,
+        revision: store.current_revision() as i64,
         raft_term: 1,
     }
 }
@@ -62,7 +62,7 @@ impl etcdserverpb::cluster_server::Cluster for Cluster {
         _req: Request<etcdserverpb::MemberListRequest>,
     ) -> Result<Response<etcdserverpb::MemberListResponse>, Status> {
         Ok(Response::new(etcdserverpb::MemberListResponse {
-            header: Some(header()),
+            header: Some(header(&self.store)),
             members: vec![self_member()],
         }))
     }
