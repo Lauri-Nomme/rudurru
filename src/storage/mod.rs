@@ -314,7 +314,7 @@ mod compact_tests {
 
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 ..Default::default()
             })
@@ -334,7 +334,7 @@ mod compact_tests {
 
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 ..Default::default()
             })
@@ -375,7 +375,7 @@ mod compact_tests {
 
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 ..Default::default()
             })
@@ -428,7 +428,7 @@ mod compact_tests {
 
         let resp = store2
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 ..Default::default()
             })
@@ -491,7 +491,7 @@ mod compact_tests {
         let store2 = Store::open(&path).await.unwrap();
         let resp2 = store2
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 ..Default::default()
             })
@@ -524,7 +524,7 @@ mod historical_tests {
 
     fn all_req() -> etcdserverpb::RangeRequest {
         etcdserverpb::RangeRequest {
-            key: b"".to_vec(),
+            key: b"\0".to_vec(),
             range_end: vec![0],
             ..Default::default()
         }
@@ -655,7 +655,7 @@ mod historical_tests {
         // Query at rev2: both keys have mod_revision == rev2, so mod_rev <= target_rev
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: rev2 as i64,
                 ..Default::default()
@@ -667,7 +667,7 @@ mod historical_tests {
         // Query at rev1: only k1 exists (k2 doesn't exist yet)
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: rev1 as i64,
                 ..Default::default()
@@ -705,7 +705,7 @@ mod historical_tests {
         // Query at rev1: k1 exists, k2 doesn't (create_rev > rev1)
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: rev1 as i64,
                 ..Default::default()
@@ -833,7 +833,7 @@ mod historical_tests {
         // k2's create_rev > create_rev.
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: create_rev as i64,
                 ..Default::default()
@@ -878,7 +878,7 @@ mod historical_tests {
 
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: later_rev as i64,
                 ..Default::default()
@@ -921,7 +921,7 @@ mod historical_tests {
 
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: rev as i64,
                 keys_only: true,
@@ -958,7 +958,7 @@ mod historical_tests {
 
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: rev as i64,
                 count_only: true,
@@ -995,7 +995,7 @@ mod historical_tests {
 
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: rev as i64,
                 limit: 1,
@@ -1162,7 +1162,7 @@ mod historical_tests {
         );
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: pre_compact_rev as i64,
                 ..Default::default()
@@ -1434,7 +1434,7 @@ mod historical_tests {
         // Query with limit=2 at target_rev: all keys stale, should return 2
         let resp = store
             .range(etcdserverpb::RangeRequest {
-                key: b"".to_vec(),
+                key: b"\0".to_vec(),
                 range_end: vec![0],
                 revision: target_rev as i64,
                 limit: 2,
@@ -1521,7 +1521,7 @@ mod historical_tests {
 
         // Current-state: min_mod_revision filters current mod_revision
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             min_mod_revision: (rev + 1) as i64,
             ..Default::default()
         }).await.unwrap();
@@ -1538,7 +1538,7 @@ mod historical_tests {
         store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             max_mod_revision: rev1 as i64,
             ..Default::default()
         }).await.unwrap();
@@ -1555,7 +1555,7 @@ mod historical_tests {
         let rev_b = store.current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             min_create_revision: rev_b as i64,
             ..Default::default()
         }).await.unwrap();
@@ -1572,7 +1572,7 @@ mod historical_tests {
         store.put(etcdserverpb::PutRequest{key:b"b".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             max_create_revision: rev_a as i64,
             ..Default::default()
         }).await.unwrap();
@@ -1686,7 +1686,7 @@ mod historical_tests {
         store.put(etcdserverpb::PutRequest{key:b"k2".to_vec(),value:b"v2".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             revision: store.current_revision() as i64, limit: 0,
             ..Default::default()
         }).await.unwrap();
@@ -1705,14 +1705,14 @@ mod historical_tests {
         store.put(etcdserverpb::PutRequest{key:b"k1".to_vec(),value:b"v1_upd".to_vec(),..Default::default()}).await.unwrap();
 
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             min_mod_revision: (rev + 1) as i64,
             ..Default::default()
         }).await.unwrap();
         assert_eq!(resp.count, 1, "min_mod_revision: only k1");
 
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             max_mod_revision: rev as i64,
             ..Default::default()
         }).await.unwrap();
@@ -1729,14 +1729,14 @@ mod historical_tests {
         let rev_k2 = store.current_revision();
 
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             min_create_revision: rev_k2 as i64,
             ..Default::default()
         }).await.unwrap();
         assert_eq!(resp.count, 1, "min_create_revision: only k2");
 
         let resp = store.range(etcdserverpb::RangeRequest{
-            key: b"".to_vec(), range_end: vec![0],
+            key: b"\0".to_vec(), range_end: vec![0],
             max_create_revision: rev_k2 as i64 - 1,
             ..Default::default()
         }).await.unwrap();
