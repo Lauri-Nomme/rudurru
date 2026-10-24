@@ -266,6 +266,122 @@ fn check_lease_ttl(ttl: i64) -> Result<i64, Status> {
     Ok(ttl.max(LEASE_MIN_TTL))
 }
 
+/// etcd rejects transactions whose **writes** touch overlapping keys: puts are
+/// point intervals, delete ranges are intervals, and no two may intersect.
+/// Range (read) ops do not participate — reading a key the same txn writes is
+/// legal, and the read sees the txn's own write.
+fn check_txn_duplicate_keys(req: &etcdserverpb::TxnRequest) -> Result<(), Status> {
+    check_txn_branch(&req.success)?;
+    check_txn_branch(&req.failure)
+}
+
+fn check_txn_branch(ops: &[etcdserverpb::RequestOp]) -> Result<(), Status> {
+    use etcdserverpb::request_op::Request;
+
+    let mut intervals: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    for op in ops {
+        match &op.request {
+            Some(Request::RequestPut(p)) => {
+                check_key(&p.key)?;
+                intervals.push(point_interval(&p.key));
+            }
+            Some(Request::RequestDeleteRange(d)) => {
+                check_key(&d.key)?;
+                intervals.push(bound_interval(resolve_range(&d.key, &d.range_end).to_ref()));
+            }
+            Some(Request::RequestRange(r)) => check_key(&r.key)?,
+            Some(Request::RequestTxn(t)) => {
+                check_txn_branch(&t.success)?;
+                check_txn_branch(&t.failure)?;
+            }
+            None => {}
+        }
+    }
+
+    for i in 0..intervals.len() {
+        for j in (i + 1)..intervals.len() {
+            if intervals_overlap(&intervals[i], &intervals[j]) {
+                return Err(Status::new(
+                    tonic::Code::InvalidArgument,
+                    "etcdserver: duplicate key given in txn request",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn point_interval(key: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let mut end = key.to_vec();
+    end.push(0);
+    (key.to_vec(), Some(end))
+}
+
+/// Smallest key greater than every key with `prefix`; `None` when unbounded
+/// (prefix consists only of 0xFF).
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut v = prefix.to_vec();
+    while let Some(last) = v.last_mut() {
+        if *last == 0xff {
+            v.pop();
+        } else {
+            *last += 1;
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn bound_interval(bound: RangeBoundRef<'_>) -> (Vec<u8>, Option<Vec<u8>>) {
+    match bound {
+        RangeBoundRef::All => (Vec::new(), None),
+        RangeBoundRef::Point(k) => point_interval(k),
+        RangeBoundRef::Prefix(p) => (p.to_vec(), prefix_end(p)),
+        RangeBoundRef::From(k) => (k.to_vec(), None),
+        RangeBoundRef::Range(s, e) => (s.to_vec(), Some(e.to_vec())),
+    }
+}
+
+fn intervals_overlap(a: &(Vec<u8>, Option<Vec<u8>>), b: &(Vec<u8>, Option<Vec<u8>>)) -> bool {
+    if let Some(end) = &a.1 {
+        if a.0 >= *end {
+            return false;
+        }
+    }
+    if let Some(end) = &b.1 {
+        if b.0 >= *end {
+            return false;
+        }
+    }
+    let starts_before_end = |start: &[u8], end: &Option<Vec<u8>>| match end {
+        Some(e) => start < e.as_slice(),
+        None => true,
+    };
+    starts_before_end(&a.0, &b.1) && starts_before_end(&b.0, &a.1)
+}
+
+/// Place a deferred historical-range response at its slot in the txn response
+/// tree (`path` is a chain of response indices through nested txns).
+fn patch_deferred_range(
+    responses: &mut [etcdserverpb::ResponseOp],
+    path: &[usize],
+    resp: etcdserverpb::RangeResponse,
+) {
+    let Some((&first, rest)) = path.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        responses[first].response =
+            Some(etcdserverpb::response_op::Response::ResponseRange(resp));
+        return;
+    }
+    if let Some(etcdserverpb::response_op::Response::ResponseTxn(nested)) =
+        &mut responses[first].response
+    {
+        patch_deferred_range(&mut nested.responses, rest, resp);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct StoreStats {
     pub revision: u64,
@@ -278,6 +394,235 @@ pub struct StoreStats {
 pub struct Store {
     pub state: Arc<RwLock<StoreState>>,
 }
+/// Validation and application helpers shared by the direct RPCs and by
+/// transactions, which apply several writes under one lock at one revision.
+impl StoreState {
+    fn validate_put(&self, req: &etcdserverpb::PutRequest) -> Result<(), Status> {
+        check_key(&req.key)?;
+        if req.ignore_value && !req.value.is_empty() {
+            return Err(Status::new(
+                tonic::Code::InvalidArgument,
+                "etcdserver: value is provided",
+            ));
+        }
+        if req.ignore_lease && req.lease != 0 {
+            return Err(Status::new(
+                tonic::Code::InvalidArgument,
+                "etcdserver: lease is provided",
+            ));
+        }
+
+        // ignore_value/ignore_lease mean "reuse the stored value/lease", which
+        // is an error when there is nothing stored (etcd: key not found).
+        let prev_alive = self.keys.get(&req.key).filter(|k| k.is_alive());
+        if (req.ignore_value || req.ignore_lease) && prev_alive.is_none() {
+            return Err(Status::new(
+                tonic::Code::InvalidArgument,
+                "etcdserver: key not found",
+            ));
+        }
+
+        let lease = if req.ignore_lease {
+            prev_alive.map(|k| k.lease).unwrap_or(req.lease)
+        } else {
+            req.lease
+        };
+        if lease != 0 && !self.leases.contains_key(&lease) {
+            return Err(Status::new(
+                tonic::Code::NotFound,
+                "etcdserver: requested lease not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Apply a validated put at `rev`. The caller holds the write lock and owns
+    /// the revision, so a transaction can apply several writes at one revision.
+    fn put_at(
+        &mut self,
+        req: etcdserverpb::PutRequest,
+        rev: u64,
+    ) -> Result<etcdserverpb::PutResponse, Status> {
+        let key = req.key;
+
+        // ignore_value/ignore_lease mean "reuse the stored value/lease", which
+        // is an error when there is nothing stored (etcd: key not found).
+        let prev_alive = self.keys.get(&key).filter(|k| k.is_alive()).cloned();
+        if (req.ignore_value || req.ignore_lease) && prev_alive.is_none() {
+            return Err(Status::new(
+                tonic::Code::InvalidArgument,
+                "etcdserver: key not found",
+            ));
+        }
+
+        let value = if req.ignore_value {
+            prev_alive
+                .as_ref()
+                .map(|k| k.value.to_vec())
+                .unwrap_or_default()
+        } else {
+            req.value
+        };
+        let lease = if req.ignore_lease {
+            prev_alive.as_ref().map(|k| k.lease).unwrap_or(req.lease)
+        } else {
+            req.lease
+        };
+
+        if lease != 0 && !self.leases.contains_key(&lease) {
+            return Err(Status::new(
+                tonic::Code::NotFound,
+                "etcdserver: requested lease not found",
+            ));
+        }
+
+        let prev = prev_alive;
+        let mut flags = 0u8;
+        if prev.is_none() {
+            flags |= wal::IS_CREATE;
+        }
+        if lease != 0 {
+            flags |= wal::HAS_LEASE;
+        }
+        let create_revision = prev.as_ref().map(|k| k.create_revision).unwrap_or(rev);
+        let version = prev.as_ref().map(|k| k.version + 1).unwrap_or(1);
+
+        let record = wal::KvWalRecord::new(
+            flags,
+            &key,
+            &value,
+            create_revision as i64,
+            rev as i64,
+            version,
+            lease,
+        );
+        if let Err(e) = self.wal.append_kv(&record) {
+            tracing::error!("WAL append failed: {e}");
+            return Err(Status::new(
+                tonic::Code::Internal,
+                "etcdserver: wal write failed",
+            ));
+        }
+
+        let prev = self.apply(key, value, lease, rev, None);
+
+        let header = Some(self.header());
+        let prev_kv = if req.prev_kv {
+            prev.as_ref()
+                .map(|p| p.kv_bytes.clone())
+                .unwrap_or_default()
+        } else {
+            Bytes::new()
+        };
+
+        Ok(etcdserverpb::PutResponse { header, prev_kv })
+    
+    }
+
+    /// Apply a delete range at `rev`, under the caller's write lock.
+    fn delete_range_at(
+        &mut self,
+        req: etcdserverpb::DeleteRangeRequest,
+        rev: u64,
+    ) -> Result<etcdserverpb::DeleteRangeResponse, Status> {
+        let bound = resolve_range(&req.key, &req.range_end);
+
+        let keys_to_delete: Vec<Vec<u8>> = match bound.to_ref() {
+            RangeBoundRef::Point(k) => self
+                .keys
+                .get(k)
+                .filter(|ks| ks.is_alive())
+                .map(|_| k.to_vec())
+                .into_iter()
+                .collect(),
+            RangeBoundRef::From(k) => {
+                let start = k.to_vec();
+                self
+                    .keys
+                    .range(start..)
+                    .filter(|(_, ks)| ks.is_alive())
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            }
+            RangeBoundRef::Prefix(p) => {
+                let start = p.to_vec();
+                self
+                    .keys
+                    .range(start..)
+                    .take_while(|(k, _)| k.starts_with(p))
+                    .filter(|(_, ks)| ks.is_alive())
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            }
+            RangeBoundRef::Range(start, end) => {
+                let start = start.to_vec();
+                let end = end.to_vec();
+                self
+                    .keys
+                    .range(start..end)
+                    .filter(|(_, ks)| ks.is_alive())
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            }
+            RangeBoundRef::All => self
+                .keys
+                .iter()
+                .filter(|(_, ks)| ks.is_alive())
+                .map(|(k, _)| k.clone())
+                .collect(),
+        };
+
+        // Build WAL records before mutating self.
+        let mut records: Vec<wal::KvWalRecord> = Vec::with_capacity(keys_to_delete.len());
+        let mut prevs: Vec<Option<KeyState>> = Vec::with_capacity(keys_to_delete.len());
+        for key in &keys_to_delete {
+            let prev = self.keys.get(key).filter(|k| k.is_alive()).cloned();
+            if let Some(p) = &prev {
+                let mut flags = wal::DELETED;
+                if p.lease != 0 {
+                    flags |= wal::HAS_LEASE;
+                }
+                records.push(wal::KvWalRecord::new(
+                    flags,
+                    key,
+                    &p.value,
+                    p.create_revision as i64,
+                    rev as i64,
+                    p.version,
+                    p.lease,
+                ));
+            }
+            prevs.push(prev);
+        }
+
+        if let Err(e) = self.wal.append_kv_batch(&records) {
+            tracing::error!("WAL batch append on delete_range failed: {e}");
+            return Err(Status::new(
+                tonic::Code::Internal,
+                "etcdserver: wal write failed",
+            ));
+        }
+
+        // Apply deletions to self only after WAL write succeeds.
+        let mut prev_kvs = Vec::new();
+        for (i, key) in keys_to_delete.iter().enumerate() {
+            self.apply_delete(key.clone(), rev);
+            if req.prev_kv {
+                if let Some(p) = &prevs[i] {
+                    prev_kvs.push(p.kv_bytes.clone());
+                }
+            }
+        }
+
+        Ok(etcdserverpb::DeleteRangeResponse {
+            header: Some(self.header()),
+            deleted: keys_to_delete.len() as i64,
+            prev_kvs,
+        })
+    
+    }
+}
+
 impl Store {
     /// Open or create the store from the given WAL path.
     /// Rebuilds in-memory state from the WAL on startup.
@@ -422,8 +767,19 @@ impl Store {
             return self.range_historical(req, target_rev).await;
         }
 
-        // Current state (revision == 0) — unchanged logic
+        // Current state (revision == 0)
         let state = self.state.read();
+        Self::range_current(&state, &req)
+    }
+
+/// Range over the current state. Takes `&StoreState` so it can run either under
+/// a read lock (normal path) or under the write lock held by a transaction —
+/// which is what makes in-txn reads see the transaction's own earlier writes,
+/// as etcd does.
+fn range_current(
+    state: &StoreState,
+    req: &etcdserverpb::RangeRequest,
+) -> Result<etcdserverpb::RangeResponse, Status> {
         let bound = resolve_range(&req.key, &req.range_end);
 
         // Point queries are exact-key lookups, so resolve them with a single
@@ -562,7 +918,7 @@ impl Store {
             more,
             count,
         })
-    }
+}
 
     /// Range query at a specific historical revision (target_rev >= COMPACT_REV).
     ///
@@ -892,96 +1248,10 @@ impl Store {
         &self,
         req: etcdserverpb::PutRequest,
     ) -> Result<etcdserverpb::PutResponse, Status> {
-        check_key(&req.key)?;
-        if req.ignore_value && !req.value.is_empty() {
-            return Err(Status::new(
-                tonic::Code::InvalidArgument,
-                "etcdserver: value is provided",
-            ));
-        }
-        if req.ignore_lease && req.lease != 0 {
-            return Err(Status::new(
-                tonic::Code::InvalidArgument,
-                "etcdserver: lease is provided",
-            ));
-        }
-
         let mut state = self.state.write();
-        let key = req.key;
-
-        // ignore_value/ignore_lease mean "reuse the stored value/lease", which
-        // is an error when there is nothing stored (etcd: key not found).
-        let prev_alive = state.keys.get(&key).filter(|k| k.is_alive()).cloned();
-        if (req.ignore_value || req.ignore_lease) && prev_alive.is_none() {
-            return Err(Status::new(
-                tonic::Code::InvalidArgument,
-                "etcdserver: key not found",
-            ));
-        }
-
-        let value = if req.ignore_value {
-            prev_alive
-                .as_ref()
-                .map(|k| k.value.to_vec())
-                .unwrap_or_default()
-        } else {
-            req.value
-        };
-        let lease = if req.ignore_lease {
-            prev_alive.as_ref().map(|k| k.lease).unwrap_or(req.lease)
-        } else {
-            req.lease
-        };
-
-        if lease != 0 && !state.leases.contains_key(&lease) {
-            return Err(Status::new(
-                tonic::Code::NotFound,
-                "etcdserver: requested lease not found",
-            ));
-        }
-
-        // Only validated requests consume a revision.
+        state.validate_put(&req)?;
         let rev = state.alloc_revision();
-        let prev = prev_alive;
-        let mut flags = 0u8;
-        if prev.is_none() {
-            flags |= wal::IS_CREATE;
-        }
-        if lease != 0 {
-            flags |= wal::HAS_LEASE;
-        }
-        let create_revision = prev.as_ref().map(|k| k.create_revision).unwrap_or(rev);
-        let version = prev.as_ref().map(|k| k.version + 1).unwrap_or(1);
-
-        let record = wal::KvWalRecord::new(
-            flags,
-            &key,
-            &value,
-            create_revision as i64,
-            rev as i64,
-            version,
-            lease,
-        );
-        if let Err(e) = state.wal.append_kv(&record) {
-            tracing::error!("WAL append failed: {e}");
-            return Err(Status::new(
-                tonic::Code::Internal,
-                "etcdserver: wal write failed",
-            ));
-        }
-
-        let prev = state.apply(key, value, lease, rev, None);
-
-        let header = Some(state.header());
-        let prev_kv = if req.prev_kv {
-            prev.as_ref()
-                .map(|p| p.kv_bytes.clone())
-                .unwrap_or_default()
-        } else {
-            Bytes::new()
-        };
-
-        Ok(etcdserverpb::PutResponse { header, prev_kv })
+        state.put_at(req, rev)
     }
 
     pub async fn delete_range(
@@ -991,162 +1261,98 @@ impl Store {
         check_key(&req.key)?;
         let mut state = self.state.write();
         let rev = state.alloc_revision();
-
-        let bound = resolve_range(&req.key, &req.range_end);
-
-        let keys_to_delete: Vec<Vec<u8>> = match bound.to_ref() {
-            RangeBoundRef::Point(k) => state
-                .keys
-                .get(k)
-                .filter(|ks| ks.is_alive())
-                .map(|_| k.to_vec())
-                .into_iter()
-                .collect(),
-            RangeBoundRef::From(k) => {
-                let start = k.to_vec();
-                state
-                    .keys
-                    .range(start..)
-                    .filter(|(_, ks)| ks.is_alive())
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            }
-            RangeBoundRef::Prefix(p) => {
-                let start = p.to_vec();
-                state
-                    .keys
-                    .range(start..)
-                    .take_while(|(k, _)| k.starts_with(p))
-                    .filter(|(_, ks)| ks.is_alive())
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            }
-            RangeBoundRef::Range(start, end) => {
-                let start = start.to_vec();
-                let end = end.to_vec();
-                state
-                    .keys
-                    .range(start..end)
-                    .filter(|(_, ks)| ks.is_alive())
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            }
-            RangeBoundRef::All => state
-                .keys
-                .iter()
-                .filter(|(_, ks)| ks.is_alive())
-                .map(|(k, _)| k.clone())
-                .collect(),
-        };
-
-        // Build WAL records before mutating state.
-        let mut records: Vec<wal::KvWalRecord> = Vec::with_capacity(keys_to_delete.len());
-        let mut prevs: Vec<Option<KeyState>> = Vec::with_capacity(keys_to_delete.len());
-        for key in &keys_to_delete {
-            let prev = state.keys.get(key).filter(|k| k.is_alive()).cloned();
-            if let Some(p) = &prev {
-                let mut flags = wal::DELETED;
-                if p.lease != 0 {
-                    flags |= wal::HAS_LEASE;
-                }
-                records.push(wal::KvWalRecord::new(
-                    flags,
-                    key,
-                    &p.value,
-                    p.create_revision as i64,
-                    rev as i64,
-                    p.version,
-                    p.lease,
-                ));
-            }
-            prevs.push(prev);
-        }
-
-        if let Err(e) = state.wal.append_kv_batch(&records) {
-            tracing::error!("WAL batch append on delete_range failed: {e}");
-            return Err(Status::new(
-                tonic::Code::Internal,
-                "etcdserver: wal write failed",
-            ));
-        }
-
-        // Apply deletions to state only after WAL write succeeds.
-        let mut prev_kvs = Vec::new();
-        for (i, key) in keys_to_delete.iter().enumerate() {
-            state.apply_delete(key.clone(), rev);
-            if req.prev_kv {
-                if let Some(p) = &prevs[i] {
-                    prev_kvs.push(p.kv_bytes.clone());
-                }
-            }
-        }
-
-        Ok(etcdserverpb::DeleteRangeResponse {
-            header: Some(state.header()),
-            deleted: keys_to_delete.len() as i64,
-            prev_kvs,
-        })
+        state.delete_range_at(req, rev)
     }
 
     pub async fn txn(
         &self,
         req: etcdserverpb::TxnRequest,
     ) -> Result<etcdserverpb::TxnResponse, Status> {
-        let success = {
-            let state = self.state.read();
-            req.compare.iter().all(|c| eval_compare(&state, c))
+        // etcd validates the whole request before applying anything: writes in a
+        // txn must touch disjoint keys ("duplicate key given in txn request").
+        check_txn_duplicate_keys(&req)?;
+
+        // One lock for the whole transaction, and one revision for all of its
+        // writes. Readers therefore see the txn either entirely or not at all:
+        // no intermediate revision exists. The lock lives in this block so it is
+        // released before the deferred (async) historical ranges run.
+        let (succeeded, header, mut responses, deferred) = {
+            let mut state = self.state.write();
+            let succeeded = req.compare.iter().all(|c| eval_compare(&state, c));
+            let ops = if succeeded { req.success } else { req.failure };
+
+            let mut rev: Option<u64> = None;
+            let mut deferred: Vec<(Vec<usize>, etcdserverpb::RangeRequest)> = Vec::new();
+            let responses = Self::apply_txn_ops(
+                &mut state,
+                ops,
+                &mut rev,
+                &mut Vec::new(),
+                &mut deferred,
+                0,
+            )?;
+            (succeeded, state.header(), responses, deferred)
         };
 
-        let ops = if success { req.success } else { req.failure };
-        self.execute_txn_ops(ops, success).await
-    }
-
-    async fn execute_txn_ops(
-        &self,
-        ops: Vec<etcdserverpb::RequestOp>,
-        succeeded: bool,
-    ) -> Result<etcdserverpb::TxnResponse, Status> {
-        self.execute_txn_ops_at(ops, succeeded, 0).await
-    }
-
-    /// `depth` bounds nesting the way etcd does: a txn may contain one nested
-    /// txn, not a chain of them.
-    async fn execute_txn_ops_at(
-        &self,
-        ops: Vec<etcdserverpb::RequestOp>,
-        succeeded: bool,
-        depth: u8,
-    ) -> Result<etcdserverpb::TxnResponse, Status> {
-        if ops.len() > 1 {
-            tracing::warn!(
-                op_count = ops.len(),
-                succeeded,
-                "txn_multi_op: partial execution possible on WAL write failure — txn is not atomic across multiple ops"
-            );
+        // Historical ranges need the WAL and take read locks, so they run after
+        // the write lock is released and are patched back into place. Their
+        // requested revision is <= the txn's, so the result is unaffected by the
+        // txn's own writes.
+        for (path, req) in deferred {
+            let resp = self.range(req).await?;
+            patch_deferred_range(&mut responses, &path, resp);
         }
+
+        Ok(etcdserverpb::TxnResponse {
+            header: Some(header),
+            succeeded,
+            responses,
+        })
+    }
+
+    /// Apply a txn's operations under the caller's write lock.
+    ///
+    /// `rev` is allocated lazily on the first write and shared by every write in
+    /// the transaction (including nested ones). `path` tracks the response
+    /// position so deferred historical ranges can be patched afterwards.
+    fn apply_txn_ops(
+        state: &mut StoreState,
+        ops: Vec<etcdserverpb::RequestOp>,
+        rev: &mut Option<u64>,
+        path: &mut Vec<usize>,
+        deferred: &mut Vec<(Vec<usize>, etcdserverpb::RangeRequest)>,
+        depth: u8,
+    ) -> Result<Vec<etcdserverpb::ResponseOp>, Status> {
         let mut responses = Vec::with_capacity(ops.len());
 
-        for op in ops {
-            match op.request {
+        for (i, op) in ops.into_iter().enumerate() {
+            path.push(i);
+            let response = match op.request {
                 Some(etcdserverpb::request_op::Request::RequestRange(r)) => {
-                    let resp = self.range(r).await?;
-                    responses.push(etcdserverpb::ResponseOp {
-                        response: Some(etcdserverpb::response_op::Response::ResponseRange(resp)),
-                    });
+                    if r.revision > 0 {
+                        deferred.push((path.clone(), r));
+                        None
+                    } else {
+                        // Reads see the transaction's own earlier writes: the
+                        // state is already mutated under this same lock.
+                        Some(etcdserverpb::response_op::Response::ResponseRange(
+                            Store::range_current(state, &r)?,
+                        ))
+                    }
                 }
                 Some(etcdserverpb::request_op::Request::RequestPut(p)) => {
-                    let resp = self.put(p).await?;
-                    responses.push(etcdserverpb::ResponseOp {
-                        response: Some(etcdserverpb::response_op::Response::ResponsePut(resp)),
-                    });
+                    state.validate_put(&p)?;
+                    let r = *rev.get_or_insert_with(|| state.alloc_revision());
+                    Some(etcdserverpb::response_op::Response::ResponsePut(
+                        state.put_at(p, r)?,
+                    ))
                 }
                 Some(etcdserverpb::request_op::Request::RequestDeleteRange(d)) => {
-                    let resp = self.delete_range(d).await?;
-                    responses.push(etcdserverpb::ResponseOp {
-                        response: Some(etcdserverpb::response_op::Response::ResponseDeleteRange(
-                            resp,
-                        )),
-                    });
+                    check_key(&d.key)?;
+                    let r = *rev.get_or_insert_with(|| state.alloc_revision());
+                    Some(etcdserverpb::response_op::Response::ResponseDeleteRange(
+                        state.delete_range_at(d, r)?,
+                    ))
                 }
                 Some(etcdserverpb::request_op::Request::RequestTxn(t)) => {
                     if depth >= 1 {
@@ -1155,37 +1361,34 @@ impl Store {
                             "etcdserver: nested txn is not allowed",
                         ));
                     }
-                    // A nested txn evaluates its own compares and runs its own
-                    // branch; the response is the real one, not a placeholder.
-                    let nested_succeeded = {
-                        let state = self.state.read();
-                        t.compare.iter().all(|c| eval_compare(&state, c))
-                    };
+                    let nested_succeeded =
+                        t.compare.iter().all(|c| eval_compare(state, c));
                     let nested_ops = if nested_succeeded { t.success } else { t.failure };
-                    let nested = Box::pin(self.execute_txn_ops_at(
+                    let nested = Self::apply_txn_ops(
+                        state,
                         nested_ops,
-                        nested_succeeded,
+                        rev,
+                        path,
+                        deferred,
                         depth + 1,
+                    )?;
+                    Some(etcdserverpb::response_op::Response::ResponseTxn(
+                        etcdserverpb::TxnResponse {
+                            header: Some(state.header()),
+                            succeeded: nested_succeeded,
+                            responses: nested,
+                        },
                     ))
-                    .await?;
-                    responses.push(etcdserverpb::ResponseOp {
-                        response: Some(etcdserverpb::response_op::Response::ResponseTxn(nested)),
-                    });
                 }
-                None => {}
-            }
+                None => None,
+            };
+            path.pop();
+            responses.push(etcdserverpb::ResponseOp { response });
         }
 
-        let header = {
-            let state = self.state.read();
-            state.header()
-        };
-        Ok(etcdserverpb::TxnResponse {
-            header: Some(header),
-            succeeded,
-            responses,
-        })
+        Ok(responses)
     }
+
 
     pub async fn compact(
         &self,

@@ -3141,3 +3141,154 @@ mod sort_bench {
         }
     }
 }
+
+#[cfg(test)]
+mod txn_atomicity_tests {
+    use super::*;
+    use crate::proto::etcdserverpb::{request_op::Request, RequestOp, TxnRequest};
+    use crate::proto::mvccpb;
+
+    fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "/tmp/rudurru_txn_atomic_test_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn put_op(key: &str, value: &str) -> RequestOp {
+        RequestOp {
+            request: Some(Request::RequestPut(etcdserverpb::PutRequest {
+                key: key.as_bytes().to_vec(),
+                value: value.as_bytes().to_vec(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn get_op(key: &str) -> RequestOp {
+        RequestOp {
+            request: Some(Request::RequestRange(etcdserverpb::RangeRequest {
+                key: key.as_bytes().to_vec(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn txn(ops: Vec<RequestOp>) -> TxnRequest {
+        TxnRequest {
+            compare: vec![],
+            success: ops,
+            failure: vec![],
+        }
+    }
+
+    /// Range count over `prefix` at a revision. The end bound is `prefix` with
+    /// its last byte incremented (etcd's prefix encoding).
+    async fn count_at(store: &Store, prefix: &str, rev: i64) -> i64 {
+        let mut end = prefix.as_bytes().to_vec();
+        *end.last_mut().unwrap() += 1;
+        store
+            .range(etcdserverpb::RangeRequest {
+                key: prefix.as_bytes().to_vec(),
+                range_end: end,
+                revision: rev,
+                ..Default::default()
+            })
+            .await
+            .map(|r| r.count)
+            .unwrap_or(-1)
+    }
+
+    /// All writes in a txn share one revision, so no intermediate revision shows
+    /// a partially applied transaction.
+    #[tokio::test]
+    async fn txn_writes_share_one_revision() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        // Seed one revision so "before" is a real, non-zero revision: revision 0
+        // in a RangeRequest means "current".
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"seed".to_vec(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let before = store.current_revision() as i64;
+        let resp = store
+            .txn(txn(vec![
+                put_op("txn/a", "1"),
+                put_op("txn/b", "2"),
+                put_op("txn/c", "3"),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.header.unwrap().revision, before + 1);
+        assert_eq!(store.current_revision() as i64, before + 1);
+
+        // nothing before, everything at the txn revision
+        assert_eq!(count_at(&store, "txn/", before).await, 0);
+        assert_eq!(count_at(&store, "txn/", before + 1).await, 3);
+        // and no revision exists between them
+        let err = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"txn/a".to_vec(),
+                revision: before + 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Reads inside a txn observe the txn's own earlier writes (etcd does this),
+    /// and writes on the same key are rejected before anything is applied.
+    #[tokio::test]
+    async fn txn_read_own_writes_and_reject_duplicate_keys() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"own".to_vec(),
+                value: b"pre".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resp = store
+            .txn(txn(vec![put_op("own", "mid"), get_op("own")]))
+            .await
+            .unwrap();
+        match &resp.responses[1].response {
+            Some(etcdserverpb::response_op::Response::ResponseRange(g)) => {
+                assert_eq!(g.kvs.len(), 1);
+                use prost::Message;
+                let kv = mvccpb::KeyValue::decode(&g.kvs[0][..]).unwrap();
+                assert_eq!(kv.value, b"mid");
+            }
+            other => panic!("expected a range response, got {other:?}"),
+        }
+
+        let err = store
+            .txn(txn(vec![put_op("dup", "1"), put_op("dup", "2")]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("duplicate key"), "{}", err.message());
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

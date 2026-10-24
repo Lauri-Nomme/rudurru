@@ -249,6 +249,32 @@ async fn conformance() {
         format!("inner_written={}", !c.get(ik.as_str(), None).await.unwrap().kvs().is_empty()),
     );
 
+    // reads inside a txn see the txn's own earlier writes
+    let own = uniq("txn-own");
+    c.put(own.as_str(), "pre", None).await.unwrap();
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(own.as_str(), "mid", None),
+        TxnOp::get(own.as_str(), None),
+    ]);
+    let r = c.txn(txn).await.unwrap();
+    let seen = match &r.op_responses()[1] {
+        TxnOpResponse::Get(g) => g
+            .kvs()
+            .first()
+            .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
+            .unwrap_or_default(),
+        _ => "<not a get>".to_string(),
+    };
+    emit("txn.read_own_writes", format!("value={seen}"));
+
+    // two writes on the same key are rejected
+    let dup = uniq("txn-dup");
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(dup.as_str(), "1", None),
+        TxnOp::put(dup.as_str(), "2", None),
+    ]);
+    emit("txn.duplicate_write_keys", code_msg(&c.txn(txn).await));
+
     // ── watch ─────────────────────────────────────────────────────────
     let wk = uniq("watch");
     let mut w = c
