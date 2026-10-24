@@ -31,6 +31,22 @@ fn make_header(revision: i64) -> etcdserverpb::ResponseHeader {
     }
 }
 
+/// Effective `start_revision` for a create request.
+///
+/// etcd documents "No start_revision is 'now'", and "now" has to be the moment
+/// the request is read: creates are batched for up to 50 ms before the replay
+/// runs, and a client typically issues its first write as soon as the stream is
+/// open (etcd clients do not wait for the `created` frame). Resolving this at
+/// flush time would place `start_revision` *after* those writes and silently
+/// drop them.
+fn resolve_start_revision(store: &Store, requested: u64) -> u64 {
+    if requested == 0 {
+        store.current_revision() + 1
+    } else {
+        requested
+    }
+}
+
 fn make_progress_response(rev: i64) -> etcdserverpb::WatchResponse {
     etcdserverpb::WatchResponse {
         header: Some(make_header(rev)),
@@ -145,6 +161,8 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                     next_watch_id()
                                 };
                                 let progress_notify = create.progress_notify;
+                                let start_revision =
+                                    resolve_start_revision(&store, create.start_revision as u64);
 
                                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
                                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -154,7 +172,7 @@ impl etcdserverpb::watch_server::Watch for Watch {
                                         pending: PendingCreate {
                                             key: create.key,
                                             range_end: create.range_end,
-                                            start_revision: create.start_revision as u64,
+                                            start_revision,
                                             progress_notify: create.progress_notify,
                                             filters: create.filters.to_vec(),
                                             prev_kv: create.prev_kv,
@@ -404,21 +422,10 @@ async fn flush_global_batch_at(
         }
 
         let bound = storage::resolve_range(&c.pending.key, &c.pending.range_end);
-        // etcd semantics: "No start_revision is 'now'". A create request with
-        // start_revision = 0 must only receive events from the current revision
-        // onwards, not a replay of everything already stored under the key.
-        // Without this, every watch created without an explicit revision is
-        // handed the key's entire history (replayed from the WAL) before it
-        // starts seeing live events.
-        let start_revision = if c.pending.start_revision == 0 {
-            store.current_revision() + 1
-        } else {
-            c.pending.start_revision
-        };
         active.push(WatchContext {
             key: c.pending.key,
             range_end: c.pending.range_end,
-            start_revision,
+            start_revision: c.pending.start_revision,
             watch_id: c.watch_id,
             progress_notify: c.pending.progress_notify,
             filters: c.pending.filters,
@@ -739,6 +746,7 @@ mod tests {
             .await
             .unwrap();
 
+        let start_revision = resolve_start_revision(&store, 0);
         let (checkpoint_rev, checkpoint_offset) = current_checkpoint(&store);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (reply_tx, _reply_rx) = oneshot::channel();
@@ -747,7 +755,7 @@ mod tests {
             pending: PendingCreate {
                 key: b"foo".to_vec(),
                 range_end: vec![],
-                start_revision: 0, // "now"
+                start_revision,
                 progress_notify: false,
                 filters: vec![],
                 prev_kv: false,
@@ -802,5 +810,74 @@ mod tests {
         assert_eq!(resp.compact_revision, 0);
         assert!(resp.events.is_empty(), "progress notification carries no events");
         assert!(!resp.fragment);
+    }
+
+    /// "Now" must be resolved when the create request is read, not when the
+    /// batch is flushed. etcd clients do not wait for the `created` frame, so a
+    /// write issued right after `watch()` lands inside the ~50 ms batching
+    /// window; resolving the revision at flush time would put `start_revision`
+    /// after that write and drop it.
+    #[tokio::test]
+    async fn test_watch_start_revision_pinned_at_request_keeps_batched_writes() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).await.unwrap());
+
+        // history that predates the request
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"foo".to_vec(),
+                value: b"old".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // request arrives: "now" is pinned here
+        let start_revision = resolve_start_revision(&store, 0);
+
+        // the client writes immediately, before the batch is flushed
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"foo".to_vec(),
+                value: b"new".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (checkpoint_rev, checkpoint_offset) = current_checkpoint(&store);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let mut batch = vec![GlobalCreate {
+            pending: PendingCreate {
+                key: b"foo".to_vec(),
+                range_end: vec![],
+                start_revision,
+                progress_notify: false,
+                filters: vec![],
+                prev_kv: false,
+            },
+            event_tx,
+            reply: reply_tx,
+            stream_id: 1,
+            remote_addr: "test".into(),
+            watch_id: 78,
+        }];
+
+        flush_global_batch_at(&mut batch, &store, checkpoint_rev, checkpoint_offset).await;
+
+        let mut values = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            values.push(decode_val(&event.kv_bytes));
+        }
+        assert_eq!(
+            values,
+            vec![b"new".to_vec()],
+            "the write issued inside the batching window must be delivered, and \
+             the pre-request history must not"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
