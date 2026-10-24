@@ -267,6 +267,27 @@ async fn conformance() {
     };
     emit("txn.read_own_writes", format!("value={seen}"));
 
+    // a read *between* two writes sees only the writes before it: etcd reads at
+    // the txn revision, and the backend only contains the writes made so far
+    let between = uniq("txn-between");
+    let later = uniq("txn-between-later");
+    c.put(later.as_str(), "old", None).await.unwrap();
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(between.as_str(), "A", None),
+        TxnOp::get(later.as_str(), None),
+        TxnOp::put(later.as_str(), "B", None),
+    ]);
+    let r = c.txn(txn).await.unwrap();
+    let seen = match &r.op_responses()[1] {
+        TxnOpResponse::Get(g) => g
+            .kvs()
+            .first()
+            .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
+            .unwrap_or_else(|| "<absent>".to_string()),
+        _ => "<not a get>".to_string(),
+    };
+    emit("txn.read_between_writes", format!("value={seen}"));
+
     // two writes on the same key are rejected
     let dup = uniq("txn-dup");
     let txn = Txn::new().and_then(vec![
