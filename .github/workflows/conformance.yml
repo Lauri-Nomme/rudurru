@@ -1,0 +1,57 @@
+name: Conformance
+
+# Differential test against a reference etcd: the same operations are issued to
+# both servers and the results diffed per check. Deviations that are not in
+# tests/conformance/known-deviations.txt fail the build; so does a baseline entry
+# that no longer deviates (the allowlist must not rot).
+#
+# See prd/etcd-conformance-audit.md.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  ETCD_VERSION: v3.5.30
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain & protoc
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-conformance-cargo-${{ hashFiles('Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-conformance-cargo-
+
+      # The script downloads etcd into target/conformance if it is not there.
+      - name: Differential conformance
+        run: ./scripts/conformance.sh
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance
+          path: |
+            target/conformance/etcd.txt
+            target/conformance/rudurru.txt
+            target/conformance/deviations.txt
+          if-no-files-found: ignore
