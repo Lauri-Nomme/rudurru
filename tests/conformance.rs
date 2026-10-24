@@ -249,6 +249,93 @@ async fn conformance() {
         format!("inner_written={}", !c.get(ik.as_str(), None).await.unwrap().kvs().is_empty()),
     );
 
+    // reads inside a txn see the txn's own earlier writes
+    let own = uniq("txn-own");
+    c.put(own.as_str(), "pre", None).await.unwrap();
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(own.as_str(), "mid", None),
+        TxnOp::get(own.as_str(), None),
+    ]);
+    let r = c.txn(txn).await.unwrap();
+    let seen = match &r.op_responses()[1] {
+        TxnOpResponse::Get(g) => g
+            .kvs()
+            .first()
+            .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
+            .unwrap_or_default(),
+        _ => "<not a get>".to_string(),
+    };
+    emit("txn.read_own_writes", format!("value={seen}"));
+
+    // a read *between* two writes sees only the writes before it: etcd reads at
+    // the txn revision, and the backend only contains the writes made so far
+    let between = uniq("txn-between");
+    let later = uniq("txn-between-later");
+    c.put(later.as_str(), "old", None).await.unwrap();
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(between.as_str(), "A", None),
+        TxnOp::get(later.as_str(), None),
+        TxnOp::put(later.as_str(), "B", None),
+    ]);
+    let r = c.txn(txn).await.unwrap();
+    let seen = match &r.op_responses()[1] {
+        TxnOpResponse::Get(g) => g
+            .kvs()
+            .first()
+            .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
+            .unwrap_or_else(|| "<absent>".to_string()),
+        _ => "<not a get>".to_string(),
+    };
+    emit("txn.read_between_writes", format!("value={seen}"));
+
+    // ...and a read of a key written *before* it sees that write, even though a
+    // later write follows it
+    let own2 = uniq("txn-between-own");
+    let after2 = uniq("txn-between-after");
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(own2.as_str(), "A", None),
+        TxnOp::get(own2.as_str(), None),
+        TxnOp::put(after2.as_str(), "B", None),
+    ]);
+    let r = c.txn(txn).await.unwrap();
+    let seen = match &r.op_responses()[1] {
+        TxnOpResponse::Get(g) => g
+            .kvs()
+            .first()
+            .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
+            .unwrap_or_else(|| "<absent>".to_string()),
+        _ => "<not a get>".to_string(),
+    };
+    emit("txn.read_own_write_between_writes", format!("value={seen}"));
+
+    // two writes on the same key are rejected
+    let dup = uniq("txn-dup");
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(dup.as_str(), "1", None),
+        TxnOp::put(dup.as_str(), "2", None),
+    ]);
+    emit("txn.duplicate_write_keys", code_msg(&c.txn(txn).await));
+
+    // A dynamic validation error in the middle of a txn (second op reuses a
+    // value from a key that does not exist): etcd rolls the whole txn back, so
+    // the first write must not survive.
+    let partial = uniq("txn-dyn-partial");
+    let absent = uniq("txn-dyn-absent");
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(partial.as_str(), "written", None),
+        TxnOp::put(
+            absent.as_str(),
+            "",
+            Some(PutOptions::new().with_ignore_value()),
+        ),
+    ]);
+    let r = c.txn(txn).await;
+    let survived = !c.get(partial.as_str(), None).await.unwrap().kvs().is_empty();
+    emit(
+        "txn.dynamic_error_atomicity",
+        format!("{} first_write_survived={survived}", code_msg(&r)),
+    );
+
     // ── watch ─────────────────────────────────────────────────────────
     let wk = uniq("watch");
     let mut w = c
