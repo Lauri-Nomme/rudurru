@@ -888,6 +888,17 @@ impl Store {
         ops: Vec<etcdserverpb::RequestOp>,
         succeeded: bool,
     ) -> Result<etcdserverpb::TxnResponse, Status> {
+        self.execute_txn_ops_at(ops, succeeded, 0).await
+    }
+
+    /// `depth` bounds nesting the way etcd does: a txn may contain one nested
+    /// txn, not a chain of them.
+    async fn execute_txn_ops_at(
+        &self,
+        ops: Vec<etcdserverpb::RequestOp>,
+        succeeded: bool,
+        depth: u8,
+    ) -> Result<etcdserverpb::TxnResponse, Status> {
         if ops.len() > 1 {
             tracing::warn!(
                 op_count = ops.len(),
@@ -919,15 +930,28 @@ impl Store {
                         )),
                     });
                 }
-                Some(etcdserverpb::request_op::Request::RequestTxn(_)) => {
+                Some(etcdserverpb::request_op::Request::RequestTxn(t)) => {
+                    if depth >= 1 {
+                        return Err(Status::new(
+                            tonic::Code::InvalidArgument,
+                            "etcdserver: nested txn is not allowed",
+                        ));
+                    }
+                    // A nested txn evaluates its own compares and runs its own
+                    // branch; the response is the real one, not a placeholder.
+                    let nested_succeeded = {
+                        let state = self.state.read();
+                        t.compare.iter().all(|c| eval_compare(&state, c))
+                    };
+                    let nested_ops = if nested_succeeded { t.success } else { t.failure };
+                    let nested = Box::pin(self.execute_txn_ops_at(
+                        nested_ops,
+                        nested_succeeded,
+                        depth + 1,
+                    ))
+                    .await?;
                     responses.push(etcdserverpb::ResponseOp {
-                        response: Some(etcdserverpb::response_op::Response::ResponseTxn(
-                            etcdserverpb::TxnResponse {
-                                header: None,
-                                succeeded: true,
-                                responses: vec![],
-                            },
-                        )),
+                        response: Some(etcdserverpb::response_op::Response::ResponseTxn(nested)),
                     });
                 }
                 None => {}

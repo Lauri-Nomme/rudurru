@@ -2648,3 +2648,97 @@ mod lease_id_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod txn_nested_tests {
+    use super::*;
+    use crate::proto::etcdserverpb;
+    use crate::proto::etcdserverpb::{request_op::Request, response_op::Response, RequestOp, TxnRequest};
+
+    fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "/tmp/rudurru_txn_nested_test_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn put_op(key: &str) -> RequestOp {
+        RequestOp {
+            request: Some(Request::RequestPut(etcdserverpb::PutRequest {
+                key: key.as_bytes().to_vec(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn txn(ops: Vec<RequestOp>) -> TxnRequest {
+        TxnRequest {
+            compare: vec![],
+            success: ops,
+            failure: vec![],
+        }
+    }
+
+    async fn get(store: &Store, key: &str) -> usize {
+        store
+            .range(etcdserverpb::RangeRequest {
+                key: key.as_bytes().to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .count as usize
+    }
+
+    /// etcd executes a nested txn and returns its real response. rudurru used
+    /// to push a fabricated `succeeded: true` with no responses.
+    #[tokio::test]
+    async fn nested_txn_executes_its_ops() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        let resp = store
+            .txn(txn(vec![
+                put_op("n/outer"),
+                RequestOp {
+                    request: Some(Request::RequestTxn(txn(vec![put_op("n/inner")]))),
+                },
+            ]))
+            .await
+            .unwrap();
+
+        assert!(resp.succeeded);
+        assert_eq!(resp.responses.len(), 2);
+        match &resp.responses[1].response {
+            Some(Response::ResponseTxn(nested)) => {
+                assert!(nested.succeeded);
+                assert_eq!(nested.responses.len(), 1, "nested response must carry its own op");
+                assert!(matches!(
+                    nested.responses[0].response,
+                    Some(Response::ResponsePut(_))
+                ));
+            }
+            other => panic!("expected a nested txn response, got {other:?}"),
+        }
+
+        assert_eq!(get(&store, "n/outer").await, 1);
+        assert_eq!(get(&store, "n/inner").await, 1, "inner op must have run");
+
+        // one level of nesting only
+        let deep = RequestOp {
+            request: Some(Request::RequestTxn(txn(vec![RequestOp {
+                request: Some(Request::RequestTxn(txn(vec![put_op("n/deep")]))),
+            }]))),
+        };
+        let err = store.txn(txn(vec![deep])).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(get(&store, "n/deep").await, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

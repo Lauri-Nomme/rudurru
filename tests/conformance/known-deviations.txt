@@ -6,5 +6,4 @@ range.compacted
 range.future_rev
 range.sort_desc_value
 txn.atomic_mid_revision
-txn.nested
 txn.revisions_for_3_writes
