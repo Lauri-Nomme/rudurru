@@ -241,9 +241,15 @@ pointer to this section), so the gap is visible in every CI run and disappears
 from the ledger the day error rollback is implemented — the same mechanism that
 keeps the rest of the audit honest.
 
-### 3.11 Alternative considered: defer *every* read (rejected)
+### 3.10 Response assembly
 
-**The proposal.** Use one path for all in-transaction reads: defer them past the
+The txn's `header` is taken from the state *after* applying, so it equals the txn
+revision (or the current revision for a read-only txn). Nested responses get
+their own header at the same revision.
+
+### 3.11 Alternative A: defer every read, pinned to the transaction revision (rejected)
+
+**The proposal.** One path for all in-transaction reads: defer them past the
 unlock like historical ones, pinning a non-historical read to the transaction's
 own revision (or to the pre-transaction revision when no write has happened
 yet). Claimed benefits: one read path instead of two, and no read work inside
@@ -256,6 +262,7 @@ the transaction*:
 |---|---|---|
 | `get(k)`, then `put(k)` | pre-txn value | pre-txn value (pin to the pre-txn revision) ✅ |
 | `put(k)`, then `get(k)` | new value | new value (pin to the txn revision) ✅ |
+| `put(a)`, `get(a)`, `put(b)` | **`A`** | `A` ✅ (the two shapes agree) |
 | `put(a)`, `get(b)`, `put(b)` | **old `b`** | **new `b`** ❌ |
 
 Measured against etcd v3.5.30: `get(b)` between `put(a)` and `put(b)` returns
@@ -269,40 +276,89 @@ sees every one of them, including later ones. Being exact requires either
 sub-revisions or reading at the operation's position inside the critical
 section — which is the current design.
 
-**What the performance claim is worth.** The cost of an inline read is exactly
-its occupancy of the write lock. Measured in release with 50 000 keys:
+Both shapes above are now conformance checks (`txn.read_own_write_between_writes`
+and `txn.read_between_writes`), so the distinction cannot be lost later.
+
+### 3.12 Alternative B: defer, with a historical overlay for keys written later
+
+**The proposal.** Defer non-historical reads too, but instead of pinning the
+whole read to one revision, dispatch it as *"current state, except for the key
+ranges written after this read, which must be served at the previous revision"*:
+
+```
+historical_read(at_previous_rev = pre_txn_rev, keys = later)
+```
+
+where `later` is the set of key ranges touched by write operations that follow
+the read in the transaction. Everything outside `later` is served at the current
+revision from memory — no WAL — and only `later` pays a historical
+reconstruction.
+
+**It is correct, and the argument is worth stating.** Writes inside a
+transaction are disjoint (§3.8), so a key touched by a write *after* the read
+could not have been written *before* it. Therefore, for those keys, "the value
+just before the read" and "the value at the pre-transaction revision" are the
+same thing. So:
+
+```
+state_at_read_i  =  state_at_txn_rev  with `later` ranges replaced by state_at(pre_txn_rev)
+```
+
+That is exact — unlike Alternative A, which is wrong by construction.
+
+**Why it was still rejected.**
+
+| aspect | cost |
+|---|---|
+| range algebra | the request bound has to be intersected with and subtracted from each `later` bound, across `All` / `Point` / `Prefix` / `From` / `Range` |
+| merging | two sorted result sets, deduplicated, with creations and deletions inside `later` handled in both directions (a key deleted after the read must reappear with its old value; a key created after it must not appear) |
+| response pipeline | `count_only`, `limit`/`more`, `keys_only`, `min/max_mod_revision`, `min/max_create_revision` and sorting all have to be re-applied to the merged view |
+| revision stability | "current state" must mean the *txn's* revision. Once the write lock is released another transaction can land, so the base read has to verify `current_revision() == txn_rev` and otherwise fall back to a historical read at `txn_rev` — i.e. potentially a WAL scan where today there is none |
+| size | roughly 200 lines plus a new merge invariant to test, versus the ~150-line `range_current` it would replace |
+
+And the payoff: when `later` is empty — which is **every transaction
+kube-apiserver issues**, since they contain a single write — Alternative B
+degenerates to "read the current state after the txn", which is exactly what the
+inline `range_current` already does, minus the lock occupancy measured below.
+
+### 3.13 What is worth doing if large in-txn reads ever matter
+
+There is one version that is both exact and simple: **defer reads that the
+transaction follows with no further write, and pin them to the transaction's
+revision.**
+
+For such a read every write in the transaction precedes it, so its view *is* the
+transaction's final state. That is the whole argument: no pre-transaction
+revision, and no per-read "before writes / after writes" distinction is needed.
+The pin is one value for the entire transaction, resolved once when the deferred
+reads execute.
+
+Two boundary cases:
+
+- **A transaction with no writes has no transaction revision.** Its reads would
+  have to be pinned to the pre-transaction revision, i.e. served through the
+  historical path: measured at **230 ns** for a point read versus **83 ns** for
+  the inline current read (release, 50 000 keys). That is more CPU than the
+  83 ns of lock occupancy it saves, so read-only transactions keep their reads
+  inline.
+- **A read followed by a write** still needs the inline path; hiding the later
+  write is exactly what Alternative B exists for.
+
+So the rule is `has_write && !has_write_after(i)` → defer at `txn_rev`;
+otherwise inline. It needs one backwards pass over the op list to classify each
+read and about ten lines in the deferral, keeps `range_current`, and is the
+change to make if read work inside transactions ever becomes visible.
+
+**Why not now:** the cost of an inline read is its occupancy of the write lock,
+and for the shapes that actually occur it is nothing:
 
 | read shape | time |
 |---|---|
-| point `get` (the only shape kube-apiserver issues in a txn) | **84 ns** |
+| point `get` (the only shape kube-apiserver issues in a txn) | **83 ns** |
 | prefix scan over all 50 000 keys | 2.18 ms |
 
-So the change would recover ~84 ns per read for the target workload, and 2.18 ms
-only for a range that no Kubernetes transaction issues.
-
-**And it would not be simpler.** Making the deferral *correct* needs the
-pre-txn/txn revision distinction, and reads that precede a later write still
-require the inline path — two paths, plus a pre-scan to classify each read. The
-version that is genuinely one path is the version that is wrong in the table's
-third row.
-
-**Decision.** Keep the inline reads and the historical deferral. If read work
-inside transactions ever becomes significant (large ranges in txns — not
-something the control plane does), the exact optimisation is: defer reads with
-no later write in the same transaction (pinning to the pre-txn revision when
-nothing precedes them, the txn revision otherwise) and keep the inline path only
-for reads with writes on both sides.
-
-`txn.read_between_writes` is now a conformance check, so this property is pinned
-regardless of which design wins later.
-
-### 3.10 Response assembly
-
-The txn's `header` is taken from the state *after* applying, so it equals the
-txn revision (or the current revision for a read-only txn). Nested responses get
-their own header at the same revision.
-
----
+A deferral recovers 83 ns per read for the target workload, and 2.18 ms only for
+a range no Kubernetes transaction issues.
 
 ## 4. Performance
 
@@ -337,10 +393,11 @@ duration, which the design bounds by deferring the only unbounded work.
   the historical value, not the txn's.
 - `txn.revisions_for_3_writes` / `txn.atomic_mid_revision` in the differential
   harness went from deviations to matches.
-- `txn.read_own_writes`, `txn.duplicate_write_keys`, `txn.read_between_writes`
-  and `txn.dynamic_error_atomicity` were added as permanent checks (the last one
-  pins the §3.9 limitation, the third pins the property that rules out §3.11).
-- The ledger is **2 entries**: `auth.enable` (accepted) and
+- `txn.read_own_writes`, `txn.duplicate_write_keys`,
+  `txn.read_own_write_between_writes` and `txn.read_between_writes` were added as
+  permanent checks — the last two are the pair that separates §3.11 from
+  §3.12. `txn.dynamic_error_atomicity` pins the §3.9 limitation.
+- The suite is **47 checks**. The ledger is **2 entries**: `auth.enable` (accepted) and
   `txn.dynamic_error_atomicity` (the documented limitation above). Before this
   PR it was 3, two of which were the torn-transaction checks.
 - `tests/txn_test.rs::test_txn_nested` previously asserted the *stub* behaviour

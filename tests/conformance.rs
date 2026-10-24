@@ -288,6 +288,26 @@ async fn conformance() {
     };
     emit("txn.read_between_writes", format!("value={seen}"));
 
+    // ...and a read of a key written *before* it sees that write, even though a
+    // later write follows it
+    let own2 = uniq("txn-between-own");
+    let after2 = uniq("txn-between-after");
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(own2.as_str(), "A", None),
+        TxnOp::get(own2.as_str(), None),
+        TxnOp::put(after2.as_str(), "B", None),
+    ]);
+    let r = c.txn(txn).await.unwrap();
+    let seen = match &r.op_responses()[1] {
+        TxnOpResponse::Get(g) => g
+            .kvs()
+            .first()
+            .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
+            .unwrap_or_else(|| "<absent>".to_string()),
+        _ => "<not a get>".to_string(),
+    };
+    emit("txn.read_own_write_between_writes", format!("value={seen}"));
+
     // two writes on the same key are rejected
     let dup = uniq("txn-dup");
     let txn = Txn::new().and_then(vec![
