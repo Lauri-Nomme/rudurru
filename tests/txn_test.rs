@@ -115,10 +115,10 @@ async fn test_txn_nested() {
     let resp = client.txn(outer).await.unwrap();
     assert!(resp.succeeded(), "outer txn should succeed");
 
-    // Rudurru's nested-txn handler is a stub: it returns succeeded: true but
-    // does NOT execute inner operations. See `unsupported_features_tests`.
+    // A nested txn executes its operations, as in etcd.
     let get2 = client.get(k2.as_str(), None).await.unwrap();
-    assert_eq!(get2.count(), 0, "inner txn ops are not executed (stub behavior)");
+    assert_eq!(get2.count(), 1, "inner txn ops must be executed");
+    assert_eq!(get2.kvs()[0].value(), b"nested_ok");
 }
 
 #[tokio::test]
