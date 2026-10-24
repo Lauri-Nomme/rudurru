@@ -2833,3 +2833,100 @@ mod revision_error_tests {
     }
 }
 
+#[cfg(test)]
+mod range_sort_tests {
+    use super::*;
+    use crate::proto::etcdserverpb;
+    use crate::proto::mvccpb;
+    use crate::proto::etcdserverpb::range_request::{SortOrder, SortTarget};
+
+    fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "/tmp/rudurru_range_sort_test_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn values(resp: &etcdserverpb::RangeResponse) -> Vec<String> {
+        use prost::Message;
+        resp.kvs
+            .iter()
+            .map(|b| {
+                mvccpb::KeyValue::decode(&b[..])
+                    .map(|kv| String::from_utf8_lossy(&kv.value).to_string())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn keys(resp: &etcdserverpb::RangeResponse) -> Vec<String> {
+        use prost::Message;
+        resp.kvs
+            .iter()
+            .map(|b| {
+                mvccpb::KeyValue::decode(&b[..])
+                    .map(|kv| String::from_utf8_lossy(&kv.key).to_string())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// etcd sorts range results by `sort_target`/`sort_order` before applying
+    /// `limit`. rudurru used to ignore both fields.
+    #[tokio::test]
+    async fn range_honours_sort_order_and_target() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        for (k, v) in [("a", "3"), ("b", "1"), ("c", "2")] {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: format!("sort/{k}").into_bytes(),
+                    value: v.as_bytes().to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let range = |order: SortOrder, target: SortTarget| {
+            let s = &store;
+            async move {
+                s.range(etcdserverpb::RangeRequest {
+                    key: b"sort/".to_vec(),
+                    range_end: b"sort0".to_vec(),
+                    sort_order: order as i32,
+                    sort_target: target as i32,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            }
+        };
+
+        assert_eq!(
+            values(&range(SortOrder::Descend, SortTarget::Value).await),
+            ["3", "2", "1"]
+        );
+        assert_eq!(
+            values(&range(SortOrder::Ascend, SortTarget::Value).await),
+            ["1", "2", "3"]
+        );
+        assert_eq!(
+            keys(&range(SortOrder::Descend, SortTarget::Key).await),
+            ["sort/c", "sort/b", "sort/a"]
+        );
+        // unsorted keeps key order
+        assert_eq!(
+            keys(&range(SortOrder::None, SortTarget::Key).await),
+            ["sort/a", "sort/b", "sort/c"]
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+

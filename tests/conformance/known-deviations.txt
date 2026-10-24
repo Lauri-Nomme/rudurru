@@ -2,6 +2,5 @@
 #   ./scripts/conformance.sh --update-baseline
 # Each entry is a CHECK name; see prd/etcd-conformance-audit.md.
 auth.enable
-range.sort_desc_value
 txn.atomic_mid_revision
 txn.revisions_for_3_writes

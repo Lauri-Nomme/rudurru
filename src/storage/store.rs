@@ -14,6 +14,53 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::Status;
 
+/// Sort a range result in place the way etcd does (`sort_order` over
+/// `sort_target`), with the key as a deterministic tiebreak.
+///
+/// `kvs` holds encoded `mvccpb.KeyValue` blobs, so the sort target is read by
+/// decoding them; the blobs themselves are moved, never re-encoded.
+fn sort_kvs(kvs: &mut Vec<Bytes>, order: i32, target: i32) {
+    use crate::proto::mvccpb;
+    use crate::proto::etcdserverpb::range_request::{SortOrder, SortTarget};
+    use prost::Message;
+
+    if order != SortOrder::Ascend as i32 && order != SortOrder::Descend as i32 {
+        return;
+    }
+
+    let decoded: Vec<mvccpb::KeyValue> = kvs
+        .iter()
+        .map(|b| mvccpb::KeyValue::decode(&b[..]).unwrap_or_default())
+        .collect();
+
+    let mut idx: Vec<usize> = (0..kvs.len()).collect();
+    idx.sort_by(|&a, &b| {
+        let (ka, kb) = (&decoded[a], &decoded[b]);
+        let ord = match target {
+            t if t == SortTarget::Version as i32 => ka.version.cmp(&kb.version),
+            t if t == SortTarget::Create as i32 => {
+                ka.create_revision.cmp(&kb.create_revision)
+            }
+            t if t == SortTarget::Mod as i32 => ka.mod_revision.cmp(&kb.mod_revision),
+            t if t == SortTarget::Value as i32 => ka.value.cmp(&kb.value),
+            _ => ka.key.cmp(&kb.key),
+        }
+        .then_with(|| ka.key.cmp(&kb.key));
+
+        if order == SortOrder::Descend as i32 {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+
+    let mut out = Vec::with_capacity(kvs.len());
+    for i in idx {
+        out.push(std::mem::take(&mut kvs[i]));
+    }
+    *kvs = out;
+}
+
 /// etcd's lease TTL bounds.
 ///
 /// `lessor.MaxLeaseTTL = math.MaxInt64 / int64(time.Second) - 1` and
@@ -327,6 +374,8 @@ impl Store {
             });
         }
 
+        sort_kvs(&mut kvs, req.sort_order, req.sort_target);
+
         let more = if req.limit > 0 && kvs.len() > req.limit as usize {
             kvs.truncate(req.limit as usize);
             true
@@ -507,8 +556,11 @@ impl Store {
                         count,
                     });
                 }
+                let mut kvs: Vec<Bytes> =
+                    phase1_direct.into_iter().map(|(_, b)| b).collect();
+                sort_kvs(&mut kvs, req.sort_order, req.sort_target);
                 let more = if req.limit > 0 && count > req.limit as i64 {
-                    phase1_direct.truncate(req.limit as usize);
+                    kvs.truncate(req.limit as usize);
                     true
                 } else {
                     false
@@ -520,7 +572,7 @@ impl Store {
                         revision: target_rev as i64,
                         raft_term: 1,
                     }),
-                    kvs: phase1_direct.into_iter().map(|(_, b)| b).collect(),
+                    kvs,
                     more,
                     count,
                 });
@@ -647,7 +699,9 @@ impl Store {
             });
         }
 
-        let kvs: Vec<Bytes> = merged.into_values().take(limit).collect();
+        let mut kvs: Vec<Bytes> = merged.into_values().collect();
+        sort_kvs(&mut kvs, req.sort_order, req.sort_target);
+        kvs.truncate(limit);
         let more = req.limit > 0 && count > req.limit as i64;
 
         Ok(etcdserverpb::RangeResponse {
