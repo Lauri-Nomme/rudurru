@@ -25,6 +25,18 @@ use tonic::Status;
 const LEASE_MAX_TTL: i64 = i64::MAX / 1_000_000_000 - 1;
 const LEASE_MIN_TTL: i64 = 2;
 
+/// etcd rejects a zero-length key on every KV RPC with this exact status.
+/// ("all keys" is spelled `key = "\0"`, not `key = ""`.)
+fn check_key(key: &[u8]) -> Result<(), Status> {
+    if key.is_empty() {
+        return Err(Status::new(
+            tonic::Code::InvalidArgument,
+            "etcdserver: key is not provided",
+        ));
+    }
+    Ok(())
+}
+
 fn check_lease_ttl(ttl: i64) -> Result<i64, Status> {
     if ttl > LEASE_MAX_TTL {
         return Err(Status::new(
@@ -158,6 +170,7 @@ impl Store {
         &self,
         req: etcdserverpb::RangeRequest,
     ) -> Result<etcdserverpb::RangeResponse, Status> {
+        check_key(&req.key)?;
         let mut target_rev = if req.revision > 0 {
             req.revision as u64
         } else {
@@ -661,20 +674,43 @@ impl Store {
         &self,
         req: etcdserverpb::PutRequest,
     ) -> Result<etcdserverpb::PutResponse, Status> {
+        check_key(&req.key)?;
+        if req.ignore_value && !req.value.is_empty() {
+            return Err(Status::new(
+                tonic::Code::InvalidArgument,
+                "etcdserver: value is provided",
+            ));
+        }
+        if req.ignore_lease && req.lease != 0 {
+            return Err(Status::new(
+                tonic::Code::InvalidArgument,
+                "etcdserver: lease is provided",
+            ));
+        }
+
         let mut state = self.state.write();
-        let rev = state.alloc_revision();
         let key = req.key;
 
-        let prev_entry = state.keys.get(&key);
+        // ignore_value/ignore_lease mean "reuse the stored value/lease", which
+        // is an error when there is nothing stored (etcd: key not found).
+        let prev_alive = state.keys.get(&key).filter(|k| k.is_alive()).cloned();
+        if (req.ignore_value || req.ignore_lease) && prev_alive.is_none() {
+            return Err(Status::new(
+                tonic::Code::InvalidArgument,
+                "etcdserver: key not found",
+            ));
+        }
+
         let value = if req.ignore_value {
-            prev_entry
+            prev_alive
+                .as_ref()
                 .map(|k| k.value.to_vec())
                 .unwrap_or_default()
         } else {
             req.value
         };
         let lease = if req.ignore_lease {
-            prev_entry.map(|k| k.lease).unwrap_or(req.lease)
+            prev_alive.as_ref().map(|k| k.lease).unwrap_or(req.lease)
         } else {
             req.lease
         };
@@ -682,11 +718,13 @@ impl Store {
         if lease != 0 && !state.leases.contains_key(&lease) {
             return Err(Status::new(
                 tonic::Code::NotFound,
-                "etcdserver: lease not found",
+                "etcdserver: requested lease not found",
             ));
         }
 
-        let prev = prev_entry.filter(|k| k.is_alive()).cloned();
+        // Only validated requests consume a revision.
+        let rev = state.alloc_revision();
+        let prev = prev_alive;
         let mut flags = 0u8;
         if prev.is_none() {
             flags |= wal::IS_CREATE;
@@ -732,6 +770,7 @@ impl Store {
         &self,
         req: etcdserverpb::DeleteRangeRequest,
     ) -> Result<etcdserverpb::DeleteRangeResponse, Status> {
+        check_key(&req.key)?;
         let mut state = self.state.write();
         let rev = state.alloc_revision();
 
