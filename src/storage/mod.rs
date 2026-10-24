@@ -3251,6 +3251,63 @@ mod txn_atomicity_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A historical range inside a txn cannot run while the write lock is held
+    /// (it needs the WAL and a read lock), so it is deferred and patched back
+    /// into the response. The requested revision is below the txn's, so the
+    /// txn's own writes must not leak into it.
+    #[tokio::test]
+    async fn txn_historical_range_is_deferred_and_unaffected() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"h".to_vec(),
+                value: b"v1".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let v1_rev = store.current_revision() as i64;
+        store
+            .put(etcdserverpb::PutRequest {
+                key: b"h".to_vec(),
+                value: b"v2".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resp = store
+            .txn(txn(vec![
+                put_op("h2", "x"),
+                RequestOp {
+                    request: Some(Request::RequestRange(etcdserverpb::RangeRequest {
+                        key: b"h".to_vec(),
+                        revision: v1_rev,
+                        ..Default::default()
+                    })),
+                },
+            ]))
+            .await
+            .unwrap();
+
+        use prost::Message;
+        match &resp.responses[1].response {
+            Some(etcdserverpb::response_op::Response::ResponseRange(g)) => {
+                assert_eq!(g.kvs.len(), 1, "deferred historical range must be filled in");
+                let kv = mvccpb::KeyValue::decode(&g.kvs[0][..]).unwrap();
+                assert_eq!(kv.value, b"v1", "must read the value at the requested revision");
+            }
+            other => panic!("expected a range response, got {other:?}"),
+        }
+        // the write still happened, at the txn revision
+        assert_eq!(resp.header.unwrap().revision, v1_rev + 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Reads inside a txn observe the txn's own earlier writes (etcd does this),
     /// and writes on the same key are rejected before anything is applied.
     #[tokio::test]
