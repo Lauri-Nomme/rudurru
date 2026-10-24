@@ -2,8 +2,6 @@
 #   ./scripts/conformance.sh --update-baseline
 # Each entry is a CHECK name; see prd/etcd-conformance-audit.md.
 auth.enable
-lease.grant_duplicate_id
-lease.revoke_missing
 range.compacted
 range.future_rev
 range.sort_desc_value

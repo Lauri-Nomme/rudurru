@@ -2583,3 +2583,68 @@ mod lease_ttl_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod lease_id_tests {
+    use super::*;
+    use crate::proto::etcdserverpb;
+
+    fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "/tmp/rudurru_lease_id_test_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// etcd rejects a duplicate lease id with `FailedPrecondition` and revoking
+    /// an unknown lease with `NotFound`; it does not silently overwrite/succeed.
+    #[tokio::test]
+    async fn duplicate_grant_and_missing_revoke_error() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        let grant = |id: i64| {
+            let s = &store;
+            async move {
+                s.lease_grant(etcdserverpb::LeaseGrantRequest {
+                    ttl: 60,
+                    id,
+                    ..Default::default()
+                })
+                .await
+            }
+        };
+
+        grant(42).await.unwrap();
+        let err = grant(42).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("lease already exists"),
+            "unexpected message: {}",
+            err.message()
+        );
+
+        let err = store
+            .lease_revoke(etcdserverpb::LeaseRevokeRequest { id: 999_999 })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(
+            err.message().contains("requested lease not found"),
+            "unexpected message: {}",
+            err.message()
+        );
+
+        // the existing lease still works
+        store
+            .lease_revoke(etcdserverpb::LeaseRevokeRequest { id: 42 })
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

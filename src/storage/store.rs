@@ -993,6 +993,12 @@ impl Store {
         } else {
             state.alloc_lease_id()
         };
+        if state.leases.contains_key(&id) {
+            return Err(Status::new(
+                tonic::Code::FailedPrecondition,
+                "etcdserver: lease already exists",
+            ));
+        }
         let expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
         state.leases.insert(
             id,
@@ -1019,6 +1025,12 @@ impl Store {
     ) -> Result<etcdserverpb::LeaseRevokeResponse, Status> {
         let mut state = self.state.write();
         let id = req.id;
+        if !state.leases.contains_key(&id) {
+            return Err(Status::new(
+                tonic::Code::NotFound,
+                "etcdserver: requested lease not found",
+            ));
+        }
         state.leases.remove(&id);
         state.expiry_notify.notify_one();
         tracing::info!(id, "lease_revoked");
