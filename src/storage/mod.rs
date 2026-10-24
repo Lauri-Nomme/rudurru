@@ -2519,3 +2519,67 @@ mod stats_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod lease_ttl_tests {
+    use super::*;
+    use crate::proto::etcdserverpb;
+
+    fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "/tmp/rudurru_lease_ttl_test_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// etcd clamps TTLs to `LeaseMinTTL` (2) and rejects anything above
+    /// `MaxLeaseTTL` (i64::MAX/1e9 - 1). A negative TTL used to reach
+    /// `Instant + Duration::from_secs(ttl as u64)` and abort the process in
+    /// release builds.
+    #[tokio::test]
+    async fn lease_ttl_is_clamped_and_bounded() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        for (requested, expected) in [(0, 2), (-5, 2), (1, 2), (2, 2), (60, 60)] {
+            let resp = store
+                .lease_grant(etcdserverpb::LeaseGrantRequest {
+                    ttl: requested,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp.ttl, expected, "ttl {requested} should clamp to {expected}");
+        }
+
+        // one past etcd's MaxLeaseTTL is rejected...
+        let err = store
+            .lease_grant(etcdserverpb::LeaseGrantRequest {
+                ttl: 9_223_372_036,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
+        assert!(
+            err.message().contains("too large lease TTL"),
+            "unexpected message: {}",
+            err.message()
+        );
+
+        // ...and the boundary itself is accepted without overflowing the instant
+        store
+            .lease_grant(etcdserverpb::LeaseGrantRequest {
+                ttl: 9_223_372_035,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

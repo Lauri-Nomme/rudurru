@@ -14,6 +14,27 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::Status;
 
+/// etcd's lease TTL bounds.
+///
+/// `lessor.MaxLeaseTTL = math.MaxInt64 / int64(time.Second) - 1` and
+/// `LeaseMinTTL = 2`: shorter TTLs are silently raised to the minimum, longer
+/// ones are rejected. This also keeps a client-supplied integer out of
+/// `Instant::now() + Duration::from_secs(ttl as u64)`, where a negative TTL
+/// casts to ~1.8e19 seconds and the addition overflows — with `panic = "abort"`
+/// in the release profile that aborts the process.
+const LEASE_MAX_TTL: i64 = i64::MAX / 1_000_000_000 - 1;
+const LEASE_MIN_TTL: i64 = 2;
+
+fn check_lease_ttl(ttl: i64) -> Result<i64, Status> {
+    if ttl > LEASE_MAX_TTL {
+        return Err(Status::new(
+            tonic::Code::OutOfRange,
+            "etcdserver: too large lease TTL",
+        ));
+    }
+    Ok(ttl.max(LEASE_MIN_TTL))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct StoreStats {
     pub revision: u64,
@@ -924,13 +945,15 @@ impl Store {
         &self,
         req: etcdserverpb::LeaseGrantRequest,
     ) -> Result<etcdserverpb::LeaseGrantResponse, Status> {
+        // Validate before touching state (and before doing `Instant + Duration`
+        // with a client-supplied integer).
+        let ttl = check_lease_ttl(req.ttl)?;
         let mut state = self.state.write();
         let id = if req.id != 0 {
             req.id
         } else {
             state.alloc_lease_id()
         };
-        let ttl = req.ttl;
         let expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl as u64);
         state.leases.insert(
             id,
