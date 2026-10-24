@@ -2930,3 +2930,214 @@ mod range_sort_tests {
     }
 }
 
+
+/// Sorting benchmarks. Not part of the test suite:
+///
+///     cargo test --release --lib sort_bench -- --ignored --nocapture
+///
+/// Each stage is measured separately so a change can be attributed: field
+/// extraction (prost decode -> two tag walks -> one-pass known-offset parse),
+/// then the sort (full vs top-k pushdown) at two result-set sizes.
+#[cfg(test)]
+mod sort_bench {
+    use super::*;
+    use crate::proto::etcdserverpb::range_request::{SortOrder, SortTarget};
+    use crate::proto::mvccpb;
+    use prost::bytes::Bytes;
+    use prost::Message;
+    use std::time::Instant;
+
+    const VALUE_LEN: usize = 200;
+
+    fn blobs(n: usize) -> Vec<Bytes> {
+        (0..n)
+            .map(|i| {
+                let (b, _, _) = wal::encode_kv(
+                    format!("registry/pods/ns/k{i:06}").as_bytes(),
+                    &vec![b'x'; VALUE_LEN],
+                    1,
+                    i as i64 + 1, // mod_revision increases with the key
+                    1,
+                    0,
+                );
+                Bytes::from(b)
+            })
+            .collect()
+    }
+
+    // ── extraction strategies ──────────────────────────────────────────
+
+    /// Step 0: prost decodes the whole KeyValue (allocates key + value).
+    fn extract_prost(blob: &[u8]) -> (u64, Vec<u8>) {
+        let kv = mvccpb::KeyValue::decode(blob).unwrap();
+        (kv.mod_revision as u64, kv.key)
+    }
+
+    fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
+        let mut value = 0u64;
+        let mut shift = 0;
+        for (i, &b) in buf.iter().enumerate() {
+            value |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn pb_field<'a>(buf: &'a [u8], want: u32) -> Option<(u64, &'a [u8])> {
+        let mut buf = buf;
+        while !buf.is_empty() {
+            let (tag, n) = read_varint(buf)?;
+            buf = buf.get(n..)?;
+            let field = (tag >> 3) as u32;
+            match tag & 7 {
+                0 => {
+                    let (v, n) = read_varint(buf)?;
+                    buf = buf.get(n..)?;
+                    if field == want {
+                        return Some((v, &[]));
+                    }
+                }
+                2 => {
+                    let (len, n) = read_varint(buf)?;
+                    buf = buf.get(n..)?;
+                    let (data, rest) = buf.split_at_checked(len as usize)?;
+                    buf = rest;
+                    if field == want {
+                        return Some((0, data));
+                    }
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Step 1: two tag walks per blob (mod_revision, then key).
+    fn extract_two_walk(blob: &[u8]) -> (u64, &[u8]) {
+        let mod_rev = pb_field(blob, 3).map(|(v, _)| v).unwrap_or(0);
+        let key = pb_field(blob, 1).map(|(_, b)| b).unwrap_or(&[]);
+        (mod_rev, key)
+    }
+
+    /// Step 2: one pass, known layout, fixed-width overlong varints.
+    fn extract_one_pass(blob: &[u8]) -> (u64, &[u8]) {
+        match crate::storage::store::parse_kv(blob) {
+            Some(f) => (f.mod_revision, f.key),
+            None => (0, &[]),
+        }
+    }
+
+    /// Step 3: the original sort — prost-decode every element, full sort.
+    fn sort_prost_full(kvs: &mut Vec<Bytes>, order: i32, target: i32) {
+        if order == SortOrder::None as i32 {
+            return;
+        }
+        let decoded: Vec<mvccpb::KeyValue> = kvs
+            .iter()
+            .map(|b| mvccpb::KeyValue::decode(&b[..]).unwrap_or_default())
+            .collect();
+        let mut idx: Vec<usize> = (0..kvs.len()).collect();
+        idx.sort_by(|&a, &b| {
+            let (ka, kb) = (&decoded[a], &decoded[b]);
+            let ord = match target {
+                t if t == SortTarget::Value as i32 => ka.value.cmp(&kb.value),
+                t if t == SortTarget::Mod as i32 => ka.mod_revision.cmp(&kb.mod_revision),
+                _ => ka.key.cmp(&kb.key),
+            }
+            .then_with(|| ka.key.cmp(&kb.key));
+            if order == SortOrder::Descend as i32 {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+        let mut out = Vec::with_capacity(kvs.len());
+        for i in idx {
+            out.push(std::mem::take(&mut kvs[i]));
+        }
+        *kvs = out;
+    }
+
+    fn bench_us(iters: usize, mut f: impl FnMut()) -> f64 {
+        let t = Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        t.elapsed().as_secs_f64() * 1e6 / iters as f64
+    }
+
+    fn extraction(n: usize, blobs: &[Bytes]) {
+        println!("\n== extraction, {n} blobs x {VALUE_LEN} B ==");
+        let mut sink = 0usize;
+
+        let us = bench_us(200, || {
+            for b in blobs {
+                let (v, k) = extract_prost(b);
+                sink += v as usize + k.len();
+            }
+        });
+        println!("{:<18} {us:8.1} us   ({:.1} ns/blob)", "prost decode", us * 1000.0 / n as f64);
+
+        let us = bench_us(200, || {
+            for b in blobs {
+                let (v, k) = extract_two_walk(b);
+                sink += v as usize + k.len();
+            }
+        });
+        println!("{:<18} {us:8.1} us   ({:.1} ns/blob)", "two tag walks", us * 1000.0 / n as f64);
+
+        let us = bench_us(200, || {
+            for b in blobs {
+                let (v, k) = extract_one_pass(b);
+                sink += v as usize + k.len();
+            }
+        });
+        println!("{:<18} {us:8.1} us   ({:.1} ns/blob)", "one-pass parse", us * 1000.0 / n as f64);
+        std::hint::black_box(sink);
+    }
+
+    fn sorting(n: usize, blobs: &[Bytes]) {
+        println!("\n== sort, {n} keys x {VALUE_LEN} B (Vec<Bytes> clone included) ==");
+        let mut run = |label: &str, order: i32, target: i32, limit: usize| {
+            let us = bench_us(30, || {
+                let mut v = blobs.to_vec();
+                crate::storage::store::sort_kvs(&mut v, order, target, limit);
+                std::hint::black_box(&v);
+            });
+            println!("{label:<26} {:7.2} ms", us / 1000.0);
+        };
+
+        run("clone only (no sort)", SortOrder::None as i32, SortTarget::Key as i32, 0);
+        run("asc/key (fast path)", SortOrder::Ascend as i32, SortTarget::Key as i32, 0);
+        run("desc/key (reverse)", SortOrder::Descend as i32, SortTarget::Key as i32, 0);
+        run("desc/value full", SortOrder::Descend as i32, SortTarget::Value as i32, 0);
+        run("desc/value top-10", SortOrder::Descend as i32, SortTarget::Value as i32, 10);
+        run("desc/value top-100", SortOrder::Descend as i32, SortTarget::Value as i32, 100);
+        run("desc/value top-1000", SortOrder::Descend as i32, SortTarget::Value as i32, 1000);
+        run("asc/mod full", SortOrder::Ascend as i32, SortTarget::Mod as i32, 0);
+        run("asc/mod top-100", SortOrder::Ascend as i32, SortTarget::Mod as i32, 100);
+
+        let us = bench_us(20, || {
+            let mut v = blobs.to_vec();
+            sort_prost_full(&mut v, SortOrder::Descend as i32, SortTarget::Value as i32);
+            std::hint::black_box(&v);
+        });
+        println!("{:<26} {:7.2} ms   (before)", "desc/value prost full", us / 1000.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench() {
+        for n in [5_000usize, 50_000] {
+            let blobs = blobs(n);
+            extraction(n, &blobs);
+            sorting(n, &blobs);
+        }
+    }
+}
