@@ -14,45 +14,134 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::Status;
 
+/// A protobuf field read without decoding the message.
+enum PbValue<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+}
+
+fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        value |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Read field `want` out of an encoded `mvccpb.KeyValue` by walking its tags.
+/// Wire types 0 (varint) and 2 (length-delimited) are the only ones the message
+/// uses. Bytes are borrowed from `buf`.
+fn pb_field(buf: &[u8], want: u32) -> Option<PbValue<'_>> {
+    let mut buf = buf;
+    while !buf.is_empty() {
+        let (tag, n) = read_varint(buf)?;
+        buf = buf.get(n..)?;
+        let field = (tag >> 3) as u32;
+        match tag & 7 {
+            0 => {
+                let (v, n) = read_varint(buf)?;
+                buf = buf.get(n..)?;
+                if field == want {
+                    return Some(PbValue::Varint(v));
+                }
+            }
+            2 => {
+                let (len, n) = read_varint(buf)?;
+                buf = buf.get(n..)?;
+                let (data, rest) = buf.split_at_checked(len as usize)?;
+                buf = rest;
+                if field == want {
+                    return Some(PbValue::Bytes(data));
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn cmp_field(a: Option<&PbValue<'_>>, b: Option<&PbValue<'_>>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(PbValue::Varint(x)), Some(PbValue::Varint(y))) => x.cmp(y),
+        (Some(PbValue::Bytes(x)), Some(PbValue::Bytes(y))) => x.cmp(y),
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        // Mixed wire types cannot occur for one field; keep it deterministic.
+        _ => Ordering::Equal,
+    }
+}
+
 /// Sort a range result in place the way etcd does (`sort_order` over
 /// `sort_target`), with the key as a deterministic tiebreak.
 ///
-/// `kvs` holds encoded `mvccpb.KeyValue` blobs, so the sort target is read by
-/// decoding them; the blobs themselves are moved, never re-encoded.
-fn sort_kvs(kvs: &mut Vec<Bytes>, order: i32, target: i32) {
-    use crate::proto::mvccpb;
+/// `kvs` holds encoded `mvccpb.KeyValue` blobs. Nothing is decoded into a
+/// `KeyValue`: the compared field is pulled out with a tag walk that borrows
+/// bytes fields in place, so sorting a range of large values costs one
+/// `Vec<SortEntry>` and no copies of the values.
+pub(crate) fn sort_kvs(kvs: &mut Vec<Bytes>, order: i32, target: i32) {
     use crate::proto::etcdserverpb::range_request::{SortOrder, SortTarget};
-    use prost::Message;
 
     if order != SortOrder::Ascend as i32 && order != SortOrder::Descend as i32 {
         return;
     }
 
-    let decoded: Vec<mvccpb::KeyValue> = kvs
-        .iter()
-        .map(|b| mvccpb::KeyValue::decode(&b[..]).unwrap_or_default())
-        .collect();
+    // Every range result is produced by iterating a BTreeMap, so it is already
+    // ascending by key. Sorting on the key axis therefore never needs to decode
+    // (ASCEND is a no-op, DESCEND is a reverse) — which keeps the common
+    // `--sort-by=KEY` and the unsorted case allocation-free.
+    if target == SortTarget::Key as i32 {
+        if order == SortOrder::Descend as i32 {
+            kvs.reverse();
+        }
+        return;
+    }
+
+    let field = match target {
+        t if t == SortTarget::Create as i32 => 2, // create_revision
+        t if t == SortTarget::Mod as i32 => 3,    // mod_revision
+        t if t == SortTarget::Version as i32 => 4,
+        t if t == SortTarget::Value as i32 => 5,
+        _ => return, // unknown target: leave the (key-ordered) result alone
+    };
 
     let mut idx: Vec<usize> = (0..kvs.len()).collect();
-    idx.sort_by(|&a, &b| {
-        let (ka, kb) = (&decoded[a], &decoded[b]);
-        let ord = match target {
-            t if t == SortTarget::Version as i32 => ka.version.cmp(&kb.version),
-            t if t == SortTarget::Create as i32 => {
-                ka.create_revision.cmp(&kb.create_revision)
-            }
-            t if t == SortTarget::Mod as i32 => ka.mod_revision.cmp(&kb.mod_revision),
-            t if t == SortTarget::Value as i32 => ka.value.cmp(&kb.value),
-            _ => ka.key.cmp(&kb.key),
+    {
+        // Borrows `kvs` immutably; dropped before the reorder below.
+        struct SortEntry<'a> {
+            target: Option<PbValue<'a>>,
+            key: &'a [u8],
         }
-        .then_with(|| ka.key.cmp(&kb.key));
+        let entries: Vec<SortEntry<'_>> = kvs
+            .iter()
+            .map(|b| SortEntry {
+                target: pb_field(b, field),
+                key: match pb_field(b, 1) {
+                    Some(PbValue::Bytes(k)) => k,
+                    _ => &[],
+                },
+            })
+            .collect();
 
-        if order == SortOrder::Descend as i32 {
-            ord.reverse()
-        } else {
-            ord
-        }
-    });
+        idx.sort_by(|&a, &b| {
+            let ord = cmp_field(entries[a].target.as_ref(), entries[b].target.as_ref())
+                .then_with(|| entries[a].key.cmp(entries[b].key));
+            if order == SortOrder::Descend as i32 {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+    }
 
     let mut out = Vec::with_capacity(kvs.len());
     for i in idx {
