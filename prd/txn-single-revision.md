@@ -227,6 +227,20 @@ write, where the failure happens before any write. The gap only exists for
 multi-op txns that mix a write with `ignore_*` on a key that the same txn does
 not create. It is recorded here and in the PR rather than left implicit.
 
+**It is also measured, not just documented.** `txn.dynamic_error_atomicity` runs
+a two-op txn whose second op fails this way and reports whether the first write
+survived:
+
+```
+etcd    : code=InvalidArgument msg=etcdserver: key not found first_write_survived=false
+rudurru : code=InvalidArgument msg=etcdserver: key not found first_write_survived=true
+```
+
+That entry sits in `tests/conformance/known-deviations.txt` (annotated with a
+pointer to this section), so the gap is visible in every CI run and disappears
+from the ledger the day error rollback is implemented — the same mechanism that
+keeps the rest of the audit honest.
+
 ### 3.10 Response assembly
 
 The txn's `header` is taken from the state *after* applying, so it equals the
@@ -267,8 +281,13 @@ duration, which the design bounds by deferring the only unbounded work.
 - `txn_historical_range_is_deferred_and_unaffected` — the deferred path returns
   the historical value, not the txn's.
 - `txn.revisions_for_3_writes` / `txn.atomic_mid_revision` in the differential
-  harness went from deviations to matches; the ledger dropped **3 → 1** (only
-  the accepted `auth.enable` difference remains).
+  harness went from deviations to matches.
+- `txn.read_own_writes`, `txn.duplicate_write_keys` and
+  `txn.dynamic_error_atomicity` were added as permanent checks (the last one
+  pins the §3.9 limitation).
+- The ledger is **2 entries**: `auth.enable` (accepted) and
+  `txn.dynamic_error_atomicity` (the documented limitation above). Before this
+  PR it was 3, two of which were the torn-transaction checks.
 - `tests/txn_test.rs::test_txn_nested` previously asserted the *stub* behaviour
   ("inner txn ops are not executed") — updated in the nested-txn PR; this PR
   keeps it green.

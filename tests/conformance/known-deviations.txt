@@ -2,3 +2,7 @@
 #   ./scripts/conformance.sh --update-baseline
 # Each entry is a CHECK name; see prd/etcd-conformance-audit.md.
 auth.enable
+# Known limitation: a dynamic validation error mid-txn leaves the earlier
+# operations applied; etcd rolls the whole transaction back.
+# See prd/txn-single-revision.md section 3.9.
+txn.dynamic_error_atomicity

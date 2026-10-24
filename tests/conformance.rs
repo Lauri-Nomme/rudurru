@@ -275,6 +275,26 @@ async fn conformance() {
     ]);
     emit("txn.duplicate_write_keys", code_msg(&c.txn(txn).await));
 
+    // A dynamic validation error in the middle of a txn (second op reuses a
+    // value from a key that does not exist): etcd rolls the whole txn back, so
+    // the first write must not survive.
+    let partial = uniq("txn-dyn-partial");
+    let absent = uniq("txn-dyn-absent");
+    let txn = Txn::new().and_then(vec![
+        TxnOp::put(partial.as_str(), "written", None),
+        TxnOp::put(
+            absent.as_str(),
+            "",
+            Some(PutOptions::new().with_ignore_value()),
+        ),
+    ]);
+    let r = c.txn(txn).await;
+    let survived = !c.get(partial.as_str(), None).await.unwrap().kvs().is_empty();
+    emit(
+        "txn.dynamic_error_atomicity",
+        format!("{} first_write_survived={survived}", code_msg(&r)),
+    );
+
     // ── watch ─────────────────────────────────────────────────────────
     let wk = uniq("watch");
     let mut w = c
