@@ -4,8 +4,6 @@
 auth.enable
 delete.empty_key
 lease.grant_duplicate_id
-lease.grant_ttl_negative
-lease.grant_ttl_zero
 lease.revoke_missing
 put.empty_key
 put.ignore_lease_missing
@@ -18,8 +16,6 @@ range.compacted
 range.empty_key
 range.future_rev
 range.sort_desc_value
-server.process_alive
-server.survives_negative_ttl
 txn.atomic_mid_revision
 txn.nested
 txn.revisions_for_3_writes
