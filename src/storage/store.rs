@@ -178,29 +178,22 @@ impl Store {
         };
         let current_rev = self.current_revision();
 
-        // Future revision — etcd accepts small races from bookmark watches
-        // and returns the current state. Only reject egregious gaps that
-        // indicate a genuinely bogus revision (>10k, matching watch threshold).
+        // etcd rejects any revision above the current one, however small the
+        // gap: `ErrFutureRev` is `codes.OutOfRange`. Serving "current" instead
+        // hides a broken client (a reader that asked for N and silently got
+        // today's data cannot tell), so there is no tolerance here.
         if target_rev > current_rev {
-            if target_rev.saturating_sub(current_rev) > 10_000 {
-                return Err(Status::new(
-                    tonic::Code::Unavailable,
-                    "etcdserver: mvcc: required revision is a future revision",
-                ));
-            }
-            tracing::info!(
-                target_rev,
-                current_rev,
-                gap = target_rev.saturating_sub(current_rev),
-                "range future revision within tolerance, serving current state"
-            );
-            target_rev = 0; // fall through to current-state path
+            return Err(Status::new(
+                tonic::Code::OutOfRange,
+                "etcdserver: mvcc: required revision is a future revision",
+            ));
         }
 
-        // Compacted revision
+        // `ErrCompacted` is also `codes.OutOfRange` (kube-apiserver's
+        // isCompactedErr matches on the code, not just the message).
         if target_rev > 0 && target_rev < self.compact_rev().await {
             return Err(Status::new(
-                tonic::Code::Unavailable,
+                tonic::Code::OutOfRange,
                 "etcdserver: mvcc: required revision has been compacted",
             ));
         }

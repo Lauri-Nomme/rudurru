@@ -2742,3 +2742,94 @@ mod txn_nested_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod revision_error_tests {
+    use super::*;
+    use crate::proto::etcdserverpb;
+
+    fn temp_wal() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "/tmp/rudurru_rev_err_test_{}_{}.wal",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// etcd maps `ErrFutureRev` and `ErrCompacted` to `codes.OutOfRange`, and
+    /// rejects *any* future revision rather than serving current state.
+    #[tokio::test]
+    async fn future_and_compacted_revisions_error_with_out_of_range() {
+        let path = temp_wal();
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).await.unwrap();
+
+        for i in 0..4 {
+            store
+                .put(etcdserverpb::PutRequest {
+                    key: format!("k{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let current = store.current_revision();
+
+        // any future revision, including current + 1
+        for rev in [current + 1, current + 5, current + 100_000] {
+            let err = store
+                .range(etcdserverpb::RangeRequest {
+                    key: b"k0".to_vec(),
+                    revision: rev as i64,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::OutOfRange, "rev {rev}");
+            assert!(
+                err.message().contains("required revision is a future revision"),
+                "unexpected message: {}",
+                err.message()
+            );
+        }
+
+        // compact, then read below the watermark
+        store
+            .compact(etcdserverpb::CompactionRequest {
+                revision: current as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let err = store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k0".to_vec(),
+                revision: (current - 1) as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
+        assert!(
+            err.message().contains("required revision has been compacted"),
+            "unexpected message: {}",
+            err.message()
+        );
+
+        // the watermark itself stays readable
+        store
+            .range(etcdserverpb::RangeRequest {
+                key: b"k0".to_vec(),
+                revision: current as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
