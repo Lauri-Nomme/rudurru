@@ -14,6 +14,225 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::Status;
 
+/// A cursor over an encoded `mvccpb.KeyValue`.
+///
+/// `wal::encode_kv` is the only producer of these blobs, so the field layout is
+/// known and the tags can be skipped instead of interpreted: length prefixes are
+/// fixed-width "overlong" varints (5 bytes for key/value, 10 for `mod_revision`),
+/// which decode without scanning for a terminator.
+struct KvCursor<'a> {
+    buf: &'a [u8],
+    i: usize,
+}
+
+impl<'a> KvCursor<'a> {
+    #[inline]
+    fn skip(&mut self, n: usize) -> Option<()> {
+        self.i = self.i.checked_add(n)?;
+        (self.i <= self.buf.len()).then_some(())
+    }
+
+    #[inline]
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.i.checked_add(n)?;
+        let slice = self.buf.get(self.i..end)?;
+        self.i = end;
+        Some(slice)
+    }
+
+    #[inline]
+    fn varint(&mut self) -> Option<u64> {
+        let buf = self.buf.get(self.i..)?;
+        let mut value = 0u64;
+        let mut shift = 0;
+        for (n, &b) in buf.iter().enumerate() {
+            value |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                self.i += n + 1;
+                return Some(value);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Fixed 5-byte overlong key/value length.
+    #[inline]
+    fn overlong_u32(&mut self) -> Option<u32> {
+        wal::decode_overlong_u32(self.take(5)?)
+    }
+
+    /// Fixed 10-byte overlong `mod_revision`.
+    #[inline]
+    fn overlong_u64(&mut self) -> Option<u64> {
+        wal::decode_overlong_u64(self.take(10)?)
+    }
+}
+
+/// The fields of an encoded `mvccpb.KeyValue`, borrowed from the blob.
+pub(crate) struct KvFields<'a> {
+    pub(crate) key: &'a [u8],
+    pub(crate) create_revision: u64,
+    pub(crate) mod_revision: u64,
+    pub(crate) version: u64,
+    pub(crate) value: &'a [u8],
+}
+
+/// Pull every sortable field out of a blob in **one** pass, without decoding a
+/// `KeyValue` and without allocating.
+///
+/// Layout written by `wal::encode_kv` (tags are skipped, not checked):
+///
+/// ```text
+/// 0x0a | overlong u32 len (5B) | key
+/// 0x10 | varint create_revision
+/// 0x18 | overlong u64 (10B)    | mod_revision
+/// 0x20 | varint version
+/// 0x2a | overlong u32 len (5B) | value
+/// 0x30 | varint lease
+/// ```
+#[inline]
+pub(crate) fn parse_kv(buf: &[u8]) -> Option<KvFields<'_>> {
+    let mut c = KvCursor { buf, i: 0 };
+    c.skip(1)?; // key tag
+    let key_len = c.overlong_u32()? as usize;
+    let key = c.take(key_len)?;
+    c.skip(1)?; // create_revision tag
+    let create_revision = c.varint()?;
+    c.skip(1)?; // mod_revision tag
+    let mod_revision = c.overlong_u64()?;
+    c.skip(1)?; // version tag
+    let version = c.varint()?;
+    c.skip(1)?; // value tag
+    let value_len = c.overlong_u32()? as usize;
+    let value = c.take(value_len)?;
+    Some(KvFields {
+        key,
+        create_revision,
+        mod_revision,
+        version,
+        value,
+    })
+}
+
+/// The compared value for a sort target.
+enum SortValue<'a> {
+    Int(u64),
+    Bytes(&'a [u8]),
+}
+
+fn cmp_sort_value(a: &SortValue<'_>, b: &SortValue<'_>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (SortValue::Int(x), SortValue::Int(y)) => x.cmp(y),
+        (SortValue::Bytes(x), SortValue::Bytes(y)) => x.cmp(y),
+        (SortValue::Int(_), SortValue::Bytes(_)) => Ordering::Less,
+        (SortValue::Bytes(_), SortValue::Int(_)) => Ordering::Greater,
+    }
+}
+
+/// Sort a range result like etcd (`sort_order` over `sort_target`), with the key
+/// as a deterministic tiebreak.
+///
+/// `limit` is a hint: when it is smaller than the result set, the sort finds the
+/// top `limit` with a linear `select_nth_unstable_by` and sorts only those,
+/// instead of a full `O(n log n)` sort over the whole range. Callers still
+/// truncate afterwards (and derive `more` from the pre-sort count).
+///
+/// Bytes fields are borrowed from the blobs, so sorting never copies a value:
+/// peak extra memory is one `(SortValue, &[u8])` per element.
+pub(crate) fn sort_kvs(kvs: &mut Vec<Bytes>, order: i32, target: i32, limit: usize) {
+    use crate::proto::etcdserverpb::range_request::{SortOrder, SortTarget};
+
+    if order != SortOrder::Ascend as i32 && order != SortOrder::Descend as i32 {
+        return;
+    }
+
+    // Every range result is produced by iterating a BTreeMap, so it is already
+    // ascending by key. Sorting on the key axis needs no parsing at all:
+    // ASCEND is a no-op and DESCEND is a reverse.
+    if target == SortTarget::Key as i32 {
+        if order == SortOrder::Descend as i32 {
+            kvs.reverse();
+        }
+        return;
+    }
+
+    let descending = order == SortOrder::Descend as i32;
+    // Unknown target: leave the (key-ordered) result alone.
+    if target != SortTarget::Create as i32
+        && target != SortTarget::Mod as i32
+        && target != SortTarget::Version as i32
+        && target != SortTarget::Value as i32
+    {
+        return;
+    }
+
+    // Sort the entries themselves rather than indices into a side table: the
+    // comparator then walks a compact, sequentially-built array instead of
+    // chasing `entries[idx]` for every comparison.
+    struct Entry<'a> {
+        value: SortValue<'a>,
+        key: &'a [u8],
+        idx: u32,
+    }
+
+    let mut entries: Vec<Entry<'_>> = kvs
+        .iter()
+        .enumerate()
+        .map(|(idx, blob)| match parse_kv(blob) {
+            Some(f) => {
+                let value = match target {
+                    t if t == SortTarget::Create as i32 => SortValue::Int(f.create_revision),
+                    t if t == SortTarget::Version as i32 => SortValue::Int(f.version),
+                    t if t == SortTarget::Value as i32 => SortValue::Bytes(f.value),
+                    _ => SortValue::Int(f.mod_revision),
+                };
+                Entry {
+                    value,
+                    key: f.key,
+                    idx: idx as u32,
+                }
+            }
+            None => Entry {
+                value: SortValue::Int(0),
+                key: &[],
+                idx: idx as u32,
+            },
+        })
+        .collect();
+
+    let cmp = |a: &Entry<'_>, b: &Entry<'_>| {
+        let ord = cmp_sort_value(&a.value, &b.value).then_with(|| a.key.cmp(b.key));
+        if descending {
+            ord.reverse()
+        } else {
+            ord
+        }
+    };
+
+    // Top-k: partition in O(n), then sort only the k selected entries. Only
+    // worth it when the limit is a small fraction of the range — otherwise
+    // `sort_unstable_by` is as fast (measured; parsing dominates either way).
+    if limit > 0 && limit.saturating_mul(64) <= entries.len() {
+        entries.select_nth_unstable_by(limit - 1, cmp);
+        entries.truncate(limit);
+    }
+    entries.sort_unstable_by(cmp);
+
+    let order: Vec<usize> = entries.iter().map(|e| e.idx as usize).collect();
+    drop(entries);
+
+    let mut out = Vec::with_capacity(order.len());
+    for i in order {
+        out.push(std::mem::take(&mut kvs[i]));
+    }
+    *kvs = out;
+}
+
 /// etcd's lease TTL bounds.
 ///
 /// `lessor.MaxLeaseTTL = math.MaxInt64 / int64(time.Second) - 1` and
@@ -327,12 +546,15 @@ impl Store {
             });
         }
 
-        let more = if req.limit > 0 && kvs.len() > req.limit as usize {
+        let limit = if req.limit > 0 { req.limit as usize } else { 0 };
+        sort_kvs(&mut kvs, req.sort_order, req.sort_target, limit);
+
+        // `count` is the pre-sort length: sort_kvs may already have dropped the
+        // tail, so `more` cannot be derived from kvs.len() any more.
+        let more = req.limit > 0 && count > req.limit;
+        if more {
             kvs.truncate(req.limit as usize);
-            true
-        } else {
-            false
-        };
+        }
 
         Ok(etcdserverpb::RangeResponse {
             header: Some(state.header()),
@@ -507,12 +729,13 @@ impl Store {
                         count,
                     });
                 }
-                let more = if req.limit > 0 && count > req.limit as i64 {
-                    phase1_direct.truncate(req.limit as usize);
-                    true
-                } else {
-                    false
-                };
+                let mut kvs: Vec<Bytes> = phase1_direct.into_iter().map(|(_, b)| b).collect();
+                let limit = if req.limit > 0 { req.limit as usize } else { 0 };
+                sort_kvs(&mut kvs, req.sort_order, req.sort_target, limit);
+                let more = req.limit > 0 && count > req.limit;
+                if more {
+                    kvs.truncate(req.limit as usize);
+                }
                 return Ok(etcdserverpb::RangeResponse {
                     header: Some(etcdserverpb::ResponseHeader {
                         cluster_id: 1,
@@ -520,7 +743,7 @@ impl Store {
                         revision: target_rev as i64,
                         raft_term: 1,
                     }),
-                    kvs: phase1_direct.into_iter().map(|(_, b)| b).collect(),
+                    kvs,
                     more,
                     count,
                 });
@@ -647,7 +870,9 @@ impl Store {
             });
         }
 
-        let kvs: Vec<Bytes> = merged.into_values().take(limit).collect();
+        let mut kvs: Vec<Bytes> = merged.into_values().collect();
+        sort_kvs(&mut kvs, req.sort_order, req.sort_target, limit);
+        kvs.truncate(limit);
         let more = req.limit > 0 && count > req.limit as i64;
 
         Ok(etcdserverpb::RangeResponse {
